@@ -444,3 +444,7 @@ with none: not NFRUX's. Vulkan, 2x / 4x: NFRUX selected by name ("NFRUX"), integ
 
 Fast Vulkan network by default on NVIDIA where the host's features are unknown: OptiScaler 0.9.5 2x 380 fps (fp16 cooperative matrix), with NFRUX_VK_ASSUME_FEATURES=0 287 (integers). A marker at two unfinished starts: integers, said in the log.
 A start killed early leaves the count at one; the next full run clears it. Harness 158 checks, strict 63 of 63 identical; minimal host with nothing assumed, under validation, 78 of 78; with assumption 78 of 78.
+
+D3D12 with that OptiScaler build (d6b02459), sample 1280x701, 4x, 500 frames, 4 starts each: with LogLevel=0 (trace, LogToFile=true) all run: NFRUX 664-679 fps. With LogLevel=5 all 8 starts end
+in the access violation; with LogLevel=2 and no file NFRUX's four do, and the other provider's four fail too (two of them may be this session's kills). So the crash depends on OptiScaler's own timing or logging, whichever provider is
+selected; the cause is not found. 2x and 6x on D3D12 there: not run.
