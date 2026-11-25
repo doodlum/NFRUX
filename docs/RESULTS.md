@@ -291,3 +291,21 @@ of 177,000. Vulkan 2x 225 s and 6x 165 s, exit 0, but the window lost focus part
 user of the machine) and it presented 1x from there: 20,983 of 21,000 and 8,890 of 9,000 generated before. The earlier Vulkan drop to 1x is the same effect.
 The runs are under 300 s, and the window was clamped to 1284x701 by the desktop although 1920x1080 was asked.
 With the new loader NGX Shutdown reaches NFRUX on both APIs (loader log).
+
+## Low frame rates under a Reflex cap (request; eedcb52, sample in real time, 2026-11-25)
+
+The sample's Reflex cap limits presented frames. Scripted camera at real speed (it was one step a frame before, which tied the simulation to the frame
+rate: a fixed step is now used only while recording with NFRUX_DUMP).
+
+| | 2x cap 40 (base 20) | 2x cap 60 (30) | 2x cap 120 (60) | 4x cap 120 (30) | 6x cap 180 (30) |
+|---|---|---|---|---|---|
+| D3D12 | 40.0 | 60.0 | 120.0 | 120.0 | 180.0 |
+| Vulkan | 40.0 | 60.0 | 120.0 | 120.0 | **cap not kept (612-649)** |
+
+The multiplier held in every log line. D3D12 keeps the cap at every multiplier with the slowest network too (scalar, 4x and 6x). Vulkan loses it at 5x, at
+6x, at 4x with the scalar network and at 4x with a 240 cap, and keeps it at 6x when NFRUX only copies: it depends on the time generation and presenting
+take. NFRUX calls no Reflex or present function. The validation layer reports (both directions, earlier log) that Streamline's pacer presents the swapchain on one
+thread while vkLatencySleepNV uses it on another; that race is the likely cause, not a shown one. Open.
+
+A7 again after the marker change: two kills, third start on dot4 (file name with the driver's time), cleared, CUDA back; a failed self-check keeps the marker.
+Harness at eedcb52 (strict and shipped): 124 checks, 0 failed; strict 55 of 55 identical.
