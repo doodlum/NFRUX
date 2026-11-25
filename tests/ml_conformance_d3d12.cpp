@@ -1,5 +1,6 @@
 // A1 on D3D12: the kernels against the CPU reference, byte for byte. SPDX-License-Identifier: MIT
 #include "../core/ml/d3d12_network.h"
+#include "../core/ml/cuda_network.h"
 #include "../core/model.h"
 
 #include <dxgi1_6.h>
@@ -51,13 +52,18 @@ int main(int argc, char** argv)
     int bad = 0;
     const uint32_t sizes[][2] = {{64, 64}, {744, 464}, {960, 544}};
     for (auto& wh : sizes)
-        for (int dot4 = 1; dot4 >= 0; --dot4)
+        for (int dot4 = 2; dot4 >= 0; --dot4)  // 2: CUDA
         {
             const uint32_t w = wh[0], h = wh[1];
+            const int before = bad;
             const ffx_ml::GraphDesc desc = nfrux::DescribeModel(w, h);
             std::string err;
-            auto g = nfrux::D3D12Graph::Create(dev.Get(), desc, dot4 != 0, &err);
-            if (!g) { printf("%ux%u dot4=%d: create failed: %s\n", w, h, dot4, err.c_str()); return 1; }
+            std::unique_ptr<nfrux::D3D12Graph> g;
+            std::unique_ptr<nfrux::CudaGraph> cu;
+            const ULONGLONG t0 = GetTickCount64();
+            if (dot4 == 2) { if (!(cu = nfrux::CudaGraph::Create(dev.Get(), desc, &err))) { printf("%ux%u CUDA: not available: %s\n", w, h, err.c_str()); continue; } printf("CUDA created in %llu ms\n", GetTickCount64() - t0); }
+            else g = nfrux::D3D12Graph::Create(dev.Get(), desc, dot4 != 0, &err);
+            if (!g && !cu) { printf("%ux%u dot4=%d: create failed: %s\n", w, h, dot4, err.c_str()); return 1; }
             const uint64_t inSize = uint64_t(w) * h * nfrux::kInputChannels, outSize = uint64_t(w / 2) * (h / 2) * 4;
             auto up = Buf(dev.Get(), inSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
             auto in = Buf(dev.Get(), inSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -76,12 +82,20 @@ int main(int argc, char** argv)
                 al->Reset(); cl->Reset(al.Get(), nullptr);
                 cl->CopyResource(in.Get(), up.Get());
                 D3D12_RESOURCE_BARRIER t[3] = {};
-                t[0].Transition = {in.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+                t[0].Transition = {in.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, cu ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
                 for (int i = 0; i < 2; ++i) t[1 + i].Transition = {o[i].Get(), 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
                 cl->ResourceBarrier(3, t);
                 cl->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
                 ID3D12Resource* outs[2] = {o[0].Get(), o[1].Get()};
-                g->Record(cl.Get(), in->GetGPUVirtualAddress(), outs);
+                for (int rep = timing ? 39 : 0; rep > 0; --rep)  // keeps the clocks up; the time is per network
+                {
+                    if (cu) cu->Record(cl.Get(), in->GetGPUVirtualAddress(), outs, w / 2 * 4); else g->Record(cl.Get(), in->GetGPUVirtualAddress(), outs);
+                    D3D12_RESOURCE_BARRIER u[2] = {{D3D12_RESOURCE_BARRIER_TYPE_UAV}, {D3D12_RESOURCE_BARRIER_TYPE_UAV}};
+                    u[0].UAV.pResource = outs[0], u[1].UAV.pResource = outs[1];
+                    cl->ResourceBarrier(2, u);
+                }
+                if (cu) cu->Record(cl.Get(), in->GetGPUVirtualAddress(), outs, w / 2 * 4);
+                else g->Record(cl.Get(), in->GetGPUVirtualAddress(), outs);
                 cl->EndQuery(heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
                 for (int i = 0; i < 2; ++i) t[i].Transition = {o[i].Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
                 cl->ResourceBarrier(2, t);
@@ -90,7 +104,7 @@ int main(int argc, char** argv)
                 run();
                 uint8_t* r; rb->Map(0, nullptr, reinterpret_cast<void**>(&r));
                 uint64_t ts[2], f; memcpy(ts, r + ((outSize * 2 + 255) & ~255ull), 16); q->GetTimestampFrequency(&f);
-                ms.push_back(double(ts[1] - ts[0]) * 1000 / double(f));
+                ms.push_back(double(ts[1] - ts[0]) * 1000 / double(f) / (timing ? 40 : 1));
                 if (!timing)
                 {
                     std::map<uint32_t, std::vector<int8_t>> ri{{b.input, x}}, ro;
@@ -98,7 +112,7 @@ int main(int argc, char** argv)
                     size_t diff = 0, total = 0;
                     for (int i = 0; i < 2; ++i)
                     {
-                        const auto& ref = ro[g->outputBinding(i)];
+                        const auto& ref = ro[cu ? cu->outputBinding(i) : g->outputBinding(i)];
                         const size_t px = size_t(w / 2) * (h / 2), ch = ref.size() / px;
                         for (size_t p = 0; p < px; ++p)
                             for (size_t c = 0; c < ch; ++c)
@@ -109,7 +123,7 @@ int main(int argc, char** argv)
                 rb->Unmap(0, nullptr);
             }
             std::sort(ms.begin(), ms.end());
-            printf("%ux%u %s: %d cases, %s, median %.3f ms\n", w, h, dot4 ? "dot4" : "int32", cases, timing ? "timed" : bad ? "DIFFERENCES" : "exact", ms[ms.size() / 2]);
+            printf("%ux%u %s: %d cases, %s, median %.3f ms\n", w, h, dot4 == 2 ? "CUDA tensor cores" : dot4 ? "dot4" : "int32", cases, timing ? "timed" : bad > before ? "DIFFERENCES" : "exact", ms[ms.size() / 2]);
         }
     uint64_t msgs = iq ? iq->GetNumStoredMessages() : 0;
     for (uint64_t i = 0; i < msgs && i < 8; ++i)

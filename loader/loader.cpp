@@ -284,7 +284,7 @@ struct NOTIFY { ULONG Flags; const UNICODE_STRING *Full, *Base; PVOID DllBase; U
 static wchar_t g_win[MAX_PATH]; static size_t g_winLen;
 static bool IsWindows(const UNICODE_STRING* n) { return g_winLen && n->Buffer && n->Length / 2 > g_winLen && !_wcsnicmp(n->Buffer, g_win, g_winLen); }
 static VOID CALLBACK OnDll(ULONG reason, const NOTIFY* d, PVOID) { if (reason == 1 && !IsWindows(d->Full)) { Patch((HMODULE)d->DllBase); } }
-BOOL WINAPI DllMain(HINSTANCE, DWORD r, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE self, DWORD r, LPVOID)
 {
     if (r == DLL_PROCESS_ATTACH)
     {
@@ -296,7 +296,7 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD r, LPVOID)
         for (auto* e = peb->Ldr->InMemoryOrderModuleList.Flink; e != &peb->Ldr->InMemoryOrderModuleList; e = e->Flink)
         {
             auto* m = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-            if (m->DllBase && !IsWindows(&m->FullDllName)) Patch((HMODULE)m->DllBase);
+            if (m->DllBase && m->DllBase != (void*)self && !IsWindows(&m->FullDllName))  Patch((HMODULE)m->DllBase);
         }
     }
     return TRUE;

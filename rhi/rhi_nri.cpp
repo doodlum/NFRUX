@@ -2,8 +2,10 @@
 // descriptor recycling and completion tokens are here; the network goes through native handles. SPDX-License-Identifier: MIT
 #include "rhi_nri.h"
 
+#include "cuda_network.h"
 #include "d3d12_network.h"
 #include "log.h"
+#include "marker.h"
 #include "model.h"
 
 #include <d3d12.h>
@@ -92,6 +94,7 @@ struct PassN : Pass
 struct NetN : Network
 {
     std::unique_ptr<D3D12Graph>    d3d;
+    std::unique_ptr<CudaGraph>     cuda;
     std::unique_ptr<ffx_ml::Graph> vk;
     std::unique_ptr<BufN>          in, out[2];  // params, gate
     std::unique_ptr<TexN>          tex[2];
@@ -136,6 +139,7 @@ public:
     {
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear();
+        if (cudaState == 1 && !Lost()) MarkerOk(Rung());
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
@@ -335,12 +339,21 @@ public:
         }
         else
         {
-            if (ml && strcmp(ml, "scalar") && (strcmp(ml, "dot4") || !c.dot4)) { if (error) *error = "NFRUX_ML: path unavailable on D3D12"; return nullptr; }
+            if (ml && strcmp(ml, "scalar") && strcmp(ml, "cuda") && (strcmp(ml, "dot4") || !c.dot4)) { if (error) *error = "NFRUX_ML: path unavailable on D3D12"; return nullptr; }
+            const bool forced = ml && !strcmp(ml, "cuda");
+            if (forced || (!ml && c.vendorId == uint32_t(nri::Vendor::NVIDIA)))
+            {
+                std::string why;
+                if (cudaState == 0) cudaState = forced || MarkerBegin(Rung()) ? 1 : -1;
+                if (cudaState > 0) net->cuda = CudaGraph::Create(d3d, DescribeModel(w, h), &why);
+                if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(Rung()), cudaState = -1;
+                if (forced && !net->cuda) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
+            }
             const bool dot4 = c.dot4 && !(ml && !strcmp(ml, "scalar"));
-            net->d3d = D3D12Graph::Create(d3d, DescribeModel(w, h), dot4, error);
-            if (!net->d3d) return nullptr;
-            what = dot4 ? "shader model 6.4 packed dot product" : "shader model 6.0 integers";
-            for (uint32_t i = 0; i < 2; ++i) net->order[i] = net->d3d->outputBinding(i) == mb.params ? 0 : 1;
+            if (!net->cuda) net->d3d = D3D12Graph::Create(d3d, DescribeModel(w, h), dot4, error);
+            if (!net->d3d && !net->cuda) return nullptr;
+            what = net->cuda ? "CUDA kernels, int8 tensor cores" : dot4 ? "shader model 6.4 packed dot product" : "shader model 6.0 integers";
+            for (uint32_t i = 0; i < 2; ++i) net->order[i] = (net->cuda ? net->cuda->outputBinding(i) : net->d3d->outputBinding(i)) == mb.params ? 0 : 1;
         }
         net->pitch = isVk ? w / 2 * 4 : (w / 2 * 4 + 255) & ~255u;
         net->in    = MakeBuf(uint64_t(w) * h * kInputChannels);
@@ -366,6 +379,9 @@ public:
         for (auto it = retired.begin(); it != retired.end();)
             if (Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
     }
+    int         cudaState = 0;  // 0 not tried, 1 in use, -1 not
+    uint32_t    finished = 0;
+    std::string Rung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
     bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
     bool TakeSlot()
@@ -389,6 +405,7 @@ public:
     bool BeginFrame(void* commands) override
     {
         Poll();
+        if (cudaState == 1 && next > 12 && ++finished == 10) MarkerOk(Rung());  // a dozen recordings on, ten more begun without trouble
         nativeCmd = commands;
         if (isVk)
         {
@@ -547,7 +564,7 @@ public:
         for (uint32_t i = 0; i < count; ++i)
         {
             auto& x = static_cast<NetN&>(*nets[i]);
-            To(*x.in, nri::AccessBits::SHADER_RESOURCE, nri::StageBits::COMPUTE_SHADER);
+            To(*x.in, x.cuda ? nri::AccessBits::SHADER_RESOURCE_STORAGE : nri::AccessBits::SHADER_RESOURCE, nri::StageBits::COMPUTE_SHADER);
             for (auto& o : x.out) To(*o, nri::AccessBits::SHADER_RESOURCE_STORAGE, nri::StageBits::COMPUTE_SHADER);
         }
         Flush();
@@ -574,7 +591,8 @@ public:
                 auto& x = static_cast<NetN&>(*nets[i]);
                 auto  r = [&](const BufN& f) { return reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(f.buf)); };
                 ID3D12Resource* o[2] = {r(*x.out[x.order[0]]), r(*x.out[x.order[1]])};
-                x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
+                if (x.cuda) x.cuda->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
+                else x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
             }
         for (uint32_t i = 0; i < count; ++i)
             for (uint32_t k = 0; k < 2; ++k)

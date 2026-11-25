@@ -82,3 +82,30 @@ The native D3D12 backend was bit-identical to NRI's and no faster in the sample 
 
 The two wordings above were narrowed (they claimed more than was compared or patched). Fixed in code: NRI took features from the GPU instead of the host (now unknownFeatures, API 1.2); completion token ordering (D3D12 MARKER_OUT, Vulkan full barrier + fill + host barrier); host image access masks on Vulkan; D3D12 buffer decay; slot reuse; shared device state; use after free on Release; int8 forced for Auto; unknown NFRUX_ML values refused. Parity after these: 0 bytes differ (6x 720p, BGRA8 3x), FP16 4x 120 dB.
 The validation claim earlier (no synchronization errors) is withdrawn: the layer's activation was never proven.
+
+## A4, long runs (2026-11-25; DLL at commit e07fecf, before the revision 5 fixes; release Streamline DLLs, scripted camera, 1280x701)
+
+| API | multiplier | seconds | evaluations | generated | presented multiplier in every log line after the first |
+|---|---|---|---|---|---|
+| D3D12 | 2x | 275 | 51,000 | 50,998 | 2 (433 of 433) |
+| D3D12 | 6x | 290 | 147,000 | 146,990 | 6 (250 of 250) |
+| Vulkan | 2x | 271 | 51,000 | 50,998 | 2 (433 of 433) |
+| Vulkan | 6x | 292 | 147,000 | 146,990 | 6 (250 of 250) |
+
+No crash. They are 271-292 s, not the 300 s the row asks for; other processes used the machine meanwhile. Not done: validation runs, the
+between-neighbours check, the current DLL for the full time.
+
+Current build (after the fixes), 900 frames each: D3D12 2x 384 fps, 6x 623; Vulkan (cooperative matrix) 2x 390, 6x 629.
+A loader regression was caught by these (the loader patched its own imports: stack overflow at start), fixed.
+## M0b CUDA: go (2026-11-25)
+
+`tests/cuda_spike.cpp`: PTX linked by nvcuda.dll (no toolkit), launched by NVAPI in a D3D12 compute list; chained kernels with UAV barriers 0 of 4096
+wrong, `mma.sync` m16n8k16 s8 product 0 of 128 wrong. `core/ml/cuda_network.cpp`: the whole network, one generated kernel per layer, exact against
+the CPU reference (64x64: 23 cases, 744x464 and 960x544: 5 each, 0 bytes). sm_80 and newer (RTX 30+); older NVIDIA GPUs fall to dot4. Creation
+about 0.7 s the first time at a size, under 0.05 s from the cubin cache (LOCALAPPDATA\NFRUX) - still inside Evaluate (worker thread owed).
+
+Time a network, 40 back to back, idle RTX 4070: 744x464 CUDA 0.155 ms, dot4 0.42, int32 0.85; 960x544 CUDA 0.194, dot4 0.58-0.63, int32 1.02
+(Vulkan int8 cooperative matrix 0.37 at 744x464). Earlier single-shot figures here were affected by idle clocks.
+
+In the sample at 1280x701 (900 frames, fps presented): 2x 384 -> 462, 4x 572 -> 736, 6x 623 -> 889. Parity with Vulkan unchanged (0 bytes; 6x 720p and
+4x 1080p from 720p RGB10A2). Crash markers (core/marker.cpp) guard the rung; their failure path has not been exercised.
