@@ -231,8 +231,7 @@ namespace ffx_ml
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
                 // AMD RDNA2 APUs. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
-                // Workgroups 8 x 8: wider ones (32 x 2) were 2.5% faster for NFRU v2's network alone (nfru_ml_test) but 6% slower
-                // in the proxy (x4, Balanced's sizes between the other passes).
+                // Workgroups 8 x 8: wider ones (32 x 2) were 2.5% faster for the network alone but 6% slower between the other passes.
                 return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 32, 40, 8, 8, 4096, 4};
             case Vendor::Intel:
                 return {8, 16, 8, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles (untuned)

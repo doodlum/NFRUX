@@ -89,12 +89,12 @@ OutputInterpolated is always written too. A failure is returned only for a missi
 | OutputReal, HUDLess, UI, UIAlpha, NoWarp, BidirectionalDistortionField | optional | rule without it |
 | *Subrect{BaseX,BaseY,Width,Height} per input; InputBackbuffer* preferred over the deprecated Backbuffer* | region | whole image (or the back buffer's, same size) |
 | OutputInterpolatedSubrect*, OutputRealSubrect* | where the region goes in the output | the region's own place |
-| EvalFlags bit 0 (UpdateOnlyInsideExtents) | only the region is written: several viewports, a feature each, on one back buffer | the whole image is written |
-| OutputDisableInterpolation | a 4-byte word: 1 when this batch holds copies only (menu, not rendering, reset failures, not ready), else 0; written at k = 1. D3D12: in UNORDERED_ACCESS. Vulkan: NGX buffer resource | not written |
+| EvalFlags bit 0 (UpdateOnlyInsideExtents) | only the region is written: several viewports, a feature each, on one back buffer | the whole image is written (around the region: the back buffer) |
+| OutputDisableInterpolation | a 4-byte word: 1 when this batch holds copies only (menu, not rendering, reset failures, not ready), else 0; written at k = 1. D3D12: in UNORDERED_ACCESS. Vulkan: NGX buffer resource with TRANSFER_DST usage; a host that maps it waits for the submission | not written |
 | BackbufferFrameID | an id that is not the last or the last + 1 restarts the history | not used |
 | DynamicResolution, InternalWidth/Height | depth and vectors resampled (nearest) to one size, the given or half the colour's, so a changing region keeps the history | the region's size |
 | InvertXAxis, InvertYAxis | negate MvecScale | 0 |
-| CameraMotionIncluded | 0: the camera's motion (depth, ClipToPrevClip) is added to the vectors | 1 |
+| CameraMotionIncluded | 0: the camera's motion (depth, ClipToPrevClip) is added to the vectors; without ClipToPrevClip it cannot be (logged) | 1 |
 | MvecScaleX/Y | to motion-vector pixels, **not** multiplied by the size again | 1 |
 | ClipToPrevClip (row-major, row vectors) | camera motion; VP is chained from it | camera basis reconstruction |
 | CameraViewToClip, CameraPos/Up/Right/Fwd, Near, Far, FOV, OrthoProjection | depth and fallback camera | defaults 0.1 / 1000 / 1.0 |
@@ -157,7 +157,7 @@ Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one AP
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8, fp16 or bf16: the float forms hold every int8 value and
 x - zero point exactly, and their float32 sums are the same integers while every partial sum is below 2^24. The bound (per output channel, max
 |x - zp| * sum |w| + |bias|) is computed from the weights when a network is made: 7,021,312 of 16,777,216 for this one; at 2^24 or more the float forms are not
-used (dot4 is). fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only by a host that reports it enabled
+used. A prefix of a sum is at most the sum of absolute values, so partial sums are covered. Order when a float form is refused or fails its self-check: int8, dot4, integer. fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only by a host that reports it enabled
 (NFRUX_SetVulkanFeatures; the tests do, the loader does not). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
 requantisation is off. `conv2d.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
 dilation 1, square kernel and stride, resize on source 0 only, shift >= 1, source strides equal to the words read): graph creation
@@ -178,8 +178,8 @@ rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: 
 its own, copied raw (size-compatible) into the host's. Everything
 else is optional and needs to be *enabled*. Source of truth:
 - Standalone route: the loader intercepts `vkCreateDevice`, obtained through GetProcAddress of vulkan-1.dll
-  and through vkGetInstanceProcAddr / vkGetDeviceProcAddr, whose returned pointer for that name it wraps. It records the enabled
-  extensions and features and appends, when supported per `vkGetPhysicalDeviceFeatures2`: shaderStorageImageExtendedFormats,
+  and through vkGetInstanceProcAddr / vkGetDeviceProcAddr, whose returned pointer for that name it wraps. It appends (and records what it
+  appended), when supported per `vkGetPhysicalDeviceFeatures2`: shaderStorageImageExtendedFormats,
   cooperativeMatrix, vulkanMemoryModel (+ DeviceScope), shaderInt8, storageBuffer8BitAccess, shaderFloat16, storageBuffer16BitAccess, shaderIntegerDotProduct,
   subgroupSizeControl, computeFullSubgroups
   and their extensions. It also wraps vkDestroyDevice (what is on the device is destroyed first). Merge rule: known structures of the pNext chain are copied, unknown ones kept in place (their pNext is changed for the call and put back); a feature that belongs to an aggregate
@@ -311,7 +311,7 @@ M1-M3 do not depend on M0a.
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
 | Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
-| The D3D12 debug layer cannot run here (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
+| The D3D12 debug layer cannot run here; a host that leaves its images in COMMON instead of the guide's states would only be seen by it (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
 
 ## 8. Acceptance
 

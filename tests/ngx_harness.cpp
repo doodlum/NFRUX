@@ -91,6 +91,7 @@ struct Api
     virtual uint32_t ReadWord() = 0;
     virtual NgxHandle* CreateFeature(Params& p) = 0;
     virtual NgxResult Evaluate(NgxHandle* h, Params& p) = 0;  // recorded, submitted, waited for
+    bool evaluateC = false;  // through EvaluateFeature_C
     virtual NgxResult Release(NgxHandle* h) = 0;
     virtual void Shutdown() = 0;
     virtual bool Recreate() = 0;
@@ -284,7 +285,7 @@ struct Api12 : Api
     NgxResult Evaluate(NgxHandle* h, Params& p) override
     {
         Begin();
-        const NgxResult r = Fn<NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, NgxParameter*, void*)>("NVSDK_NGX_D3D12_EvaluateFeature")(cl.Get(), h, &p, nullptr);
+        const NgxResult r = Fn<NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_D3D12_EvaluateFeature_C" : "NVSDK_NGX_D3D12_EvaluateFeature")(cl.Get(), h, &p, nullptr);
         End();
         return r;
     }
@@ -490,7 +491,7 @@ struct ApiV : Api
     NgxResult Evaluate(NgxHandle* h, Params& p) override
     {
         Begin();
-        const NgxResult r = Fn<NgxResult (*)(VkCommandBuffer, const NgxHandle*, NgxParameter*, void*)>("NVSDK_NGX_VULKAN_EvaluateFeature")(cb, h, &p, nullptr);
+        const NgxResult r = Fn<NgxResult (*)(VkCommandBuffer, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_VULKAN_EvaluateFeature_C" : "NVSDK_NGX_VULKAN_EvaluateFeature")(cb, h, &p, nullptr);
         End();
         return r;
     }
@@ -825,6 +826,27 @@ static void Scenes(Api& a, Results& res)
         s.extra = [&](Params& p, int i) { a.BindWord(p, "DLSSG.OutputDisableInterpolation"), p.Set("DLSSG.NotRenderingGameFrames", int(i == 3)); };
         Run(a, s);
         Check(a.ReadWord() == 1, "not rendering: 1", 1);
+        s.extra = [&](Params& p, int) { a.BindWord(p, "DLSSG.OutputDisableInterpolation"), p.Set("DLSSG.MenuDetectionEnabled", 1); };
+        s.uiI = [](int) { return Image(W, H, 1); }, s.frames = 12;
+        Run(a, s);
+        Check(a.ReadWord() == 1, "a menu: 1", 1);
+        s = plain;
+        s.extra = [&](Params& p, int) { a.BindWord(p, "DLSSG.OutputDisableInterpolation"), p.Set("DLSSG.Depth", static_cast<void*>(nullptr)); };
+        Run(a, s);
+        Check(a.ReadWord() == 1, "nothing to interpolate from: 1", 1);
+    }
+    printf("  _C evaluate, video memory estimate\n");
+    {
+        a.evaluateC = true;
+        Check(Run(a, plain).raw == base.raw, "EvaluateFeature_C: the same frames", 1);
+        a.evaluateC = false;
+        Params p;
+        a.Fn<NgxResult (*)(NgxParameter*)>("NVSDK_NGX_D3D12_PopulateParameters_Impl")(&p);
+        void* cb = nullptr;
+        size_t bytes = 0;
+        p.Get("DLSSG.EstimateVRAMCallback", &cb);
+        if (cb) reinterpret_cast<NgxResult (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, size_t*)>(cb)(W, H, W, H, 28, 28, 41, 34, 28, &bytes);
+        Check(bytes > (100u << 20) && bytes < (2048u << 20), "the estimate, MB", double(bytes) / 1048576);
     }
     printf("  frame ids, inverted axes, camera motion, dynamic resolution\n");
     {
@@ -861,6 +883,20 @@ static void Scenes(Api& a, Results& res)
         keep("dynamic internal", u);
         q = Psnr(u.gen[0], truth(3, 0, 2), 24);
         Check(u.ok && q > 30, "a given internal size, dB", q);
+        // Jitter in the region's pixels, the vectors holding it.
+        Scene j = plain;
+        j.extra = [](Params& p, int i) {
+            for (const char* n : {"Depth", "MVecs"}) { const std::string b = std::string("DLSSG.") + n + "Subrect"; p.Set((b + "BaseX").c_str(), 0), p.Set((b + "BaseY").c_str(), 0), p.Set((b + "Width").c_str(), W / 2), p.Set((b + "Height").c_str(), H / 2); }
+            p.Set("DLSSG.DynamicResolution", 1), p.Set("DLSSG.InternalWidth", 400u), p.Set("DLSSG.InternalHeight", 240u), p.Set("DLSSG.MvecScaleX", 0.5f), p.Set("DLSSG.MvecScaleY", 0.5f);
+        };
+        const Out clean = Run(a, j);
+        const auto base2 = j.extra;
+        j.extra = [base2](Params& p, int i) { base2(p, i), p.Set("DLSSG.JitterOffsetX", 2.0f * float(i)), p.Set("DLSSG.JitterOffsetY", -1.5f * float(i)), p.Set("DLSSG.MvecJittered", 1); };
+        j.mvOffset[0] = 4.0f, j.mvOffset[1] = -3.0f;
+        u = Run(a, j);
+        keep("dynamic jitter", u);
+        q = Psnr(u.gen[0], clean.gen[0], 24);
+        Check(u.ok && q > 90, "jitter with it: as without, dB", q);
     }
     printf("  jittered motion vectors\n");
     {

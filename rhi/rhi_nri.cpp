@@ -365,12 +365,14 @@ public:
     }
 
     std::mutex making;
+    bool lastFloat = false, noFloats = false;  // float cooperative matrices: the last made, refused
     int rung = -1, topRung = 0;  // 0 cooperative matrices / CUDA, 1 dot4, 2 integers: the last made, the highest allowed
     bool DropRung() override
     {
         std::lock_guard<std::mutex> lock(making);
         if (rung < 0 || rung >= 2) return false;
         if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
+        if (isVk && rung == 0 && lastFloat && !noFloats) { noFloats = true; return true; }  // the int8 matrices next, if there are any
         topRung = rung + 1;
         return true;
     }
@@ -385,7 +387,7 @@ public:
         {
             const ffx_ml::DeviceContext dc = {vk.instance, vk.physicalDevice, vk.device, vk.gipa, vk.gdpa, vk.mlFeatures};
             ffx_ml::Path path = ffx_ml::Path::Auto;
-            // Cooperative matrices: int8 where the driver has them (NVIDIA, Intel XMX, AMD WMMA), else fp16 or bf16, whose sums are the same
+            // Cooperative matrices: fp16 first on NVIDIA, int8 first elsewhere (Intel XMX, AMD WMMA); fp16 and bf16 are those whose sums are the same
             // integers while below 2^24 (bound computed here from the weights; tested at the extremes; and the self-check compares).
             ffx_ml::MatType type = ffx_ml::MatType::None;
             if (ml)
@@ -403,7 +405,11 @@ public:
             if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
             if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8 && ffx_ml::AccumulatorBound(DescribeModel(w, h)) >= (1 << 24))
-                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
+                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+            if (noFloats && topRung == 0 && sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8)
+                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+            if (sel.path == ffx_ml::Path::CoopMat) lastFloat = sel.matType != ffx_ml::MatType::Int8;
+            else lastFloat = false;
             rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
             sel.rescaleFloat = false;  // exact
             if (path != ffx_ml::Path::Auto && !topRung && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }

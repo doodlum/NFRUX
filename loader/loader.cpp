@@ -1,4 +1,4 @@
-// The loader role of NFRUX's one DLL, when its file is named as a Windows DLL the game loads (dbghelp.dll, version.dll, winmm.dll): Streamline's calls to the NGX core for feature 11 (frame generation) go to NFRUX, the
+// The loader role of NFRUX's one DLL, when its file is named as a Windows DLL the game loads (dbghelp.dll, version.dll): Streamline's calls to the NGX core for feature 11 (frame generation) go to NFRUX, the
 // rest to the core untouched. Nothing outside this process changes. SPDX-License-Identifier: MIT
 #include "ngx.h"
 #include "proxy_exports.h"
@@ -214,6 +214,24 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         fmm->vulkanMemoryModel |= s12.vulkanMemoryModel, fmm->vulkanMemoryModelDeviceScope |= s12.vulkanMemoryModelDeviceScope;
         f8->shaderInt8 |= s12.shaderInt8, f8s->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess;
     }
+    // Promoted in 1.3: without its aggregate, only when the extension is there to enable.
+    const bool own13 = !f13;
+    auto device = [&](const char* n) {
+        static auto en = (PFN_vkEnumerateDeviceExtensionProperties)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkEnumerateDeviceExtensionProperties");
+        uint32_t count = 0;
+        if (!en || en(pd, nullptr, &count, nullptr)) return false;
+        std::vector<VkExtensionProperties> e(count);
+        en(pd, nullptr, &count, e.data());
+        for (auto& x : e) if (!strcmp(x.extensionName, n)) return true;
+        return false;
+    };
+    if (own13)
+        for (auto [n, b] : {std::pair<const char*, int>{VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME, 0}, std::pair<const char*, int>{VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME, 1}})
+        {
+            if (device(n)) { if (!has(n)) ext.push_back(n); }
+            else if (b) s13.subgroupSizeControl = s13.computeFullSubgroups = VK_FALSE;
+            else s13.shaderIntegerDotProduct = VK_FALSE;
+        }
     if (f13) f13->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, f13->subgroupSizeControl |= s13.subgroupSizeControl, f13->computeFullSubgroups |= s13.computeFullSubgroups;
     else
     {

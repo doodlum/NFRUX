@@ -172,6 +172,8 @@ const Texture* FrameGenerator::Crop(const EvalInputs& in, bool depth, const Rect
     struct { int32_t base[2], size[2], outSize[2], depthBase[2], depthSize[2], camera, pad; float toUnits[2], pad2[2], clip[16]; } k = {
         {int32_t(r.x), int32_t(r.y)}, {int32_t(r.w), int32_t(r.h)}, {int32_t(w), int32_t(h)}, {int32_t(dr.x), int32_t(dr.y)}, {int32_t(dr.w), int32_t(dr.h)}};
     k.camera = !depth && !in.cameraMotion && in.hasClipToPrevClip;
+    static bool said = false;
+    if (!depth && !in.cameraMotion && !in.hasClipToPrevClip && !said) said = true, Log("camera motion is not in the vectors and there is no ClipToPrevClip: not added");
     for (int i = 0; i < 2; ++i) k.toUnits[i] = in.mvScale[i] != 0 ? float(i ? r.h : r.w) / in.mvScale[i] : 0.0f;
     memcpy(k.clip, in.clipToPrevClip, sizeof(k.clip));  // row-major for row vectors: the columns of the shader's matrix
     const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Tex(1, *src), Bind::Tex(2, *c.tex), Bind::Tex(3, *dep)};
@@ -307,7 +309,7 @@ bool FrameGenerator::InMenu(const EvalInputs& in)
     if (!m_menuPass) m_menuPass = m_dev.CreatePass(shaders::kMenu);
     Texture*       counts = Keep(m_menuCounts, Format::R32Uint, 2, 1);
     const Texture* src    = m_dev.Wrap(ui, false);
-    if (!m_menuPass || !counts || !src || r.x + r.w > ui.width || r.y + r.h > ui.height || false)
+    if (!m_menuPass || !counts || !src || r.x + r.w > ui.width || r.y + r.h > ui.height)
         return m_inMenu;
     m_dev.Clear(*counts, 1.0f);  // every bit set: the shader's adds start from there
     const int32_t k[8] = {int32_t(r.x), int32_t(r.y), int32_t(r.w), int32_t(r.h), 8, alpha};
@@ -434,7 +436,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     const uint32_t kind = (hudless ? 1u : 0u) | (staged ? 2u : 0u) | (in.distortion ? 4u : 0u);
     if (kind != m_kind) m_kind = kind, m_restart = true;  // the history is another kind of image
     f.reset = in.reset || m_restart;
-    f.jitter[0] = in.jitter[0], f.jitter[1] = in.jitter[1], f.motionJittered = in.motionJittered;
+    f.jitter[0] = in.jitter[0] * float(rw) / float(dr.w), f.jitter[1] = in.jitter[1] * float(rh) / float(dr.h);  // pixels of the region given
+    f.motionJittered = in.motionJittered;
     f.mvScale[0] = in.mvScale[0] * float(l.back.w) / float(std::max(1u, mw));
     f.mvScale[1] = in.mvScale[1] * float(l.back.h) / float(std::max(1u, mh));
     f.cameraNear = in.cameraNear, f.cameraFar = in.cameraFar, f.fovY = in.fovY, f.orthographic = in.ortho;
@@ -525,6 +528,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     const Rect region = Whole(in.backRect, in.back) ? Rect{0, 0, in.back.width, in.back.height} : in.backRect;
     auto put = [&](const Texture& from, const Texture& to, const Rect& at) {
         const bool elsewhere = at.w && (at.x != region.x || at.y != region.y);
+        if (!in.onlyInside && elsewhere) m_dev.CopyTexture(back, to);
         if (in.onlyInside || elsewhere) m_dev.CopyRect(from, region.x, region.y, to, at.w ? at.x : region.x, at.w ? at.y : region.y, region.w, region.h);
         else m_dev.CopyTexture(from, to);
     };
