@@ -91,6 +91,7 @@ struct Api
     virtual uint32_t ReadWord() = 0;
     virtual NgxHandle* CreateFeature(NgxParameter& p) = 0;
     virtual NgxResult Evaluate(NgxHandle* h, NgxParameter& p) = 0;  // recorded, submitted, waited for
+    bool isBack = false;  // the next image made is a back buffer: always in the guide's state
     bool evaluateC = false;  // through EvaluateFeature_C
     virtual NgxResult Release(NgxHandle* h) = 0;
     virtual void Shutdown() = 0;
@@ -220,7 +221,7 @@ struct Api12 : Api
                                  output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         bool told = false;
         if (output) t->home = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        if (const char* s = getenv("NFRUX_TEST_INPUT_STATE"); s && !output)  // inputs in another state, told as the loader tells it
+        if (const char* s = getenv("NFRUX_TEST_INPUT_STATE"); s && !output && !isBack)  // inputs in another state, told as the loader tells it
             t->home = D3D12_RESOURCE_STATES(strtoul(s, nullptr, 16)), told = true;
         if (!output && getenv("NFRUX_TEST_WRONG_STATE")) t->home = D3D12_RESOURCE_STATE_COPY_SOURCE;  // the layers' control: must be reported
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, t->home, nullptr, IID_PPV_ARGS(&t->r));
@@ -639,7 +640,10 @@ static Out Run(Api& a, const Scene& s, NgxHandle* use = nullptr)
     Out o;
     Params p;
     auto tex = [&](Fmt f, uint32_t w, uint32_t h, bool out = false) { return a.Create(f, w, h, out); };
-    TexP back = tex(s.back, s.w, s.h), out = tex(s.back, s.w, s.h, true), real = tex(s.back, s.w, s.h, true), depth = tex(F_R32F, s.dw, s.dh), mv = tex(F_RG16F, s.dw, s.dh);
+    a.isBack = true;
+    TexP back = tex(s.back, s.w, s.h);
+    a.isBack = false;
+    TexP out = tex(s.back, s.w, s.h, true), real = tex(s.back, s.w, s.h, true), depth = tex(F_R32F, s.dw, s.dh), mv = tex(F_RG16F, s.dw, s.dh);
     TexP hud, ui, al, nw, fd;
     Image dI(s.dw, s.dh, 0.9f), mI(s.dw, s.dh);
     for (uint32_t i = 0; i < s.dw * s.dh; ++i) mI.p[i * 4] = -8 + s.mvOffset[0], mI.p[i * 4 + 1] = -2 + s.mvOffset[1];
@@ -817,7 +821,10 @@ static void Scenes(Api& a, Results& res)
         Check(MaxDiff(around.gen[0], around.back, out2) == 0, "and the back buffer around it", 0);
         // Only the region is written: the second viewport's leaves the first's.
         Params p;
-        TexP back = a.Create(F_RGBA8, 2 * W, H, false), out = a.Create(F_RGBA8, 2 * W, H, true), depth = a.Create(F_R32F, W, H, false), mv = a.Create(F_RG16F, W, H, false);
+        a.isBack = true;
+        TexP back = a.Create(F_RGBA8, 2 * W, H, false);
+        a.isBack = false;
+        TexP out = a.Create(F_RGBA8, 2 * W, H, true), depth = a.Create(F_R32F, W, H, false), mv = a.Create(F_RG16F, W, H, false);
         Image dI(W, H, 0.9f), mI(W, H);
         for (uint32_t i = 0; i < W * H; ++i) mI.p[i * 4] = -8, mI.p[i * 4 + 1] = -2;
         a.Upload(*depth, Encode(dI, F_R32F)), a.Upload(*mv, Encode(mI, F_RG16F));
