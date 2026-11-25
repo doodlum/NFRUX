@@ -161,7 +161,7 @@ colour subrects, HUD-less in RGB10A2 / BGRA8, outputs BGRA8 / RGB10A2 / RGBA16F,
 features, release, release twice, evaluate after release, create again. Between the APIs: strict 49 of 49 outputs byte-identical; relaxed 40 of 49,
 the rest 103 dB or better. Depth and motion subrects: only checked to evaluate. PQ UI values are not checked separately.
 
-- Soak, 2000 evaluates each API: video memory and handles flat.
+- Soak, 2000 evaluates each API: video memory and handles flat (video memory on D3D12 only here; on Vulkan it was not measured: see the final evidence).
 - Minimal Vulkan 1.2 host (only shaderStorageImageExtendedFormats): all checks, byte-identical to D3D12, no validation message.
 - Found and fixed by it: members outliving their device (crash when a second feature was released); the network kernels were SPIR-V 1.6 (not valid on
   a 1.2 device).
@@ -269,3 +269,25 @@ different.
 
 nvngx_dlssg.dll links no graphics DLL directly (d3d12 and dxgi are delay-loaded; vulkan-1 is loaded by name); no shared-handle call in the sources or
 imports. It needs the VC++ 2015-2022 runtime.
+
+# Final evidence (revision 6)
+
+Commit 80c9418 unless said. Strict: `build-strict` (NFRUX_STRICT_MATH=ON). Shipped: the default build. RTX 4070, driver 610.88, 2026-11-25.
+
+| Row | Result |
+|---|---|
+| A1 | D3D12 int32, dot4 and CUDA exact at 64x64 (23 cases), 744x464 and 960x544 (5 each); Vulkan cooperative matrix (int8; fp16 and bf16 too), dot4 and scalar exact at its sizes (SPIR-V 1.5 kernels) |
+| A2a | Strict, 30 cases (10 sizes / formats x 2x, 4x, 6x; 8 frames; RGBA16F included): 0 bytes in every output and intermediate, exit 0 |
+| A2b | Shipped, the same 30: worst 86.3 dB, exit 0. The limits caught a real one: above 1080 rows pass 01 rounds from an exact half and fused math picked another texel (63 dB, 0.013% over 3 codes); the reduction passes are strict in every build since |
+| A3, A14 | see below (the reference run) |
+| A5 | 64 recorded frames an API (66 dumped, frame 1 skipped by the sample's counter), HUD-less 1280x701, DLSS off: strict 0 bytes at 2x, 4x, 6x on both recordings; shipped at least 75.5 dB, at most 0.0002% over 1 code; no drift (the worst frame is not late: the limit holds in every frame) |
+| A7 | Six rungs forced: harness 61 of 61 each. Self-check faults and crash marker as earlier |
+| A9, A10 | Harness 124 checks (61 an API and 2 between): strict 55 of 55 outputs byte-identical; shipped all within 96 dB. New: sRGB images (RGBA8 and BGRA8; stored values equal to UNORM's), jittered vectors, release while another feature evaluates, device destroyed and made again (D3D12: 0 references left), both APIs at once on two threads. Khronos validation + synchronisation: 0 messages (1.3 host and minimal 1.2 host), through device destruction. Soak 2000 an API: video memory (DXGI, the process's, read on both) and handles flat |
+| A11 | as above; loaded modules at run time in each mode not recorded |
+| Not covered | D3D12 debug layer; PQ UI values; nvapi / nvcuda absent; other GPUs |
+
+A4 on the final DLL (293ca58): D3D12 2x 239 s, x2 in 400 of 400 log lines, 44,975 of 45,000 logged evaluations generated; D3D12 6x 284 s, x6 in 300 of 300, 176,865
+of 177,000. Vulkan 2x 225 s and 6x 165 s, exit 0, but the window lost focus part-way (Streamline's log: "DLSS-G disabled: window not focused"; another
+user of the machine) and it presented 1x from there: 20,983 of 21,000 and 8,890 of 9,000 generated before. The earlier Vulkan drop to 1x is the same effect.
+The runs are under 300 s, and the window was clamped to 1284x701 by the desktop although 1920x1080 was asked.
+With the new loader NGX Shutdown reaches NFRUX on both APIs (loader log).
