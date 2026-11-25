@@ -284,7 +284,7 @@ Commit 80c9418 unless said. Strict: `build-strict` (NFRUX_STRICT_MATH=ON). Shipp
 | A7 | Six rungs forced: harness 61 of 61 each. Self-check faults and crash marker as earlier |
 | A9, A10 | Harness 124 checks (61 an API and 2 between): strict 55 of 55 outputs byte-identical; shipped all within 96 dB. New: sRGB images (RGBA8 and BGRA8; stored values equal to UNORM's), jittered vectors, release while another feature evaluates, device destroyed and made again (D3D12: 0 references left), both APIs at once on two threads. Khronos validation + synchronisation: 0 messages (1.3 host and minimal 1.2 host), through device destruction. Soak 2000 an API: video memory (DXGI, the process's, read on both) and handles flat |
 | A11 | as above; loaded modules at run time in each mode not recorded |
-| Not covered | D3D12 debug layer; PQ UI values; nvapi / nvcuda absent; other GPUs |
+| Not covered | A4 as written (300 s at 1920x1080 with focus kept); D3D12 debug layer; the reduction passes against an outside reference; PQ UI values; nvapi / nvcuda absent; other GPUs |
 
 A4 on the final DLL (293ca58): D3D12 2x 239 s, x2 in 400 of 400 log lines, 44,975 of 45,000 logged evaluations generated; D3D12 6x 284 s, x6 in 300 of 300, 176,865
 of 177,000. Vulkan 2x 225 s and 6x 165 s, exit 0, but the window lost focus part-way (Streamline's log: "DLSS-G disabled: window not focused"; another

@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 6, under review (changes listed in docs/REVIEWS.md). Revision 5 was agreed by all three reviewers. Nothing under "Acceptance" counts as done until its
+Status: revision 6, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -285,6 +285,7 @@ M1-M3 do not depend on M0a.
 | Streamline limits multi-frame on RTX 40 | A4 records what it grants; 3x-6x then proven by A10 and A2, said so |
 | Cross-API rounding larger than budget | intermediates dumped per pass; the first differing pass is found |
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
+| Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
 | The D3D12 debug layer cannot run here (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
 

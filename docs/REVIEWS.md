@@ -33,3 +33,9 @@ Revision 5 at commit 61d7e69 is the agreed design; the edits after it are the re
 Revision 6 (after M0d, A12, A3 and two decisions): strict / relaxed math (D1); the nfru-mfg branch as the reference (D1); optical flow
 hardware dropped with numbers (D4); cooperative vectors and DirectML dropped (D3); scatter removed; pass 01 in; D7 as built; MvecJittered; A3 as
 run; sizes to 8K.
+
+| 6 | architecture | DISAGREE, then AGREE | 2 (sRGB images; Shutdown and device end), fixed |
+| 6 | code accuracy | DISAGREE, DISAGREE, then AGREE | 2 (Vulkan video memory not measured; A3 table owed), fixed |
+| 6 | readiness and tests | DISAGREE, then AGREE | 4 (R5, OptiScaler routes, strict / shipped criteria, evidence rule), fixed |
+
+Revision 6 is the agreed design (2026-11-25). A1 was narrowed to what the conformance programs run.

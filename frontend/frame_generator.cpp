@@ -485,6 +485,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     m_oldCuts.erase(std::remove_if(m_oldCuts.begin(), m_oldCuts.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_oldCuts.end());
     if (!m_dev.BeginFrame(commands))
         return false;  // nothing can be recorded (32 recordings unfinished after 2 s)
+    struct Recording { Device& d; bool open = true; void End() { if (open) open = false, d.EndFrame(); } ~Recording() { End(); } } recording{m_dev};  // ended whatever is thrown
     ++m_evaluations;  // recordings: 32 at most are in flight, so what is 256 old is free
     if (in.index <= 1)
     {
@@ -501,7 +502,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     Texture *pBack = m_dev.Wrap(in.back, false), *pOut = m_dev.Wrap(in.output, true);
     if (!pBack || !pOut)
     {
-        m_dev.EndFrame();
+        recording.End();
         return false;
     }
     Texture &back = *pBack, &out = *pOut;
@@ -540,7 +541,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         }
         add("gen", out);
     }
-    m_dev.EndFrame();
+    recording.End();
     if (m_evaluations % 3000 == 0)
         Log("%llu evaluations, %llu generated", (unsigned long long)m_evaluations, (unsigned long long)m_generated);
     return true;
