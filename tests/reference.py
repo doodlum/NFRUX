@@ -92,6 +92,9 @@ for info in cfg.infos:
             for j, t in enumerate(d["t"].tolist()):
                 add("blend", n, info, psnr(((1 - t) * d["rgb_m1"] + t * d["rgb_p1"])[None, :, y0:y0 + ch, x0:x0 + cw], gt[j]))
     print(info.path.stem, {a: {k: round(float(np.mean(v)), 2) for k, v in b.items()} for a, b in acc.items()}, flush=True)
+for k in sorted(acc["nfrux"]):  # the gap to torch by which generated frame
+    n = int(k[0]); a, b = np.array(acc["nfrux"][k]).reshape(-1, n - 1), np.array(acc["torch"][k]).reshape(-1, n - 1)
+    print("gap by frame", k, np.round((a - b).mean(0), 2), "median", np.round(np.median(a - b, 0), 2))
 hard = {}
 for k in acc["nfrux"]:
     m = np.array(acc["torch"][k]) < 45

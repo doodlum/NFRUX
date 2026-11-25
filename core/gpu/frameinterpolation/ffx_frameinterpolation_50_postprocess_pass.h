@@ -28,11 +28,12 @@ FFX_MIN16_F2 LoadMotionQMVD(int32_t2 pixel, out bool dynamic_oob_hole)
     return FFX_MIN16_F2(motion) * FFX_MIN16_F(!dynamic_oob_hole);
 }
 
-FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor)
+// prior: the multi-frame network is trained with log(prior) added to its logits, [1 - t, t, 1 - t, t] (the SDK's nfru-mfg branch).
+FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor, FFX_MIN16_F4 prior)
 {
     // Subtract the max value to help reduce overflow issues
     FFX_MIN16_F4 stable_ten     = tensor - max4(tensor);
-    FFX_MIN16_F4 e_ten          = exp2(stable_ten * 1.44269504088896340736f);
+    FFX_MIN16_F4 e_ten          = exp2(stable_ten * 1.44269504088896340736f) * prior;
     FFX_MIN16_F  sum            = ((e_ten.x + e_ten.y) + e_ten.z) + e_ten.w;
     FFX_MIN16_F4 smax_activated = e_ten / (sum + HALF_MIN);
     return smax_activated;
@@ -128,7 +129,7 @@ void postprocess(int32_t2 output_pixel)
     //-------------------------------------------------------------------------
     // 4) Colour blending
     //-------------------------------------------------------------------------
-    params = Stable_Softmax(params);
+    params = Stable_Softmax(params, FFX_MIN16_F4(1.0f - timestep, timestep, 1.0f - timestep, timestep));
 
     FFX_MIN16_F3 rgb_t = FFX_MIN16_F3(0.f);
     rgb_t += rgb_m1_warp_t_mv * params.x;
