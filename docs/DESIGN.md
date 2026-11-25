@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 5 (NRI feature handling, locks, M0e, acceptance rows), for review. Revision 3 was agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
+Status: revision 5, agreed by all three reviewers (docs/REVIEWS.md). Revision 3 was agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -98,8 +98,7 @@ Parameters are read through the caller's `NVSDK_NGX_Parameter` vtable; Decky's o
 PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.NeedsUpdatedDriver` = 0,
 `.MinDriverVersionMajor/Minor` = 0, `.FeatureInitResult` = Success, `DLSSG.MultiFrameCountMax` = kMaxGenerated.
 
-States. Hypothesis from Decky, proven in M0 by a native probe with the debug layer / validation before anything depends on
-it: D3D12 COMMON in and out; Vulkan GENERAL in and out. Barriers use compute-legal states only
+States. Hypothesis from Decky, observed in M0a, to be shown with the debug layer / validation before M5 exits: D3D12 COMMON in and out; Vulkan GENERAL in and out. Barriers use compute-legal states only
 (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
@@ -134,8 +133,7 @@ What NRI needs of a wrapped Vulkan device: 1.2 and the Vulkan 1.0 features the G
 after v192, the reason for the pin) makes it treat every optional 1.1+ feature (bufferDeviceAddress, synchronization2, maintenance*, memoryPriority,
 ...) as absent; `minorVersion` is always given as 2 and no extensions are listed, whatever the GPU reports, as the host's own choice is not known. Below
 1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" is an assumption on both routes; the ones our call set uses are
-shaderStorageImageExtendedFormats and shaderInt64 (atomics rung only), which the loader adds. `queueFamily`: NRI takes a queue from the family it is
-given (0); it is never submitted to; the loader's record of the host's queue families is passed when known. On the OptiScaler route the
+shaderStorageImageExtendedFormats and shaderInt64 (atomics rung only), which the loader adds. No queue family is given to NRI (it would ask for a queue the host may not have made; NFRUX never submits through it). On the OptiScaler route the
 assumptions are exactly (a) 1.2, (b) shaderStorageImageExtendedFormats, logged at creation. A minimal-host test is A10.
 Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8 only (the runtime's fp16
@@ -167,7 +165,7 @@ else is optional and needs to be *enabled*. Source of truth:
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the
   app's own process and device are affected; additions are logged.
-- OptiScaler route: the enabled set is unknown. The floor is used, with one named assumption, that
+- OptiScaler route: the enabled set is unknown. The floor is used, with the two assumptions of D1b (Vulkan 1.2, and that
   `shaderStorageImageExtendedFormats` works (reported by every desktop driver; outside strict validity when the app has not enabled it,
   and logged so). Formats rgba8/rgba16f/r32f/r32ui need no feature. `NFRUX_VK_ASSUME_FEATURES=1` (opt-in, same caveat) enables the
   optional rungs; the installer offers it for drivers listed as tested.
@@ -258,7 +256,7 @@ family when the device supports typed store; otherwise a same-family scratch + c
 through a swizzling convert pass into a render-legal copy source of that family via a buffer copy.
 
 **D10. Build.** CMake, MSVC x64, Vulkan SDK >= 1.4.363 tools and Python 3 (standard library only). Clean checkout:
-`cmake -B build -A x64 && cmake --build build --config Release`. Run time needs no compiler.
+`tools\build_nri.ps1` (network, once), then `cmake -B build -A x64` and `cmake --build build --config Release`. Run time needs no compiler.
 
 ## 6. Milestones
 
@@ -267,7 +265,7 @@ through a swizzling convert pass into a render-legal copy source of that family 
 | M0a | Loader probe (D6) and state probe (section 4) in the sample, both APIs | D6 pass condition; states recorded |
 | M0b | CUDA spike: one 3x3 layer in a compute list, bytes against the reference | exact -> rung stays; else dropped and R5 text amended, reported |
 | M0d | (requested) SM 6.9 cooperative vectors, when the host exposes them or through NVAPI, and DirectML / metacommand integer convolution (exact int32 sums, our rescale after): one 3x3 layer each, exactness and time against dot4 and CUDA | each becomes a rung if exact and faster on some device class, else dropped with numbers |
-| M0e | Vulkan optical flow re-examined: Evaluate does get a queue and pool (M0a) | D4 rewritten either way |
+| M0e | Vulkan optical flow (D4's candidate) | D4's pass condition, else offline only |
 | M0c | THIRD_PARTY.md, notices | written |
 | M1 | NRI rhi, network, completion token, build system (done, A1 partly) | A1 |
 | M2 | core on Vulkan, capture/replay | A3, A14 |

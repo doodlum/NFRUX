@@ -24,3 +24,8 @@ Architecture and code accuracy agreed on revision 2; revision 3 changed only wha
 | 4 | architecture | DISAGREE | 2 |
 | 4 | code accuracy | DISAGREE | 2 |
 | 4 | readiness and tests | DISAGREE | 4 |
+| 5 | architecture | AGREE | 0 |
+| 5 | code accuracy | AGREE | 0 |
+| 5 | readiness and tests | AGREE | 0 |
+
+Revision 5 at commit 61d7e69 is the agreed design; the edits after it are the reviewers' own text corrections.

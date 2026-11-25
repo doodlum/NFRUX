@@ -121,6 +121,7 @@ public:
     uint32_t                slotValue[kSlots] = {}, next = 0, slot = 0, usedConstants = 0;
     nri::CommandBuffer*     cmd = nullptr;
     void*                   nativeCmd = nullptr;
+    bool                    stalled = false;
     std::vector<std::unique_ptr<TexN>> wrapped;
     std::vector<nri::AccessLayoutStage> wrappedHome;
     std::vector<nri::TextureBarrierDesc> tb;
@@ -215,10 +216,9 @@ public:
     bool InitVulkan(const VulkanHost& h)
     {
         vk = h, isVk = true;
-        nri::QueueFamilyVKDesc q = {1, nri::QueueType::COMPUTE, h.queueFamily};
         nri::DeviceCreationVKDesc d = {};
         d.vkInstance = h.instance, d.vkDevice = h.device, d.vkPhysicalDevice = h.physicalDevice, d.minorVersion = uint8_t(h.minorVersion);
-        d.queueFamilies = &q, d.queueFamilyNum = 1;
+        
         d.unknownFeatures = true;  // only what Vulkan 1.0 reports: the host's enabled set is not ours to assume
         d.vkExtensions.deviceExtensions = h.deviceExtensions, d.vkExtensions.deviceExtensionNum = h.deviceExtensionCount;
         d.callbackInterface.MessageCallback = Message;
@@ -370,20 +370,20 @@ public:
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
     bool TakeSlot()
     {
-        for (int ms = 0; ms < 2000 && !Lost(); ++ms)
+        for (int ms = 0; ms < (stalled ? 1 : 2000) && !Lost(); ++ms)
         {
             for (uint32_t i = 0; i < kSlots; ++i)
             {
                 const uint32_t s = (next + i) % kSlots;
                 if (slotValue[s] && tokens[s] != slotValue[s]) continue;
-                slot = s;
+                slot = s, stalled = false;
                 slotValue[s] = tokenUpMap[s] = ++next;
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        static bool logged = false;
-        if (!logged) Log("no recording finished in 2 s: frame not generated"), logged = true;
+        if (!stalled) Log("no recording finished in 2 s: frame not generated");
+        stalled = true;  // no waiting again until one does
         return false;
     }
     bool BeginFrame(void* commands) override

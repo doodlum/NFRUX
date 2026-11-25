@@ -23,6 +23,7 @@ std::mutex g_mutex;
 struct Vk { VkInstance i = VK_NULL_HANDLE; VkPhysicalDevice pd = VK_NULL_HANDLE; VkDevice d = VK_NULL_HANDLE; PFN_vkGetInstanceProcAddr gi = nullptr; PFN_vkGetDeviceProcAddr gd = nullptr; } g_vk;
 uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
 bool     g_vkAtomic64 = false, g_vkKnown = false;
+VkDevice g_vkDevice = VK_NULL_HANDLE;
 struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
 std::map<const NgxHandle*, std::unique_ptr<Feature>> g_features;
 std::map<void*, std::shared_ptr<FrameGenerator>> g_warm;  // released features' generators, by host device, for the next create
@@ -47,7 +48,8 @@ std::unique_ptr<Device> DeviceForVk()
     if (VK_API_VERSION_MINOR(p.apiVersion) < 2)
         return Log("Vulkan 1.2 is needed"), nullptr;
     h.minorVersion = 2;  // whatever the GPU reports: the host may have asked for less
-    if (g_vkKnown) h.mlFeatures = g_vkMl, h.atomic64 = g_vkAtomic64;
+    if (!g_vkKnown) Log("Vulkan: assuming 1.2 and shaderStorageImageExtendedFormats are enabled on the game's device (no loader to tell)");
+    if (g_vkKnown && g_vkDevice == g_vk.d) h.mlFeatures = g_vkMl, h.atomic64 = g_vkAtomic64;
     else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", false))
     {
         std::vector<const char*> ext;
@@ -237,7 +239,7 @@ NFRUX_EXPORT NVSDK_NGX_VULKAN_PopulateDeviceParameters_Impl(VkInstance, VkPhysic
 NFRUX_EXPORT NVSDK_NGX_GetAPIVersion() { return 0x15; }
 NFRUX_EXPORT NVSDK_NGX_GetSnippetVersion() { return 0x00040000; }
 // The loader's record of what the game's Vulkan device has enabled.
-extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice, uint32_t mlFeatures, int atomic64) { g_vkMl = mlFeatures, g_vkAtomic64 = atomic64 != 0, g_vkKnown = true; }
+extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures, int atomic64) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkAtomic64 = atomic64 != 0, g_vkKnown = true; }
 extern "C" __declspec(dllexport) uint32_t __cdecl NFRUX_MaxFrames() { return MaxFrames(); }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
