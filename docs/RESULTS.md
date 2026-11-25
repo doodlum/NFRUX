@@ -1,4 +1,4 @@
-# Results
+﻿# Results
 
 ## A1, D3D12 (2026-11-25, RTX 4070, driver 610.88)
 
@@ -374,3 +374,20 @@ First table: 5a2b8c8. The second, on 2ac5a8e, replaces its A1, A2, A7, A9 and A1
 
 A3, A14, A8 were not re-run: the default path's passes, constants and shaders are unchanged (A2 compares the two APIs only); on Vulkan the network kernel is now fp16, exact by A1.
 Guide gaps that remain, on purpose: MvecInvalidValue, ClipToLensClip, 4x4 UI blocks, float back buffers.
+## A4, 1920x1080, release Streamline DLLs, one file (dbghelp.dll), window closed after 315-320 s
+
+| API | multiplier | DLL | log lines at the multiplier (the first, before start, left out) | evaluations generated |
+|---|---|---|---|---|
+| D3D12 | 2x | 2ac5a8e | 388 of 388 | 44,905 of 45,000 |
+| D3D12 | 6x | 2ac5a8e | 241 of 241 | 143,540 of 144,000 |
+| Vulkan | 2x | 5a2b8c8 | 397 of 397 | 44,983 of 45,000 |
+| Vulkan | 6x | 5a2b8c8 | 208 of 208 | 122,920 of 123,000 |
+
+Exit code 0 each. Runs with interruptions, same day: Vulkan on 2ac5a8e 2x 331 of 362 and 6x 200 of 207, the rest at 1x, Streamline's log saying "window not focused" in both; D3D12 on 5a2b8c8
+2x 367 of 400 and 6x 118 of 321, cause not shown (the log was overwritten). Further long runs were skipped (2026-11-25). Not met of A4: the D3D12 debug layer;
+the between-neighbours check.
+
+## db5dc31 (after the last review's two points)
+
+Harness 158 checks (78 an API, 2 between), strict and shipped 0 failed, strict 63 of 63 identical; Khronos + synchronisation validation, both hosts: 0 messages, the moved output region
+without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The long runs above predate it; it changes the int8 retry after a failed float kernel and the moved output region.
