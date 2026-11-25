@@ -391,7 +391,8 @@ public:
     void Poll()
     {
         for (auto it = retired.begin(); it != retired.end();)
-            if (Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
+            // Our work in the host's command buffer has finished, but the buffer may still count as pending (its tail, its fence): kept 16 recordings more.
+            if (next - it->value >= 16 && Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
         for (auto it = reads.begin(); it != reads.end();)
             if (Done(it->slot, it->value)) { Finish(*it); it = reads.erase(it); } else ++it;
     }
