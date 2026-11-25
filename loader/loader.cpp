@@ -343,10 +343,11 @@ static std::vector<SlTag> Tags(const SlTag* t, uint32_t n, void* list)
             if (x.buffer == b && x.lifecycle == 1 && x.resource && x.resource->native && x.resource->state != UINT32_MAX)
             {
                 const uint32_t s = x.resource->state, usable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE;
-                const bool readable = (s & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) != 0, copied = b == 2 || b == 23;  // colours are copied from as well as read
+                const bool readable = (s & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) != 0, copied = b == 2 || b == 23 || b == 69;  // colours are copied from as well as read
                 if ((s & ~usable) == 0 || (readable && !copied)) { if (note) note(x.resource->native, s); continue; }
                 static uint32_t said = 0;
                 if (!(said >> (b % 32) & 1)) said |= 1u << (b % 32), L("tag %u in state 0x%x: %s", b, s, list ? "copied when tagged" : "no command list to copy it on: used as it is");
+                if (note) note(x.resource->native, list ? uint32_t(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) : s);  // copied: no older state of it stays
                 if (list) x.lifecycle = 0, changed = true;
             }
     if (!changed) o.clear();

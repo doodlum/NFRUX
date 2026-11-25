@@ -55,3 +55,11 @@ camera motion, dynamic resolution, VRAM callback, `_C` evaluates); fp16 first on
 | 8 | readiness and tests | AGREE (253ebe3) | 0 |
 
 Revision 8 is the agreed design (2026-11-25). Architecture and readiness agreed before the fixes the third reviewer asked for and checked.
+
+Revision 9 (the D3D12 debug layer's findings: input states, tags, disable word, readback lifetime, 0x40 on DIRECT lists; Vulkan validation; the comparison).
+
+| 9 | architecture | DISAGREE (the tag hook was too wide), then AGREE | 1, fixed |
+| 9 | code accuracy | DISAGREE (the same), then AGREE | 1, fixed |
+| 9 | readiness and tests | DISAGREE, then AGREE | 5 (DLL provenance, commit and A4, Vulkan attribution, UI column, ceiling), fixed |
+
+Revision 9 is the agreed design (2026-11-25). After it: the reviewers' small points on stale state entries and UI alpha.

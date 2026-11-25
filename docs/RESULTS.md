@@ -436,3 +436,5 @@ second frame removed (vectors chained by nearest pixel, matrices multiplied; `ha
 
 One recording, one scene (noisy ray tracing), one GPU: 0.2 dB is not a ranking, and whether about 27 dB is a ceiling there was not measured. The UI in the recording is one opaque-ish panel that
 changes little; opaque means over 90 codes from the HUD-less picture. Picture: `build\compare.png` (not in the repository).
+Re-run on 93cff40: GPU-based validation CUDA and dot4, scalar (D3D12), int8 / dot4 / scalar (Vulkan): 78 of 78 each, 0 messages; A5 replays at 4x (60 and 55 frames): strict 0 bytes, shipped 76.0 and 75.1 dB; parity 1366x767 inverted 6x and 4K
+BGRA8 4x: strict 0 bytes, shipped 98.8 dB or better. On the commit after the agreement: harness strict and shipped, 2000-evaluate soak, sample 4x on both APIs (D3D12 under the debug layer).

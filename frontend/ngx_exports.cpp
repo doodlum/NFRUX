@@ -112,6 +112,7 @@ ExternalImage Image12(NgxParameter* p, const char* n)
     if (!r) return e;
     const D3D12_RESOURCE_DESC d = r->GetDesc();
     e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (strcmp(n, "DLSSG.Backbuffer") && strcmp(n, "DLSSG.OutputInterpolated") && strcmp(n, "DLSSG.OutputReal"))  // Streamline's own, never tags (and an address may be a freed tag's)
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         if (auto it = g_states.find(r); it != g_states.end()) e.state = it->second;
@@ -300,7 +301,8 @@ NFRUX_EXPORT NVSDK_NGX_GetSnippetVersion() { return 0x00040000; }
 extern "C" __declspec(dllexport) void __cdecl NFRUX_NoteState(void* resource, uint32_t state)
 {
     std::lock_guard<std::mutex> lock(g_stateMutex);
-    if (g_states.size() > 256) g_states.clear();
+    if (state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) { g_states.erase(resource); return; }
+    if (g_states.size() > 256 && !g_states.count(resource)) g_states.erase(g_states.begin());
     g_states[resource] = state;
 }
 extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkKnown = true; }

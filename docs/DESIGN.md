@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 9, under review: what the debug layer found (revision 8 was agreed by all three reviewers; docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
+Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -113,17 +113,18 @@ PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.
 States (DLSS-FG Programming Guide): D3D12 inputs arrive and leave in NON_PIXEL_SHADER_RESOURCE, outputs in UNORDERED_ACCESS. Vulkan outputs GENERAL; inputs
 GENERAL, or SHADER_READ_ONLY_OPTIMAL when the NGX resource is not read-write (RTX Remix). Streamline (debug layer, 2026-11-25)
 follows that for the back buffer and outputs only: the disable word is in COPY_DEST, and tagged inputs are in the state the game left them, its copies of tags valid only
-now in COPY_DEST. Seen in Streamline_Sample with the release Streamline 2.14.16 DLLs of the SDK; its guide asks that a tag's state be right when Streamline uses it. Therefore:
+now in COPY_DEST. Seen in Streamline_Sample with the production Streamline 2.14.16 plugins (over the air; sl.common identical to the SDK's); its guide asks that a tag's state be right when Streamline uses it. Therefore:
 - the loader wraps slSetTag / slSetTagForFrame (imports and GetProcAddress) and, once NFRUX's D3D12 feature exists, hands each valid-until-present tag's declared state to the feature
   (`NFRUX_NoteState`, by resource). Nothing is changed in the call;
-- the feature transitions such an input from that state and back where its list can name the state; an input whose state contains NON_PIXEL_SHADER_RESOURCE is read as it is;
+- the feature transitions such an input from that state and back where its list can name the state; on a COMPUTE list an input whose state also has pixel bits is read as it is;
 - only a tag a COMPUTE list cannot use (RENDER_TARGET, DEPTH_WRITE, pixel-only; a colour, which is also copied from, with any pixel or attachment bit) is passed on as valid only now, so that Streamline
   copies it on the game's list. Streamline then takes the declared state as the one there: an assumption, right in the sample, wrong for a game whose present-time state differs from its state at the
   call. Cost: one copy a tag and frame, not measured. No command list given: used as it is;
 - Streamline's copies are in COPY_DEST, known by their debug name ("clone.tagVolatile", present in the release sl.common.dll 2.14.16). Another Streamline that does not set the name: read in the wrong declared
   state, as before this rule. eValidUntilEvaluate tags and D3D11 hosts are left alone; Streamline 1's slSetTag arguments are told apart (its second argument is a small number).
 On the OptiScaler route nothing hands the states over: the guide's state is assumed, which is known to be wrong for tags in other states (section 7).
-Diagnosis switches in the DLL, off unless set: NFRUX_TEST_D3D12_MESSAGES (the debug layer's messages and barriers into the log), NFRUX_TEST_PASSTHROUGH, NFRUX_TEST_ABSENT, NFRUX_TEST_NAMES.Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
+Diagnosis switches in the DLL, off unless set: NFRUX_TEST_D3D12_MESSAGES (the debug layer's messages and barriers into the log), NFRUX_TEST_PASSTHROUGH, NFRUX_TEST_ABSENT, NFRUX_TEST_NAMES.
+Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
 (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
