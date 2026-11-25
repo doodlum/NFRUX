@@ -66,7 +66,7 @@ struct TexN : Texture
     nri::Descriptor *srv = nullptr, *uav = nullptr;
     nri::PlaneBits  planes = nri::PlaneBits::ALL;
     uint64_t        native = 0;
-    mutable nri::AccessLayoutStage state = {nri::AccessBits::NONE, nri::Layout::UNDEFINED, nri::StageBits::NONE};
+    mutable nri::AccessLayoutStage state = {nri::AccessBits::NONE, nri::Layout::UNDEFINED, nri::StageBits::ALL};
     ~TexN() override;
 };
 struct BufN : Buffer
@@ -442,6 +442,9 @@ public:
     {
         if (tb.empty() && bb.empty()) return;
         nri::BarrierDesc b = {};
+        static const bool full = EnvFlag("NFRUX_FULL_BARRIERS", false);  // diagnosis
+        nri::GlobalBarrierDesc g = {{nri::AccessBits::SHADER_RESOURCE_STORAGE | nri::AccessBits::COPY_DESTINATION, nri::StageBits::ALL}, {nri::AccessBits::SHADER_RESOURCE_STORAGE | nri::AccessBits::SHADER_RESOURCE | nri::AccessBits::COPY_SOURCE | nri::AccessBits::COPY_DESTINATION, nri::StageBits::ALL}};
+        if (full) b.globals = &g, b.globalNum = 1;
         b.textures = tb.data(), b.textureNum = uint32_t(tb.size()), b.buffers = bb.data(), b.bufferNum = uint32_t(bb.size());
         n.CmdBarrier(*cmd, b);
         tb.clear(), bb.clear();

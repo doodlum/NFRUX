@@ -341,10 +341,10 @@ FfxFloat32 NormalizeDepth(FfxFloat32 depth)
 {
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH
     // [1-near, 0-far] depth - invert to [0-near, 1-far] then apply same transform
-    return 1.0 - (log(DEPTH_LOG_K * depth + 1) / log(DEPTH_LOG_K + 1));
+    return 1.0 - (log2(DEPTH_LOG_K * depth + 1) / log2(DEPTH_LOG_K + 1));
 #else
     // [0-near, 1-far] depth
-    return 1.0 - (log(DEPTH_LOG_K * (1.0 - depth) + 1) / log(DEPTH_LOG_K + 1));
+    return 1.0 - (log2(DEPTH_LOG_K * (1.0 - depth) + 1) / log2(DEPTH_LOG_K + 1));
 #endif
 }
 

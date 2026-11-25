@@ -32,7 +32,7 @@ FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor)
 {
     // Subtract the max value to help reduce overflow issues
     FFX_MIN16_F4 stable_ten     = tensor - max4(tensor);
-    FFX_MIN16_F4 e_ten          = exp(stable_ten);
+    FFX_MIN16_F4 e_ten          = exp2(stable_ten * 1.44269504088896340736f);
     FFX_MIN16_F  sum            = dot(e_ten, FFX_MIN16_F4(1.0f));
     FFX_MIN16_F4 smax_activated = e_ten / (sum + HALF_MIN);
     return smax_activated;

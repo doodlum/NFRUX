@@ -112,6 +112,8 @@ def build(job):
         h = open(b + ".hlsl").read()
         for k in ("float", "int", "uint"):
             h = h.replace("min16" + k, k)
+        if "uint64_t" in h:  # SPIRV-Cross emits the 32-bit intrinsic for 64-bit buffer atomics
+            h = h.replace(".InterlockedMin(", ".InterlockedMin64(")
         open(b + ".hlsl", "w").write(h)
     run([XCROSS, b + ".spv", "--reflect", "--output", b + ".json"])
     run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", "-Gis",

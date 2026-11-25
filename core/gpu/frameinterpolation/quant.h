@@ -35,7 +35,7 @@ FfxUInt32 qFloat(FfxFloat32x2 flow, FfxFloat32 depth)
     FfxInt32 id = FfxInt32(round(depth * depth_max));
 
     FfxInt32 absmax = max(abs(ix), abs(iy));
-    FfxInt32 exp    = clamp(findMSB(absmax), 0, (1 << _BITS_EXP) - 1);
+    FfxInt32 exp    = clamp(absmax > 0 ? findMSB(absmax) : 0, 0,  /* NFRUX: findMSB(0) differs in HLSL */ (1 << _BITS_EXP) - 1);
 
     // exp needs to be cast to FfxInt32 here to avoid underflow
     FfxInt32 shift = max(exp - (FfxInt32(_BITS_X) - 1), 0);
@@ -75,7 +75,7 @@ FfxUInt32 qFloat(FfxFloat32x2 flow, FfxInt32 depth)
     FfxInt32 id = depth;
 
     FfxInt32 absmax = max(abs(ix), abs(iy));
-    FfxInt32 exp    = clamp(findMSB(absmax), 0, (1 << _BITS_EXP) - 1);
+    FfxInt32 exp    = clamp(absmax > 0 ? findMSB(absmax) : 0, 0,  /* NFRUX: findMSB(0) differs in HLSL */ (1 << _BITS_EXP) - 1);
 
     // exp needs to be cast to FfxInt32 here to avoid underflow
     FfxInt32 shift = max(exp - (FfxInt32(_BITS_X) - 1), 0);

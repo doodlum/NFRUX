@@ -276,7 +276,7 @@ bool Interpolator::Impl::Create(std::string* error)
     k._RandomSeed            = 2357136044u;
     k._UseReducedMotionInput = allInput ? 1u : 0u;
     memcpy(lastVP, s.initialViewProjection, sizeof(lastVP));
-    return MakeOuts(1, error);
+    return MakeOuts(kMaxGenerated, error);
 }
 
 bool Interpolator::Impl::MakeOuts(uint32_t n, std::string* error)
