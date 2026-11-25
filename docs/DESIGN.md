@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 3, for review. Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
+Status: revision 3, agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -157,6 +157,8 @@ else is optional and needs to be *enabled*. Source of truth:
   `shaderStorageImageExtendedFormats` works (reported by every desktop driver; outside strict validity when the app has not enabled it,
   and logged so). Formats rgba8/rgba16f/r32f/r32ui need no feature. `NFRUX_VK_ASSUME_FEATURES=1` (opt-in, same caveat) enables the
   optional rungs; the installer offers it for drivers listed as tested.
+The loader hands the DLL the recorded set per VkDevice (export `NFRUX_SetVulkanFeatures`); no record means the OptiScaler behaviour.
+BGRA8 outputs take D9's scratch-and-convert path unless NFRUX or the loader knows the image is MUTABLE.
 A4's validation run uses the standalone loader, which makes the cooperative-matrix rung valid. Fallback when M0a cannot intercept
 vkCreateDevice: Vulkan uses the floor, A4 claims only that, and the ladder text is amended.
 CUDA: `gen_ptx.py` writes PTX (sm_75+ `mma.sync` s8 GEMM per layer, operands laid out as the dot4 kernel's). NVAPI entry points by
@@ -167,7 +169,7 @@ UNORDERED_ACCESS. Batches interleave like the Vulkan path.
 
 Crash safety for optional rungs (CUDA, cooperative matrix, NVOF): before the first use per (device, driver, rung, NFRUX version) a
 marker file "attempting" is written; it becomes "ok" when the completion token (D5) shows the first 10 frames finished with a
-correct self-check. Orderly Release, Shutdown or process detach clears it. Two consecutive starts that find "attempting" disable the rung (one line in the log, env override); markers are per process id and an unwritable folder means no marker and the floor. A
+correct self-check. Orderly Release, Shutdown or process detach clears it (not after a device removal or a failed token wait). Two consecutive starts that find "attempting" disable the rung (one line in the log, env override); markers are per process id and an unwritable folder means no marker and the floor. A
 device loss in the game's process cannot be recovered and is not claimed to be.
 
 **D4. Optical flow.** Default everywhere: the compute block match the network was trained with. NVIDIA flow hardware is a second
@@ -240,7 +242,7 @@ through a swizzling convert pass into a render-legal copy source of that family 
 |---|---|---|
 | M0a | Loader probe (D6) and state probe (section 4) in the sample, both APIs | D6 pass condition; states recorded |
 | M0b | CUDA spike: one 3x3 layer in a compute list, bytes against the reference | exact -> rung stays; else dropped and R5 text amended, reported |
-| M0c | THIRD_PARTY.md, notices | A13 |
+| M0c | THIRD_PARTY.md, notices | written |
 | M1 | rhi_vulkan, network, completion token, build system | A1 Vulkan |
 | M2 | core on Vulkan, capture/replay | A3, A14 |
 | M3 | rhi_d3d12, dot4 and floor | A1 D3D12, A2 |
@@ -274,7 +276,7 @@ inverted depth; odd size 1366x767.
 | # | Test (`tests/`) | Pass |
 |---|---|---|
 | A1 | `ml_conformance`: each rung vs CPU reference graph outputs, and per fused layer via a debug output build; sizes 64x64, 744x464, 960x544; 20 random seeds, all -128, all 127, alternating, 8 recorded tensors; batches 1 and 5 | 0 differing bytes |
-| A2 | `parity`: replay S1-S4 at 2x, 4x, 6x, D3D12 vs Vulkan, default rung and floor | after encoding to the output's own code values (8-bit, 10-bit, or PQ-10 of scRGB): PSNR >= 60 dB, >= 99.9% of channels within 1 code; pixels off by > 3 codes <= 0.01% and each explained as a discrete flip by the intermediate dump; tensor bytes equal >= 99.9%; no drift: frame 64 no worse than 1 dB below frame 8 |
+| A2 | `parity`: replay S1-S4 at 2x, 4x, 6x, D3D12 vs Vulkan, default rung and floor | after encoding to the output's own code values (8-bit, 10-bit, or PQ-10 of scRGB): PSNR >= 60 dB, >= 99.9% of channels within 1 code; pixels off by > 3 codes <= 0.01% and each explained as a discrete flip by the intermediate dump; tensor bytes equal >= 99.9% in every frame; no drift: frame 64 no worse than 1 dB below frame 8 |
 | A3 | `reference`: (i) port with v2 weights (test-only build switch `NFRUX_TEST_V2`: 4-word tensor, v2 model and constants, never shipped) vs DeckyUpscaler's passes (its own Vulkan build, same inputs): >= 45 dB, half precision being the intended difference; (ii) port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips) | (i) as stated; (ii) PSNR against the true frames within 0.2 dB of torch per multiplier |
 | A4 | Sample, D3D12 and Vulkan, scripting patch: 2x and the maximum granted, 1920x1080, 5 min each on release DLLs; 60 s with D3D12 debug layer + GPU validation / Vulkan validation + sync | no crash; 0 messages naming NFRUX objects or thrown inside its recordings; `numFramesActuallyPresented` = n + 1 for >= 95% of states logged; OutputReal written every evaluate; dumped generated frames lie between neighbours (mean luma distance to both <= distance between them + 2 codes, >= 99% of frames) |
 | A5 | Sample with fixed timestep, scripted camera, UI off, DLSS off: dump 64 frames on both APIs; replay each API's dump on the other | replay meets A2; live D3D12 vs Vulkan generated PSNR no more than 1 dB below their inputs' PSNR and >= 35 dB; image pairs kept |
@@ -282,7 +284,7 @@ inverted depth; odd size 1366x767.
 | A7 | Detection log; each rung, both scatter variants, forced; negative: nvapi / nvcuda absent, feature off, bad self-check, stale marker | A1 + A2 each; falls to the expected rung |
 | A8 | Idle GPU, timestamps, 120 warm-up, median of 600: each rung, API, 1080p / 1440p / 4K, 2x / 4x / 6x; VRAM | recorded; default rung at 1080p 2x <= 2.5 ms on RTX 4070 or the miss explained |
 | A9 | `ui_scenes` (from fg_vk_test): each D8 rule with expected pixels, SDR + PQ + scRGB, reset + HUD-less, distortion at 4x, both APIs | all |
-| A10 | `ngx_harness`: loads the DLL like `Nvngx_DllProxy`; protocol cases of section 4 (missing, repeated, out of order, n changing, n > 5), release/recreate, resize, format and HDR switches, D3D12 and Vulkan together, 2000 frames | outputs as specified; no leak (VRAM and handles flat) |
+| A10 | `ngx_harness`: loads the DLL like `Nvngx_DllProxy`; protocol cases of section 4 (missing, repeated (a new batch between identical frames: outputs equal the frame within A2), out of order, n changing, n > 5), release/recreate, resize, format and HDR switches, D3D12 and Vulkan together, 2000 frames | outputs as specified; no leak (VRAM and handles flat) |
 | A11 | Import table and API call check: the DLL opens no shared handles and imports no other graphics API at run time (nvapi, nvcuda, nvofapi64 exempt on their rungs) in each mode | pass |
 | A12 | NVOF vs block match: true-frame PSNR on `test_bal`, `test_new` and cost, D3D12 replay (and offline Vulkan) | recorded; opt-in path runs 5 min in the sample |
 | A13 | Licensing: THIRD_PARTY.md, model license shipped, changes stated | recorded |

@@ -11,8 +11,10 @@ add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
 add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
-add_library(nfrux_core STATIC core/log.cpp core/model.cpp core/ml/ffx_vk_ml_graph.cpp core/ml/ffx_vk_ml_reference.cpp core/ml/d3d12_network.cpp)
+add_library(nfrux_core STATIC core/log.cpp core/model.cpp core/ml/ffx_vk_ml_graph.cpp core/ml/ffx_vk_ml_reference.cpp core/ml/d3d12_network.cpp core/ml/ffx_vk_ml_runtime.cpp)
 add_dependencies(nfrux_core nfrux_shaders)
 target_include_directories(nfrux_core PUBLIC core core/ml core/model rhi ${GEN} $ENV{VULKAN_SDK}/Include)
 add_executable(ml_conformance_d3d12 tests/ml_conformance_d3d12.cpp)
 target_link_libraries(ml_conformance_d3d12 nfrux_core d3d12 dxgi dxguid)
+add_executable(ml_conformance_vulkan tests/ml_conformance_vulkan.cpp)
+target_link_libraries(ml_conformance_vulkan nfrux_core $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)

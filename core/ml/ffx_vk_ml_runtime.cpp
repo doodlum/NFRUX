@@ -227,7 +227,7 @@ namespace ffx_ml
             case Vendor::Nvidia:
                 // warp32 tensor cores, 16x16xK tiles (mma.sync m16n8k32 pairs). On the RTX 4080 fp16 beat int8 by ~5-8% and
                 // a split target of 128 workgroups (~2 per SM) was best; see docs/nss_gpu_tuning.md.
-                return {4, 32, 16, 128, {MatType::Fp16, MatType::Bf16, MatType::Int8}, 128};
+                return {4, 32, 16, 128, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
                 // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md. Channel blocks up to 40 keep the 36-channel KPN layer in one block.

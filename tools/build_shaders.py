@@ -180,4 +180,11 @@ with open(tmp, "w") as f:
         f"{{{{{',' if 0 else ','.join([])}" if 0 else "{{" + ",".join(map(str, l)) + f"}},{'true' if d else 'false'},{px},{ocb},{n},{len(b)}}}" for l, d, px, ocb, n, b in convs) + "};\n")
     f.write("}\n")
 os.replace(tmp, os.path.join(out, "nfrux_shaders.h"))
+KERNELS = {"scalar": ["-DML_PATH_SCALAR=1"], "dot4": ["-DML_PATH_DOT4=1"], "dot4_tiled": ["-DML_PATH_DOT4=1", "-DML_DOT4_TILED=1"],
+           "dot4_tiled_img": ["-DML_PATH_DOT4=1", "-DML_DOT4_TILED=1", "-DML_DST_IMAGE=1"], "dot4_chain": ["-DML_PATH_DOT4=1", "-DML_DOT4_CHAIN=1"],
+           "coopmat_int8": ["-DML_PATH_COOPMAT=1", "-DML_MAT_INT8=1"], "coopmat_fp16": ["-DML_PATH_COOPMAT=1", "-DML_MAT_FP16=1"],
+           "coopmat_bf16": ["-DML_PATH_COOPMAT=1", "-DML_MAT_BF16=1"]}
+for n, d in KERNELS.items():
+    run([GLSLANG, "-V", "--target-env", "vulkan1.3", "-S", "comp", *d, "--vn", "ffx_ml_conv2d_" + n,
+         "-o", os.path.join(out, f"ffx_ml_conv2d_{n}_spv.h"), os.path.join("ml", "ffx_ml_conv2d.comp")])
 print(f"{len(built)} shaders, {os.path.getsize(os.path.join(out, 'nfrux_shaders.h')) >> 10} KB")

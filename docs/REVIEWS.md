@@ -17,3 +17,6 @@ Revision 2 answers: precision and contraction (D1), int8-only exactness and laye
 | 2 | readiness and tests | DISAGREE | 1 (Vulkan baseline feature, merge rule, interception) |
 
 Revision 3: that blocker (D3, D6 gate), plus the reviewers' suggestions on tokens, markers, FrameID, A3, A11, D7.
+| 3 | readiness and tests | AGREE | 0 |
+
+Architecture and code accuracy agreed on revision 2; revision 3 changed only what the third reviewer required plus their own suggestions.
