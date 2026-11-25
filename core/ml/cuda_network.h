@@ -12,6 +12,7 @@
 
 namespace nfrux
 {
+bool HasTensorCores(const char* name);  // an sm_75 device, by its name
 class CudaGraph
 {
 public:

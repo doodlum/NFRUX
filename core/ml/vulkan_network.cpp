@@ -225,9 +225,9 @@ namespace ffx_ml
             switch (vendor)
             {
             case Vendor::Nvidia:
-                // warp32 tensor cores, 16x16xK tiles (mma.sync m16n8k32 pairs). On the RTX 4080 fp16 beat int8 by ~5-8% and
-                // a split target of 128 workgroups (~2 per SM) was best; see docs/nss_gpu_tuning.md.
-                return {4, 32, 16, 128, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};
+                // warp32 tensor cores, 16x16xK tiles. fp16 is 20% faster than int8 on an RTX 4070, 5-8% on a 4080 (docs/RESULTS.md),
+                // and gives the same integers (AccumulatorBound).
+                return {4, 32, 16, 128, {MatType::Fp16, MatType::Int8, MatType::Bf16}, 128};
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
                 // AMD RDNA2 APUs. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
@@ -1636,6 +1636,32 @@ namespace ffx_ml
         }
     };
 
+    // The largest any partial sum of any output channel can be: max |x - zp| * sum |w|, plus |bias|.
+    int64_t AccumulatorBound(const LoweredGraph& lowered)
+    {
+        int64_t worst = 0;
+        for (const FusedConv& fc : lowered.convs)
+        {
+            const tosa::Node& c    = *fc.conv;
+            const int64_t     maxX = std::max(127 - c.inputZp, c.inputZp + 128);
+            const size_t      per  = c.weights.size() / size_t(fc.outC);
+            for (int32_t oc = 0; oc < fc.outC; ++oc)
+            {
+                int64_t sum = 0;
+                for (size_t i = 0; i < per; ++i)
+                    sum += std::abs(int(c.weights[size_t(oc) * per + i]));
+                worst = std::max(worst, sum * maxX + std::abs(int64_t(c.bias[oc])));
+            }
+        }
+        return worst;
+    }
+    int64_t AccumulatorBound(const GraphDesc& desc)
+    {
+        tosa::Graph  graph;
+        LoweredGraph lowered;
+        return tosa::Parse(desc, graph, nullptr) && Lower(graph, lowered, nullptr) ? AccumulatorBound(lowered) : INT64_MAX;
+    }
+
     std::unique_ptr<Graph> Graph::Create(const DeviceContext& context, const Selection& selection, const GraphDesc& desc, std::string* error)
     {
         std::unique_ptr<Graph> graph(new Graph());
@@ -1652,7 +1678,18 @@ namespace ffx_ml
             return nullptr;
         }
         impl.imageOutputs    = desc.imageOutputs;
-        if (!tosa::Parse(desc, impl.graph, error) || !Lower(impl.graph, impl.lowered, error) || !impl.Build(error))
+        if (!tosa::Parse(desc, impl.graph, error) || !Lower(impl.graph, impl.lowered, error))
+            return nullptr;
+        // Float accumulators hold every partial sum exactly only below 2^24.
+        const bool floats = selection.path == Path::CoopMat && selection.matType != MatType::Int8;
+        if (floats && AccumulatorBound(impl.lowered) >= (1 << 24))
+        {
+            if (error)
+                *error = "the network's sums do not fit a float accumulator";
+            impl.ctx.device = VK_NULL_HANDLE;
+            return nullptr;
+        }
+        if (!impl.Build(error))
             return nullptr;
         return graph;
     }

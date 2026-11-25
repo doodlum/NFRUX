@@ -253,6 +253,7 @@ static bool RunD3D12(Results& out)
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex[i]));
         im[i].handle = tex[i].Get(), im[i].width = w, im[i].height = h;
     }
+    bool uploaded = false;
     auto upload = [&](const Frame& f) {
         al->Reset(), cl->Reset(al.Get(), nullptr);
         ComPtr<ID3D12Resource> up[3];
@@ -269,11 +270,18 @@ static bool RunD3D12(Results& out)
             up[i]->Unmap(0, nullptr);
             D3D12_TEXTURE_COPY_LOCATION ld = {tex[i].Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}, ls = {up[i].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
             ls.PlacedFootprint.Footprint = {fm[i], im[i].width, im[i].height, 1, pitch};
+            if (uploaded)
+            {
+                D3D12_RESOURCE_BARRIER c = {};
+                c.Transition = {tex[i].Get(), 0, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+                cl->ResourceBarrier(1, &c);
+            }
             cl->CopyTextureRegion(&ld, 0, 0, 0, &ls, nullptr);
             D3D12_RESOURCE_BARRIER b = {};
-            b.Transition = {tex[i].Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON};
+            b.Transition = {tex[i].Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
             cl->ResourceBarrier(1, &b);
         }
+        uploaded = true;
         execute();
     };
     auto submit = [&](const std::function<bool(void*)>& record) { al->Reset(), cl->Reset(al.Get(), nullptr), record(cl.Get()), execute(); };
@@ -388,7 +396,7 @@ static bool RunVulkan(Results& out)
     VulkanHost host;
     host.instance = inst, host.physicalDevice = pd, host.device = dv, host.gipa = vkGetInstanceProcAddr, host.gdpa = vkGetDeviceProcAddr;
     host.queueFamily = family, host.minorVersion = 2, host.deviceExtensions = ext.data(), host.deviceExtensionCount = uint32_t(ext.size());
-    host.mlFeatures = ml, host.atomic64 = v12.shaderBufferInt64Atomics && f2.features.shaderInt64;
+    host.mlFeatures = ml;
     auto dev = CreateNriVulkanDevice(host);
     return dev ? Run(*dev, im, upload, submit, out) : (printf("  device failed\n"), false);
 }

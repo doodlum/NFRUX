@@ -23,7 +23,7 @@ namespace
 std::mutex g_mutex;
 struct Vk { VkInstance i = VK_NULL_HANDLE; VkPhysicalDevice pd = VK_NULL_HANDLE; VkDevice d = VK_NULL_HANDLE; PFN_vkGetInstanceProcAddr gi = nullptr; PFN_vkGetDeviceProcAddr gd = nullptr; } g_vk;
 uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
-bool     g_vkAtomic64 = false, g_vkKnown = false;
+bool     g_vkKnown = false;
 VkDevice g_vkDevice = VK_NULL_HANDLE;
 struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
 // Never destroyed: at process exit the devices may be gone already.
@@ -51,7 +51,7 @@ std::unique_ptr<Device> DeviceForVk()
         return Log("Vulkan 1.2 is needed"), nullptr;
     h.minorVersion = 2;  // whatever the GPU reports: the host may have asked for less
     if (!g_vkKnown) Log("Vulkan: assuming 1.2 and shaderStorageImageExtendedFormats are enabled on the game's device (no loader to tell)");
-    if (g_vkKnown && g_vkDevice == g_vk.d) h.mlFeatures = g_vkMl, h.atomic64 = g_vkAtomic64;
+    if (g_vkKnown && g_vkDevice == g_vk.d) h.mlFeatures = g_vkMl;
     else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", false))
     {
         std::vector<const char*> ext;
@@ -108,7 +108,7 @@ ExternalImage Image12(NgxParameter* p, const char* n)
     ExternalImage e;
     if (!r) return e;
     const D3D12_RESOURCE_DESC d = r->GetDesc();
-    e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = D3D12_RESOURCE_STATE_COMMON;
+    e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = 0;
     return e;
 }
 ExternalImage ImageVk(NgxParameter* p, const char* n)
@@ -117,7 +117,7 @@ ExternalImage ImageVk(NgxParameter* p, const char* n)
     ExternalImage e;
     if (!r || r->Type != 0 || !r->R.Image.Image) return e;
     e.handle = reinterpret_cast<void*>(r->R.Image.Image), e.format = r->R.Image.Format, e.width = r->R.Image.Width, e.height = r->R.Image.Height;
-    e.state = VK_IMAGE_LAYOUT_GENERAL;
+    e.state = r->ReadWrite ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     return e;
 }
 EvalInputs Read(NgxParameter* p, bool vk)
@@ -130,9 +130,30 @@ EvalInputs Read(NgxParameter* p, bool vk)
     in.distortionRect = GetRect(p, "BidirectionalDistortionField"), in.motionJittered = Int(p, "DLSSG.MvecJittered") != 0, in.menuDetection = Int(p, "DLSSG.MenuDetectionEnabled") != 0;
     if (Int(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision"))
         in.distortionScale = Float(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", 1), in.distortionBias = Float(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias");
-    in.backRect = GetRect(p, "Backbuffer"), in.hudlessRect = GetRect(p, "HUDLess"), in.uiRect = GetRect(p, "UI"), in.uiAlphaRect = GetRect(p, "UIAlpha");
+    in.backRect = GetRect(p, "InputBackbuffer");
+    if (!in.backRect.w) in.backRect = GetRect(p, "Backbuffer");  // the older name
+    in.outRect = GetRect(p, "OutputInterpolated"), in.realRect = GetRect(p, "OutputReal");
+    in.onlyInside = (Int(p, "DLSSG.EvalFlags") & 1) != 0, in.cameraMotion = Int(p, "DLSSG.CameraMotionIncluded", 1) != 0;
+    in.dynamicResolution = Int(p, "DLSSG.DynamicResolution") != 0;
+    in.internalWidth = uint32_t(Int(p, "DLSSG.InternalWidth")), in.internalHeight = uint32_t(Int(p, "DLSSG.InternalHeight"));
+    unsigned long long id = 0;
+    if (p->Get("DLSSG.BackbufferFrameID", &id) == kNgxSuccess) in.frameId = id;
+    if (vk)
+    {
+        auto* b = static_cast<NgxResourceVk*>(Ptr(p, "DLSSG.OutputDisableInterpolation"));
+        if (b && b->Type == 1) in.disable = reinterpret_cast<void*>(b->R.Buffer.Buffer);
+    }
+    else
+    {
+        ID3D12Resource* b = nullptr;
+        if (p->Get("DLSSG.OutputDisableInterpolation", &b) != kNgxSuccess || !b) b = static_cast<ID3D12Resource*>(Ptr(p, "DLSSG.OutputDisableInterpolation"));
+        if (b && b->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) in.disable = b;
+    }
+    in.hudlessRect = GetRect(p, "HUDLess"), in.uiRect = GetRect(p, "UI"), in.uiAlphaRect = GetRect(p, "UIAlpha");
     in.noWarpRect = GetRect(p, "NoWarp"), in.depthRect = GetRect(p, "Depth"), in.motionRect = GetRect(p, "MVecs");
     in.mvScale[0] = Float(p, "DLSSG.MvecScaleX", 1), in.mvScale[1] = Float(p, "DLSSG.MvecScaleY", 1);
+    if (Int(p, "DLSSG.InvertXAxis")) in.mvScale[0] = -in.mvScale[0];
+    if (Int(p, "DLSSG.InvertYAxis")) in.mvScale[1] = -in.mvScale[1];
     in.jitter[0] = Float(p, "DLSSG.JitterOffsetX"), in.jitter[1] = Float(p, "DLSSG.JitterOffsetY");
     in.cameraNear = Float(p, "DLSSG.CameraNear", 0.1f), in.cameraFar = Float(p, "DLSSG.CameraFar", 1000.0f), in.fovY = Float(p, "DLSSG.CameraFOV", 1.0f);
     in.depthInverted = Int(p, "DLSSG.DepthInverted") != 0, in.hdr = Int(p, "DLSSG.ColorBuffersHDR") != 0, in.reset = Int(p, "DLSSG.Reset") != 0;
@@ -175,6 +196,13 @@ NgxResult Release(NgxHandle* h)
     Log("feature released");
     return kNgxSuccess;
 }
+// Measured on an RTX 4070 (docs/RESULTS.md): what five outputs, networks and histories take, by display pixels.
+NgxResult __cdecl EstimateVram(uint32_t, uint32_t, uint32_t w, uint32_t h, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, size_t* bytes)
+{
+    if (!bytes) return kNgxInvalidParameter;
+    *bytes = size_t(220) * 1048576 + size_t(w) * h * 64;
+    return kNgxSuccess;
+}
 NgxResult Populate(NgxParameter* p)
 {
     if (!p) return kNgxInvalidParameter;
@@ -182,6 +210,7 @@ NgxResult Populate(NgxParameter* p)
     p->Set("FrameGeneration.MinDriverVersionMajor", 0u), p->Set("FrameGeneration.MinDriverVersionMinor", 0u);
     p->Set("FrameGeneration.FeatureInitResult", int(kNgxSuccess));
     p->Set("DLSSG.MultiFrameCountMax", MaxFrames());
+    p->Set("DLSSG.EstimateVRAMCallback", reinterpret_cast<void*>(&EstimateVram));
     return kNgxSuccess;
 }
 NgxResult Requirements(NgxFeatureRequirement* r)
@@ -251,23 +280,25 @@ NFRUX_EXPORT NVSDK_NGX_VULKAN_ReleaseFeature(NgxHandle* h) { return Release(h); 
 NFRUX_EXPORT NVSDK_NGX_VULKAN_GetFeatureRequirements(VkInstance, VkPhysicalDevice, const void*, NgxFeatureRequirement* r) { return Requirements(r); }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_PopulateParameters_Impl(NgxParameter* p) { return Populate(p); }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_PopulateDeviceParameters_Impl(VkInstance, VkPhysicalDevice, VkDevice, NgxParameter* p) { return Populate(p); }
+NFRUX_EXPORT NVSDK_NGX_D3D12_EvaluateFeature_C(ID3D12GraphicsCommandList* list, const NgxHandle* h, NgxParameter* p, void*) { return Eval(list, h, p); }
+NFRUX_EXPORT NVSDK_NGX_VULKAN_EvaluateFeature_C(VkCommandBuffer c, const NgxHandle* h, NgxParameter* p, void*) { return Eval(c, h, p); }
 // --- both
 NFRUX_EXPORT NVSDK_NGX_GetAPIVersion() { return 0x15; }
 NFRUX_EXPORT NVSDK_NGX_GetSnippetVersion() { return 0x00040000; }
 // The loader's record of what the game's Vulkan device has enabled.
-extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures, int atomic64) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkAtomic64 = atomic64 != 0, g_vkKnown = true; }
+extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkKnown = true; }
 // The loader saw vkDestroyDevice: everything on it goes first.
 extern "C" __declspec(dllexport) void __cdecl NFRUX_DropVulkanDevice(VkDevice d)
 {
     Drop(true, d);
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_vk.d == d) g_vk.d = VK_NULL_HANDLE;
-    if (g_vkDevice == d) g_vkDevice = VK_NULL_HANDLE, g_vkMl = 0, g_vkAtomic64 = false;
+    if (g_vkDevice == d) g_vkDevice = VK_NULL_HANDLE, g_vkMl = 0;
 }
 extern "C" __declspec(dllexport) uint32_t __cdecl NFRUX_MaxFrames() { return MaxFrames(); }
 
 // One file, its role by its name: nvngx_dlssg.dll and dlssg_to_fsr3_amd_is_better.dll (OptiScaler) are loaded as the feature; as dbghelp.dll,
-// version.dll or winmm.dll in a game's folder it also routes the game's own NGX calls here (loader/loader.cpp).
+// or version.dll in a game's folder it also routes the game's own NGX calls here (loader/loader.cpp).
 void LoaderAttach(HINSTANCE self);
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
 {
@@ -275,7 +306,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
     char path[MAX_PATH] = {};
     GetModuleFileNameA(self, path, MAX_PATH);
     const char* name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
-    for (const char* n : {"dbghelp.dll", "version.dll", "winmm.dll"})
+    for (const char* n : {"dbghelp.dll", "version.dll"})
         if (!_stricmp(name, n)) { LoaderAttach(self); break; }
     return TRUE;
 }

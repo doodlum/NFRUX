@@ -87,6 +87,8 @@ struct Api
     virtual void Upload(Tex& t, const Bytes& b) = 0;
     virtual Bytes Read(Tex& t) = 0;
     virtual void Bind(Params& p, const char* n, Tex* t) = 0;
+    virtual void BindWord(Params& p, const char* n) = 0;  // a 4-byte host buffer the feature writes
+    virtual uint32_t ReadWord() = 0;
     virtual NgxHandle* CreateFeature(Params& p) = 0;
     virtual NgxResult Evaluate(NgxHandle* h, Params& p) = 0;  // recorded, submitted, waited for
     virtual NgxResult Release(NgxHandle* h) = 0;
@@ -114,7 +116,8 @@ struct Api
     }
 };
 
-struct Tex12 : Tex { ComPtr<ID3D12Resource> r; };
+// Inputs rest in NON_PIXEL_SHADER_RESOURCE, outputs in UNORDERED_ACCESS, as the programming guide asks of a host.
+struct Tex12 : Tex { ComPtr<ID3D12Resource> r; D3D12_RESOURCE_STATES home = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; };
 struct Api12 : Api
 {
     ComPtr<ID3D12Device> d;
@@ -127,7 +130,7 @@ struct Api12 : Api
     bool Recreate() override
     {
         Shutdown();
-        cl.Reset(), al.Reset(), q.Reset(), fence.Reset(), info.Reset();
+        word.Reset(), cl.Reset(), al.Reset(), q.Reset(), fence.Reset(), info.Reset();
         const ULONG left = d.Reset();
         if (left) printf("    (%lu references left on the old device)\n", left);
         return Init() && left == 0;
@@ -201,8 +204,10 @@ struct Api12 : Api
         auto t = std::make_shared<Tex12>();
         t->f = f, t->w = w, t->h = h;
         D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, output && f < F_RGBA8S ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
-        d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t->r));
+        D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, output && f == F_RGBA8S ? DXGI_FORMAT_R8G8B8A8_TYPELESS : output && f == F_BGRA8S ? DXGI_FORMAT_B8G8R8A8_TYPELESS : kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                                 output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        if (output) t->home = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, t->home, nullptr, IID_PPV_ARGS(&t->r));
         return t;
     }
     void Copy(Tex& t, ID3D12Resource* buf, uint32_t pitch, bool up)
@@ -212,7 +217,7 @@ struct Api12 : Api
         lb.PlacedFootprint.Footprint = {kF[t.f], t.w, t.h, 1, pitch};
         Begin();
         D3D12_RESOURCE_BARRIER b = {};
-        b.Transition = {r, 0, D3D12_RESOURCE_STATE_COMMON, up ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE};
+        b.Transition = {r, 0, static_cast<Tex12&>(t).home, up ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COPY_SOURCE};
         cl->ResourceBarrier(1, &b);
         cl->CopyTextureRegion(up ? &lt : &lb, 0, 0, 0, up ? &lb : &lt, nullptr);
         std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
@@ -242,6 +247,32 @@ struct Api12 : Api
         return o;
     }
     void Bind(Params& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<Tex12*>(t)->r.Get() : static_cast<ID3D12Resource*>(nullptr)); }
+    ComPtr<ID3D12Resource> word;
+    void BindWord(Params& p, const char* n) override
+    {
+        if (!word)
+        {
+            D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
+            D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
+            d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&word));
+            D3D12_RESOURCE_BARRIER b = {};
+            b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            Begin(), cl->ResourceBarrier(1, &b), End();
+        }
+        p.Set(n, word.Get());
+    }
+    uint32_t ReadWord() override
+    {
+        auto rb = Buffer(D3D12_HEAP_TYPE_READBACK, 256);
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        Begin(), cl->ResourceBarrier(1, &b), cl->CopyResource(rb.Get(), word.Get()), std::swap(b.Transition.StateBefore, b.Transition.StateAfter), cl->ResourceBarrier(1, &b), End();
+        uint32_t* p;
+        rb->Map(0, nullptr, reinterpret_cast<void**>(&p));
+        const uint32_t v = *p;
+        rb->Unmap(0, nullptr);
+        return v;
+    }
     NgxHandle* CreateFeature(Params& p) override
     {
         NgxHandle* h = nullptr;
@@ -268,6 +299,7 @@ struct TexV : Tex
     VkDeviceMemory mem;
     VkImageView view;
     NgxResourceVk res = {};
+    VkImageLayout home = VK_IMAGE_LAYOUT_GENERAL;  // an input in the minimal run: SHADER_READ_ONLY_OPTIMAL, not read-write
     ~TexV() { vkDestroyImageView(d, view, nullptr), vkDestroyImage(d, img, nullptr), vkFreeMemory(d, mem, nullptr); }
 };
 struct ApiV : Api
@@ -344,13 +376,14 @@ struct ApiV : Api
         VkCommandBufferAllocateInfo ca = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         vkAllocateCommandBuffers(dv, &ca, &cb);
         vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-        if (!minimal) Fn<void (*)(VkDevice, uint32_t, int)>("NFRUX_SetVulkanFeatures")(dv, ml, v12.shaderBufferInt64Atomics && f2.features.shaderInt64);
+        if (!minimal) Fn<void (*)(VkDevice, uint32_t)>("NFRUX_SetVulkanFeatures")(dv, ml);
         return Fn<NgxResult (*)(unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, int, const void*)>("NVSDK_NGX_VULKAN_Init_Ext2")(
                    0, L".", inst, pd, dv, nullptr, nullptr, 0x15, nullptr) == kNgxSuccess;
     }
     bool Recreate() override
     {
         vkDestroyCommandPool(dv, pool, nullptr);
+        vkDestroyBuffer(dv, word, nullptr), vkFreeMemory(dv, wordMemory, nullptr), word = VK_NULL_HANDLE;
         Fn<void (*)(VkDevice)>("NFRUX_DropVulkanDevice")(dv);  // what the loader does before vkDestroyDevice
         vkDestroyDevice(dv, nullptr);
         return Init();
@@ -371,9 +404,9 @@ struct ApiV : Api
         si.commandBufferCount = 1, si.pCommandBuffers = &cb;
         vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), vkQueueWaitIdle(queue);
     }
-    void Barrier(VkImage i, VkImageLayout from)
+    void Barrier(VkImage i, VkImageLayout from, VkImageLayout to)
     {
-        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, from, VK_IMAGE_LAYOUT_GENERAL,
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, from, to,
                                   VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, i, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
@@ -392,8 +425,9 @@ struct ApiV : Api
         VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = t->img, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = kF[f], vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCreateImageView(dv, &vi, nullptr, &t->view);
-        t->res.R.Image = {t->view, t->img, vi.subresourceRange, kF[f], w, h}, t->res.Type = 0, t->res.ReadWrite = output;
-        Begin(), Barrier(t->img, VK_IMAGE_LAYOUT_UNDEFINED), End();
+        t->res.R.Image = {t->view, t->img, vi.subresourceRange, kF[f], w, h}, t->res.Type = 0, t->res.ReadWrite = output || !minimal;
+        if (!t->res.ReadWrite) t->home = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        Begin(), Barrier(t->img, VK_IMAGE_LAYOUT_UNDEFINED, t->home), End();
         return t;
     }
     void Copy(Tex& t, Bytes* out, const Bytes* in)
@@ -411,17 +445,37 @@ struct ApiV : Api
         vkMapMemory(dv, m, 0, VK_WHOLE_SIZE, 0, &p);
         if (in) memcpy(p, in->data(), bc.size);
         Begin();
-        Barrier(x.img, VK_IMAGE_LAYOUT_GENERAL);
+        Barrier(x.img, x.home, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {}, {t.w, t.h, 1}};
         if (in) vkCmdCopyBufferToImage(cb, b, x.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
         else vkCmdCopyImageToBuffer(cb, x.img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
-        Barrier(x.img, VK_IMAGE_LAYOUT_GENERAL);
+        Barrier(x.img, VK_IMAGE_LAYOUT_GENERAL, x.home);
         VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
         End();
         if (out) out->resize(bc.size), memcpy(out->data(), p, bc.size);
         vkDestroyBuffer(dv, b, nullptr), vkFreeMemory(dv, m, nullptr);
     }
+    VkBuffer word = VK_NULL_HANDLE;
+    VkDeviceMemory wordMemory = VK_NULL_HANDLE;
+    uint32_t* wordMap = nullptr;
+    NgxResourceVk wordRes = {};
+    void BindWord(Params& p, const char* n) override
+    {
+        if (!word)
+        {
+            VkBufferCreateInfo bc = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bc.size = 256, bc.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            vkCreateBuffer(dv, &bc, nullptr, &word);
+            VkMemoryRequirements r;
+            vkGetBufferMemoryRequirements(dv, word, &r);
+            wordMemory = Memory(r, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkBindBufferMemory(dv, word, wordMemory, 0), vkMapMemory(dv, wordMemory, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&wordMap));
+            wordRes.R.Buffer.Buffer = word, wordRes.Type = 1, wordRes.ReadWrite = true;
+        }
+        p.Set(n, static_cast<void*>(&wordRes));
+    }
+    uint32_t ReadWord() override { return *wordMap; }
     void Upload(Tex& t, const Bytes& b) override { Copy(t, nullptr, &b); }
     Bytes Read(Tex& t) override { Bytes o; Copy(t, &o, nullptr); return o; }
     void Bind(Params& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<void*>(&static_cast<TexV*>(t)->res) : nullptr); }
@@ -557,7 +611,7 @@ struct Scene
     Fmt back = F_RGBA8, hud = F_RGBA8, ui = F_RGBA8, alpha = F_R8;
     bool hdr = false;
     float mvOffset[2] = {};
-    uint32_t w = W, h = H, gen = 2, frames = 4;
+    uint32_t w = W, h = H, dw = W, dh = H, gen = 2, frames = 4;  // dw x dh: depth and vectors
     std::function<Image(int)> backI, hudI, uiI, alphaI, noWarpI, fieldI;
     std::function<void(Params&, int)> extra;
 };
@@ -567,10 +621,10 @@ static Out Run(Api& a, const Scene& s, NgxHandle* use = nullptr)
     Out o;
     Params p;
     auto tex = [&](Fmt f, uint32_t w, uint32_t h, bool out = false) { return a.Create(f, w, h, out); };
-    TexP back = tex(s.back, s.w, s.h), out = tex(s.back, s.w, s.h, true), real = tex(s.back, s.w, s.h, true), depth = tex(F_R32F, W, H), mv = tex(F_RG16F, W, H);
+    TexP back = tex(s.back, s.w, s.h), out = tex(s.back, s.w, s.h, true), real = tex(s.back, s.w, s.h, true), depth = tex(F_R32F, s.dw, s.dh), mv = tex(F_RG16F, s.dw, s.dh);
     TexP hud, ui, al, nw, fd;
-    Image dI(W, H, 0.9f), mI(W, H);
-    for (uint32_t i = 0; i < W * H; ++i) mI.p[i * 4] = -8 + s.mvOffset[0], mI.p[i * 4 + 1] = -2 + s.mvOffset[1];
+    Image dI(s.dw, s.dh, 0.9f), mI(s.dw, s.dh);
+    for (uint32_t i = 0; i < s.dw * s.dh; ++i) mI.p[i * 4] = -8 + s.mvOffset[0], mI.p[i * 4 + 1] = -2 + s.mvOffset[1];
     a.Upload(*depth, Encode(dI, F_R32F)), a.Upload(*mv, Encode(mI, F_RG16F));
     a.Bind(p, "DLSSG.Backbuffer", back.get()), a.Bind(p, "DLSSG.OutputInterpolated", out.get()), a.Bind(p, "DLSSG.OutputReal", real.get());
     a.Bind(p, "DLSSG.Depth", depth.get()), a.Bind(p, "DLSSG.MVecs", mv.get());
@@ -725,6 +779,88 @@ static void Scenes(Api& a, Results& res)
         Out u = Run(a, s);  // half-resolution inputs in the corner of a bigger image: vectors in their own pixels would be half; the scale says display
         keep("depth subrect", u);
         Check(u.ok, "evaluates", 1);
+    }
+    printf("  output subrects, two viewports on one back buffer\n");
+    {
+        auto half = [](int i) { Image b(800, 500, 0.3f); Image u = World(W, H, float(i)); for (uint32_t y = 0; y < H; ++y) memcpy(b.at(80, 60 + y), u.at(0, y), W * 16); return b; };
+        auto rect = [](Params& p, const char* n, uint32_t x, uint32_t y) { const std::string b = std::string("DLSSG.") + n + "Subrect"; p.Set((b + "BaseX").c_str(), x), p.Set((b + "BaseY").c_str(), y), p.Set((b + "Width").c_str(), W), p.Set((b + "Height").c_str(), H); };
+        Scene s = plain;
+        s.w = 800, s.h = 500, s.backI = half;
+        s.extra = [&](Params& p, int) { rect(p, "InputBackbuffer", 80, 60); };
+        const Out whole = Run(a, s);
+        s.extra = [&](Params& p, int) { rect(p, "InputBackbuffer", 80, 60), rect(p, "OutputInterpolated", 20, 10), p.Set("DLSSG.EvalFlags", 1); };
+        const Out moved = Run(a, s);
+        Check(MaxDiff(Cut(moved.gen[0], 20, 10, W, H), Cut(whole.gen[0], 80, 60, W, H), All) == 0, "the region, at its place in the output", 0);
+        // Only the region is written: the second viewport's leaves the first's.
+        Params p;
+        TexP back = a.Create(F_RGBA8, 2 * W, H, false), out = a.Create(F_RGBA8, 2 * W, H, true), depth = a.Create(F_R32F, W, H, false), mv = a.Create(F_RG16F, W, H, false);
+        Image dI(W, H, 0.9f), mI(W, H);
+        for (uint32_t i = 0; i < W * H; ++i) mI.p[i * 4] = -8, mI.p[i * 4 + 1] = -2;
+        a.Upload(*depth, Encode(dI, F_R32F)), a.Upload(*mv, Encode(mI, F_RG16F));
+        a.Bind(p, "DLSSG.Backbuffer", back.get()), a.Bind(p, "DLSSG.OutputInterpolated", out.get()), a.Bind(p, "DLSSG.Depth", depth.get()), a.Bind(p, "DLSSG.MVecs", mv.get());
+        float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        p.Set("DLSSG.ClipToPrevClip", static_cast<void*>(id)), p.Set("DLSSG.CameraViewToClip", static_cast<void*>(id)), p.Set("DLSSG.EvalFlags", 1);
+        p.Set("DLSSG.MvecScaleX", 1.0f), p.Set("DLSSG.MvecScaleY", 1.0f), p.Set("DLSSG.CameraNear", 0.1f), p.Set("DLSSG.CameraFar", 100.0f), p.Set("DLSSG.CameraFOV", 1.0f), p.Set("DLSSG.MultiFrameCount", 1), p.Set("DLSSG.MultiFrameIndex", 1);
+        NgxHandle* v[2] = {a.CreateFeature(p), a.CreateFeature(p)};
+        bool ok = v[0] && v[1];
+        for (int i = 0; ok && i < 4; ++i)
+        {
+            Image b(2 * W, H);
+            for (int q = 0; q < 2; ++q) { const Image u = World(W, H, float(i), 1, q * 300.0f, 0); for (uint32_t y = 0; y < H; ++y) memcpy(b.at(q * W, y), u.at(0, y), W * 16); }
+            a.Upload(*back, Encode(b, F_RGBA8));
+            p.Set("DLSSG.Reset", int(i == 0));
+            for (int q = 0; q < 2; ++q) rect(p, "InputBackbuffer", q * W, 0), rect(p, "OutputInterpolated", q * W, 0), ok = a.Evaluate(v[q], p) == kNgxSuccess && ok;
+        }
+        const Image got = Decode(a.Read(*out), F_RGBA8, 2 * W, H);
+        const double q0 = Psnr(Cut(got, 0, 0, W, H), World(W, H, 2.5f), 24), q1 = Psnr(Cut(got, W, 0, W, H), World(W, H, 2.5f, 1, 300, 0), 24);
+        Check(ok && q0 > 30 && q1 > 30, "two viewports, both interpolated, worst dB", std::min(q0, q1));
+        for (NgxHandle* x : v) if (x) a.Release(x);
+    }
+    printf("  OutputDisableInterpolation\n");
+    {
+        Scene s = plain;
+        s.extra = [&](Params& p, int) { a.BindWord(p, "DLSSG.OutputDisableInterpolation"); };
+        Run(a, s);
+        Check(a.ReadWord() == 0, "interpolated: 0", 0);
+        s.extra = [&](Params& p, int i) { a.BindWord(p, "DLSSG.OutputDisableInterpolation"), p.Set("DLSSG.NotRenderingGameFrames", int(i == 3)); };
+        Run(a, s);
+        Check(a.ReadWord() == 1, "not rendering: 1", 1);
+    }
+    printf("  frame ids, inverted axes, camera motion, dynamic resolution\n");
+    {
+        Scene s = plain;
+        s.extra = [](Params& p, int i) { p.Set("DLSSG.BackbufferFrameID", 100ull + i); };
+        Check(Run(a, s).raw == base.raw, "ids that follow: as without", 0);
+        s.extra = [](Params& p, int i) { p.Set("DLSSG.BackbufferFrameID", 100ull + i + (i == 3)); };
+        Out u = Run(a, s);
+        Check(u.ok && MaxDiff(u.gen[0], u.back, All) == 0, "a frame skipped: the frame", 0);
+        s = plain;
+        s.extra = [](Params& p, int) { p.Set("DLSSG.MvecScaleX", -1.0f), p.Set("DLSSG.MvecScaleY", -1.0f), p.Set("DLSSG.InvertXAxis", 1), p.Set("DLSSG.InvertYAxis", 1); };
+        Check(Run(a, s).raw == base.raw, "axes inverted twice: as without", 0);
+        // The vectors hold none of the camera's motion: clipToPrevClip moves by (-8, -2) pixels.
+        s = plain;
+        s.mvOffset[0] = 8, s.mvOffset[1] = 2;
+        static float clip[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -16.0f / W, 4.0f / H, 0, 1};
+        s.extra = [](Params& p, int) { p.Set("DLSSG.CameraMotionIncluded", 0), p.Set("DLSSG.ClipToPrevClip", static_cast<void*>(clip)); };
+        u = Run(a, s);
+        keep("camera motion", u);
+        double q = Psnr(u.gen[0], truth(3, 0, 2), 24);
+        Check(q > 30, "camera motion added, dB against the truth", q);
+        s = plain;
+        s.extra = [](Params& p, int i) {  // another region every frame; vectors are in display pixels: the scale undoes the region's
+            const uint32_t w = W - 40 * i, h = H - 20 * i;
+            for (const char* n : {"Depth", "MVecs"}) { const std::string b = std::string("DLSSG.") + n + "Subrect"; p.Set((b + "BaseX").c_str(), 0), p.Set((b + "BaseY").c_str(), 0), p.Set((b + "Width").c_str(), w), p.Set((b + "Height").c_str(), h); }
+            p.Set("DLSSG.DynamicResolution", 1), p.Set("DLSSG.MvecScaleX", float(w) / W), p.Set("DLSSG.MvecScaleY", float(h) / H);
+        };
+        u = Run(a, s);
+        keep("dynamic resolution", u);
+        q = Psnr(u.gen[0], truth(3, 0, 2), 24);
+        Check(u.ok && q > 30, "dynamic resolution, history kept, dB against the truth", q);
+        s.extra = [&](Params& p, int) { p.Set("DLSSG.DynamicResolution", 1), p.Set("DLSSG.InternalWidth", 400u), p.Set("DLSSG.InternalHeight", 240u); };
+        u = Run(a, s);
+        keep("dynamic internal", u);
+        q = Psnr(u.gen[0], truth(3, 0, 2), 24);
+        Check(u.ok && q > 30, "a given internal size, dB", q);
     }
     printf("  jittered motion vectors\n");
     {

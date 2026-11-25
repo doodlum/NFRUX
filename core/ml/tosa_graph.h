@@ -131,4 +131,5 @@ namespace ffx_ml
     };
 
     bool Lower(const tosa::Graph& graph, LoweredGraph& out, std::string* error);
+    int64_t AccumulatorBound(const LoweredGraph& lowered);
 }  // namespace ffx_ml

@@ -140,6 +140,9 @@ namespace ffx_ml
         std::vector<uint32_t> imageOutputs;
     };
 
+    // The largest magnitude any partial sum can reach; float kernels are exact below 2^24.
+    int64_t AccumulatorBound(const GraphDesc& desc);
+
     struct ExternalTensor
     {
         uint32_t     binding;

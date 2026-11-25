@@ -81,7 +81,7 @@ struct Caps
 {
     std::string name;
     uint32_t    vendorId = 0, deviceId = 0;
-    bool        native16Bit = false, atomic64 = false, int64 = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
+    bool        native16Bit = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
     uint32_t    shaderModel = 0;  // D3D12: 60, 62, 64, 66, ...
     std::string Describe() const;
 };
@@ -119,9 +119,11 @@ public:
     // A frame's recording into the host's command buffer / list; every wrapped image is back in its own state at EndFrame.
     virtual bool BeginFrame(void* commands) = 0;
     virtual void EndFrame() = 0;
-    virtual Texture* Wrap(const ExternalImage& image, bool written) = 0;  // valid until EndFrame
+    virtual Texture* Wrap(const ExternalImage& image, bool output) = 0;  // valid until EndFrame
     virtual void CopyTexture(const Texture& src, const Texture& dst, uint32_t dstX = 0, uint32_t dstY = 0) = 0;  // all of src
     virtual void CopyRegion(const Texture& src, uint32_t x, uint32_t y, const Texture& dst) = 0;                  // dst's size out of src
+    virtual void CopyRect(const Texture& src, uint32_t sx, uint32_t sy, const Texture& dst, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) = 0;
+    virtual void WriteWord(void* hostBuffer, uint32_t value) = 0;  // 4 bytes at its start
     virtual void Clear(const Texture& t, float value) = 0;
     virtual void Fill(const Buffer& b, uint32_t value) = 0;
     virtual void RunNetworks(Network* const* nets, uint32_t count) = 0;

@@ -16,7 +16,6 @@ struct VulkanHost
     const char* const*        deviceExtensions = nullptr;  // enabled, as far as known
     uint32_t                  deviceExtensionCount = 0;
     uint32_t                  mlFeatures     = 0;      // ffx_ml::FEATURE_* known to be enabled on the device
-    bool                      atomic64       = false;  // shaderBufferInt64Atomics + shaderInt64 known to be enabled
 };
 std::unique_ptr<Device> CreateNriVulkanDevice(const VulkanHost& host);
 std::unique_ptr<Device> CreateNriD3D12Device(ID3D12Device* device);

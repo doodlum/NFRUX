@@ -20,6 +20,11 @@ struct EvalInputs
     float mvScale[2] = {1, 1}, jitter[2] = {}, cameraNear = 0.1f, cameraFar = 1000.0f, fovY = 1.0f;
     float viewToClip[16] = {}, clipToPrevClip[16] = {}, pos[3] = {}, up[3] = {}, right[3] = {}, fwd[3] = {};
     bool  hasClipToPrevClip = false, depthInverted = false, hdr = false, reset = false, notRendering = false, ortho = false, menuDetection = false, motionJittered = false;
+    Rect     outRect, realRect;  // where the generated region goes in the outputs (none: the back buffer's)
+    bool     onlyInside = false, cameraMotion = true, dynamicResolution = false;
+    uint32_t internalWidth = 0, internalHeight = 0;
+    void*    disable = nullptr;  // OutputDisableInterpolation: a host buffer told when the batch is only copies
+    uint64_t frameId = 0;        // BackbufferFrameID, 0 none
     uint32_t count = 1, index = 1;  // DLSSG.MultiFrameCount / MultiFrameIndex
 };
 
@@ -58,6 +63,7 @@ private:
     std::shared_ptr<std::vector<uint8_t>> m_checkRead[2];
     std::vector<uint8_t>     m_checkWant[2];  // four bytes a pixel as read; m_checkChannels of them count
     uint32_t m_checkChannels[2] = {}, m_checks = 0;
+    uint64_t m_frameId = 0;
     uint32_t m_checkWaits = 0, m_kind = 0;
     std::future<bool> m_checkMake;
     enum { kCheckNone, kCheckMaking, kCheckWaiting, kCheckOk, kCheckFailed } m_check = kCheckNone;
@@ -70,7 +76,7 @@ private:
     bool     m_staged = false, m_inMenu = false, m_hudlessLogged = false, m_formatLogged = false;
     uint32_t m_menuStep = 0;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> m_menuReads;
-    const Texture* Crop(const ExternalImage& image, const Rect& r, bool depth);
+    const Texture* Crop(const EvalInputs& in, bool depth, const Rect& r, uint32_t w, uint32_t h);
 
     struct Cut { std::unique_ptr<Pass> pass; std::unique_ptr<Texture> tex; } m_cut[2];  // depth, motion
     std::vector<std::pair<std::unique_ptr<Texture>, uint64_t>> m_oldCuts;

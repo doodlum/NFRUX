@@ -152,26 +152,31 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
     return m_entries[0].get();
 }
 
-const Texture* FrameGenerator::Crop(const ExternalImage& image, const Rect& r, bool depth)
+const Texture* FrameGenerator::Crop(const EvalInputs& in, bool depth, const Rect& r, uint32_t w, uint32_t h)
 {
+    const ExternalImage& image = depth ? in.depth : in.motion;
     Cut& c = m_cut[depth ? 0 : 1];
-    if (r.x + r.w > image.width || r.y + r.h > image.height)
+    if (r.x + r.w > image.width || r.y + r.h > image.height || !r.w || !r.h || !w || !h)
         return nullptr;
     if (!c.pass) c.pass = m_dev.CreatePass(depth ? shaders::kCropR32f : shaders::kCropRg16f);
-    if (!c.tex || c.tex->width != r.w || c.tex->height != r.h)
+    if (!c.tex || c.tex->width != w || c.tex->height != h)
     {
         if (c.tex) m_oldCuts.push_back({std::move(c.tex), m_evaluations});
-        c.tex = m_dev.CreateTexture(depth ? Format::R32Float : Format::RG16Float, r.w, r.h);
-        Log("%s cut to the rendered region %ux%u of %ux%u", depth ? "depth" : "motion vectors", r.w, r.h, image.width, image.height);
+        c.tex = m_dev.CreateTexture(depth ? Format::R32Float : Format::RG16Float, w, h);
+        Log("%s: the region %ux%u of %ux%u as %ux%u%s", depth ? "depth" : "motion vectors", r.w, r.h, image.width, image.height, w, h, !depth && !in.cameraMotion ? ", the camera's motion added" : "");
     }
-    const Texture* src = m_dev.Wrap(image, false);
-    if (!c.pass || !c.tex || !src)
+    const Texture *src = m_dev.Wrap(image, false), *dep = m_dev.Wrap(in.depth, false);
+    if (!c.pass || !c.tex || !src || !dep)
         return nullptr;
-    const int32_t k[4] = {int32_t(r.x), int32_t(r.y), int32_t(r.w), int32_t(r.h)};
-    const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Tex(1, *src), Bind::Tex(2, *c.tex)};
-    return c.pass->Dispatch(b, 3, (r.w + 7) / 8, (r.h + 7) / 8) ? c.tex.get() : nullptr;
+    const Rect dr = Whole(in.depthRect, in.depth) ? Rect{0, 0, in.depth.width, in.depth.height} : in.depthRect;
+    struct { int32_t base[2], size[2], outSize[2], depthBase[2], depthSize[2], camera, pad; float toUnits[2], pad2[2], clip[16]; } k = {
+        {int32_t(r.x), int32_t(r.y)}, {int32_t(r.w), int32_t(r.h)}, {int32_t(w), int32_t(h)}, {int32_t(dr.x), int32_t(dr.y)}, {int32_t(dr.w), int32_t(dr.h)}};
+    k.camera = !depth && !in.cameraMotion && in.hasClipToPrevClip;
+    for (int i = 0; i < 2; ++i) k.toUnits[i] = in.mvScale[i] != 0 ? float(i ? r.h : r.w) / in.mvScale[i] : 0.0f;
+    memcpy(k.clip, in.clipToPrevClip, sizeof(k.clip));  // row-major for row vectors: the columns of the shader's matrix
+    const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Tex(1, *src), Bind::Tex(2, *c.tex), Bind::Tex(3, *dep)};
+    return c.pass->Dispatch(b, 4, (w + 7) / 8, (h + 7) / 8) ? c.tex.get() : nullptr;
 }
-
 // Which parts of which images the generated region is.
 struct Layout
 {
@@ -385,9 +390,14 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     ExternalImage color = hudless ? in.hudless : in.back;
     if (staged) color = ExternalImage{}, color.format = m_vulkan ? uint32_t(VK_FORMAT_R16G16B16A16_SFLOAT) : uint32_t(DXGI_FORMAT_R16G16B16A16_FLOAT);
     ExternalImage depth = in.depth, motion = in.motion;
-    const uint32_t rw = in.depthRect.w ? in.depthRect.w : depth.width, rh = in.depthRect.h ? in.depthRect.h : depth.height;
-    const bool cutDepth = !Whole(in.depthRect, depth), cutMotion = !Whole(in.motionRect, motion);
-    const uint32_t mw = cutMotion ? in.motionRect.w : motion.width, mh = cutMotion ? in.motionRect.h : motion.height;
+    const Rect dr = Whole(in.depthRect, depth) ? Rect{0, 0, depth.width, depth.height} : in.depthRect;
+    const Rect mr = Whole(in.motionRect, motion) ? Rect{0, 0, motion.width, motion.height} : in.motionRect;
+    // Dynamic resolution: depth and vectors may change size every frame; they are taken to one size, given or half the colour's.
+    uint32_t rw = dr.w, rh = dr.h;
+    if (in.dynamicResolution)
+        rw = in.internalWidth ? in.internalWidth : std::max(1u, l.back.w / 2), rh = in.internalHeight ? in.internalHeight : std::max(1u, l.back.h / 2);
+    const bool cutDepth = !Whole(in.depthRect, depth) || in.dynamicResolution, cutMotion = !Whole(in.motionRect, motion) || in.dynamicResolution || !in.cameraMotion;
+    const uint32_t mw = mr.w, mh = mr.h;
     Entry* e = Get(color, in, l.back.w, l.back.h, rw, rh);
     m_current = e;
     if (e->failed || !e->ip)
@@ -395,8 +405,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
 
     FrameInputs f;
     f.color = color, f.depth = depth, f.motion = motion;
-    if (cutDepth && !(f.depthTexture = Crop(depth, in.depthRect, true))) return false;
-    if (cutMotion && !(f.motionTexture = Crop(motion, in.motionRect, false))) return false;
+    if (cutDepth && !(f.depthTexture = Crop(in, true, dr, rw, rh))) return false;
+    if (cutMotion && !(f.motionTexture = Crop(in, false, mr, in.dynamicResolution ? rw : mr.w, in.dynamicResolution ? rh : mr.h))) return false;
     if (staged)
     {
         if (!m_prepare) m_prepare = m_dev.CreatePass(shaders::kPrepare);
@@ -489,6 +499,11 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         if (in.notRendering != m_menu)
             Log("%s", in.notRendering ? "not rendering game frames: no interpolation" : "game frames again"), m_menu = in.notRendering;
         const bool menu = InMenu(in);
+        if (in.frameId)  // a rendered frame that was not given: the history is not the frame before
+        {
+            if (m_frameId && in.frameId != m_frameId + 1 && in.frameId != m_frameId) m_restart = true;
+            m_frameId = in.frameId;
+        }
         if (in.notRendering || menu) m_restart = true;
         else if (!Checked()) m_restart = true;
         else if (!Generate(in) && m_generated == 0 && m_evaluations == 1) Log("first frame not generated");
@@ -503,13 +518,21 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     }
     Texture &back = *pBack, &out = *pOut;
     const uint32_t k = std::max(1u, in.index) - 1;
-    if (k < m_ready && m_current && m_current->ip)
-        m_dev.CopyTexture(m_staged ? *m_composed[k] : m_current->ip->Output(k), out), ++m_generated;
-    else
-        m_dev.CopyTexture(back, out);
+    const bool generated = k < m_ready && m_current && m_current->ip;
+    const Texture& made = !generated ? back : m_staged ? *m_composed[k] : m_current->ip->Output(k);
+    m_generated += generated;
+    // The generated image is the back buffer's size (the region and what is around it). UpdateOnlyInsideExtents: the region alone, to its own place.
+    const Rect region = Whole(in.backRect, in.back) ? Rect{0, 0, in.back.width, in.back.height} : in.backRect;
+    auto put = [&](const Texture& from, const Texture& to, const Rect& at) {
+        const bool elsewhere = at.w && (at.x != region.x || at.y != region.y);
+        if (in.onlyInside || elsewhere) m_dev.CopyRect(from, region.x, region.y, to, at.w ? at.x : region.x, at.w ? at.y : region.y, region.w, region.h);
+        else m_dev.CopyTexture(from, to);
+    };
+    put(made, out, in.outRect);
     if (in.outputReal && in.outputReal.handle != in.back.handle)
         if (Texture* real = m_dev.Wrap(in.outputReal, true))
-            m_dev.CopyTexture(back, *real);
+            put(back, *real, in.realRect);
+    if (in.disable && in.index <= 1) m_dev.WriteWord(in.disable, m_ready ? 0u : 1u);
     if (dumpAt >= 0 && rendered >= dumpAt && rendered < dumpAt + dumpFrames)
     {
         auto add = [&](const std::string& what, const Texture& t) {
@@ -523,8 +546,8 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
             if (in.depth && in.motion)  // in known formats, through the cut-out pass
             {
                 const Rect dr = in.depthRect.w ? in.depthRect : Rect{0, 0, in.depth.width, in.depth.height}, mr = in.motionRect.w ? in.motionRect : Rect{0, 0, in.motion.width, in.motion.height};
-                if (const Texture* t = Crop(in.depth, dr, true)) add("depth", *t);
-                if (const Texture* t = Crop(in.motion, mr, false)) add("motion", *t);
+                if (const Texture* t = Crop(in, true, dr, dr.w, dr.h)) add("depth", *t);
+                if (const Texture* t = Crop(in, false, mr, mr.w, mr.h)) add("motion", *t);
                 if (FILE* pf = fopen((std::string(Env("NFRUX_DUMP_DIR") ? Env("NFRUX_DUMP_DIR") : ".") + "\\params_f" + std::to_string(rendered - dumpAt) + ".txt").c_str(), "w"))
                 {
                     fprintf(pf, "%u %u %u %u %u %u %u\n", in.back.width, in.back.height, dr.w, dr.h, mr.w, mr.h, in.back.format);

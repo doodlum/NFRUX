@@ -23,6 +23,12 @@ static ComPtr<ID3D12Resource> Buf(ID3D12Device* d, uint64_t size, D3D12_HEAP_TYP
 
 int main(int argc, char** argv)
 {
+    for (auto [name, yes] : std::initializer_list<std::pair<const char*, bool>>{
+             {"NVIDIA GeForce RTX 2060", true}, {"NVIDIA GeForce RTX 2080 SUPER", true}, {"Quadro RTX 4000", true}, {"NVIDIA TITAN RTX", true}, {"Tesla T4", true}, {"T4G", true}, {"NVIDIA T4", true},
+             {"NVIDIA GeForce GTX 1650", false}, {"NVIDIA GeForce GTX 1660 Ti", false}, {"NVIDIA T400", false}, {"NVIDIA T400 4GB", false}, {"NVIDIA T600", false}, {"NVIDIA T1000", false},
+             {"NVIDIA T1200 Laptop GPU", false}, {"NVIDIA GeForce MX450", false}})
+        if (nfrux::HasTensorCores(name) != yes) return printf("tensor cores by name: %s wrong\n", name), 1;
+    puts("tensor cores by name: 15 names right");
     const bool timing = argc > 1 && !strcmp(argv[1], "time");
     ComPtr<ID3D12Debug> dbg;
     if (!timing && SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))))

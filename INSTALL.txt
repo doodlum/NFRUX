@@ -1,7 +1,8 @@
 NFRUX is one file, nvngx_dlssg.dll. Copy it under the name the route asks for; delete that copy to uninstall. Nothing is registered, and nothing else
-is written (a crash marker lives in %LOCALAPPDATA%\NFRUX for a game's first frames, and is removed after).
+is written unless NFRUX_LOG is set (a crash marker lives in %LOCALAPPDATA%\NFRUX for a game's first frames, and is removed after).
 
 OptiScaler 0.9.5 (2x): beside OptiScaler as dlssg_to_fsr3_amd_is_better.dll; in OptiScaler.ini FGInput=nukems, FGOutput=nukems.
 OptiScaler builds with FGNvngxReplacement: OptiScaler\custom\NFRUX\dlssg\nvngx_dlssg.dll; FGNvngxReplacement=NFRUX.
-Games with Streamline, no OptiScaler: beside the game's .exe as dbghelp.dll, or version.dll / winmm.dll if the game does not load that one.
-Not for games with anti-cheat.
+Games with Streamline, no OptiScaler: beside the game's .exe as dbghelp.dll, or version.dll if the game does not load that one.
+Use one route only. Not for games with anti-cheat.
+To report a problem: set NFRUX_LOG to a file path for a log; NFRUX_ML=scalar takes the plainest network path.

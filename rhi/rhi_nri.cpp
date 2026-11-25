@@ -58,8 +58,9 @@ const nri::AccessLayoutStage kSrv = {nri::AccessBits::SHADER_RESOURCE, nri::Layo
 const nri::AccessLayoutStage kUav = {nri::AccessBits::SHADER_RESOURCE_STORAGE, nri::Layout::SHADER_RESOURCE_STORAGE, nri::StageBits::COMPUTE_SHADER};
 const nri::AccessLayoutStage kSrc = {nri::AccessBits::COPY_SOURCE, nri::Layout::COPY_SOURCE, nri::StageBits::COPY};
 const nri::AccessLayoutStage kDst = {nri::AccessBits::COPY_DESTINATION, nri::Layout::COPY_DESTINATION, nri::StageBits::COPY};
-// The host's images: D3D12 COMMON, Vulkan GENERAL, in and out.
-const nri::AccessLayoutStage kHostD3D12 = {nri::AccessBits::NONE, nri::Layout::GENERAL, nri::StageBits::ALL};
+// The host's images, in and out (DLSS-FG Programming Guide, section 6): D3D12 inputs NON_PIXEL_SHADER_RESOURCE, outputs UNORDERED_ACCESS. Vulkan GENERAL, or
+// SHADER_READ_ONLY_OPTIMAL for an input the host declares not read-write.
+const nri::AccessLayoutStage kHostVkRead = {nri::AccessBits::SHADER_RESOURCE, nri::Layout::SHADER_RESOURCE, nri::StageBits::ALL};
 const nri::AccessLayoutStage kHostVk = {nri::AccessBits::SHADER_RESOURCE | nri::AccessBits::SHADER_RESOURCE_STORAGE | nri::AccessBits::COPY_SOURCE | nri::AccessBits::COPY_DESTINATION,
                                         nri::Layout::GENERAL, nri::StageBits::ALL};
 bool Same(const nri::AccessLayoutStage& a, const nri::AccessLayoutStage& b) { return a.access == b.access && a.layout == b.layout; }
@@ -217,9 +218,9 @@ public:
         }
         D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
         device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
-        c.int64 = o1.Int64ShaderOps, c.atomic64 = c.int64 && c.shaderModel >= 0x66, c.dot4 = c.shaderModel >= 0x64;
+        c.dot4 = c.shaderModel >= 0x64;
         c.cuda  = c.vendorId == uint32_t(nri::Vendor::NVIDIA) && GetModuleHandleA("nvapi64.dll");
-        Log("D3D12 (NRI): %s, shader model %x, dot4 %d, 64-bit atomics %d", c.name.c_str(), c.shaderModel, c.dot4, c.atomic64);
+        Log("D3D12 (NRI): %s, shader model %x, dot4 %d", c.name.c_str(), c.shaderModel, c.dot4);
         return c.shaderModel >= 0x60;
     }
     bool InitVulkan(const VulkanHost& h)
@@ -233,9 +234,9 @@ public:
         d.callbackInterface.MessageCallback = Message;
         d.enableNRIValidation = EnvFlag("NFRUX_VALIDATE", false);
         if (!NRI_OK(nri::nriCreateDeviceFromVKDevice(d, dev)) || !Init()) return false;
-        c.atomic64 = h.atomic64, c.int64 = h.atomic64;
+        
         c.dot4 = (h.mlFeatures & ffx_ml::FEATURE_INTEGER_DOT_PRODUCT) != 0, c.cooperativeMatrix = (h.mlFeatures & ffx_ml::FEATURE_COOPERATIVE_MATRIX) != 0;
-        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d, 64-bit atomics %d", c.name.c_str(), c.dot4, c.cooperativeMatrix, c.atomic64);
+        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d", c.name.c_str(), c.dot4, c.cooperativeMatrix);
         return true;
     }
 
@@ -303,7 +304,7 @@ public:
     Texture* Stored(const ExternalImage& e)
     {
         for (auto& s : scratch) if (s.last == next && s.of == uint64_t(e.handle)) return s.t.get();
-        TexN* src = static_cast<TexN*>(Wrap(e, true));
+        TexN* src = static_cast<TexN*>(WrapRaw(e, false));
         if (!src) return nullptr;
         const nri::Format f = HostFormat(e);
         Scratch* use = nullptr;
@@ -385,7 +386,7 @@ public:
             const ffx_ml::DeviceContext dc = {vk.instance, vk.physicalDevice, vk.device, vk.gipa, vk.gdpa, vk.mlFeatures};
             ffx_ml::Path path = ffx_ml::Path::Auto;
             // Cooperative matrices: int8 where the driver has them (NVIDIA, Intel XMX, AMD WMMA), else fp16 or bf16, whose sums are the same
-            // integers (tested; and the self-check compares).
+            // integers while below 2^24 (bound computed here from the weights; tested at the extremes; and the self-check compares).
             ffx_ml::MatType type = ffx_ml::MatType::None;
             if (ml)
             {
@@ -401,6 +402,8 @@ public:
             ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, type);
             if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
+            if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8 && ffx_ml::AccumulatorBound(DescribeModel(w, h)) >= (1 << 24))
+                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
             sel.rescaleFloat = false;  // exact
             if (path != ffx_ml::Path::Auto && !topRung && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
@@ -548,9 +551,13 @@ public:
         wrapped.clear(), wrappedHome.clear();
         cmd = nullptr;
     }
-    Texture* Wrap(const ExternalImage& e, bool written) override
+    Texture* Wrap(const ExternalImage& e, bool output) override
     {
-        if (!written && IsSrgb(e)) return Stored(e);
+        if (!output && IsSrgb(e)) return Stored(e);
+        return WrapRaw(e, output);
+    }
+    Texture* WrapRaw(const ExternalImage& e, bool output)
+    {
         for (auto& t : wrapped) if (t->native == uint64_t(e.handle)) return t.get();
         auto t = std::make_unique<TexN>();
         t->dev = this, t->native = uint64_t(e.handle), t->width = e.width, t->height = e.height, t->format = Format::Native;
@@ -573,7 +580,7 @@ public:
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
         if (!IsSrgb(e) && !Views(*t, f, false)) return nullptr;
-        const nri::AccessLayoutStage& home = isVk ? kHostVk : kHostD3D12;
+        const nri::AccessLayoutStage& home = isVk ? (!output && e.state == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? kHostVkRead : kHostVk) : output ? kUav : kSrv;
         t->state = home;
         wrapped.push_back(std::move(t)), wrappedHome.push_back(home);
         return wrapped.back().get();
@@ -618,6 +625,40 @@ public:
     void CopyTexture(const Texture& s, const Texture& d, uint32_t x, uint32_t y) override
     {
         Copy(s, 0, 0, d, x, y, std::min(s.width, d.width - x), std::min(s.height, d.height - y));
+    }
+    void CopyRect(const Texture& s, uint32_t sx, uint32_t sy, const Texture& d, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) override
+    {
+        if (sx >= s.width || sy >= s.height || dx >= d.width || dy >= d.height) return;
+        Copy(s, sx, sy, d, dx, dy, std::min({w, s.width - sx, d.width - dx}), std::min({h, s.height - sy, d.height - dy}));
+    }
+    // A word into one of the host's buffers (D3D12: in UNORDERED_ACCESS).
+    void WriteWord(void* buffer, uint32_t value) override
+    {
+        Flush();
+        if (isVk)
+        {
+            const auto vc = static_cast<VkCommandBuffer>(nativeCmd);
+            const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(vk.gdpa(vk.device, "vkCmdPipelineBarrier"));
+            const auto fill = reinterpret_cast<PFN_vkCmdFillBuffer>(vk.gdpa(vk.device, "vkCmdFillBuffer"));
+            VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+            barrier(vc, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+            fill(vc, reinterpret_cast<VkBuffer>(buffer), 0, 4, value);
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier(vc, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+            return;
+        }
+        auto* list = static_cast<ID3D12GraphicsCommandList*>(nativeCmd);
+        auto* res = static_cast<ID3D12Resource*>(buffer);
+        ID3D12GraphicsCommandList2* l2 = nullptr;
+        if (FAILED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&l2)))) return;
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Transition = {res, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
+        list->ResourceBarrier(1, &b);
+        const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER p = {res->GetGPUVirtualAddress(), value};
+        l2->WriteBufferImmediate(1, &p, nullptr);
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        list->ResourceBarrier(1, &b);
+        l2->Release();
     }
     void CopyRegion(const Texture& s, uint32_t x, uint32_t y, const Texture& d) override { Copy(s, x, y, d, 0, 0, d.width, d.height); }
     // A host buffer of 0xff bytes: 1.0 in R8, ~0 in the scatter keys.

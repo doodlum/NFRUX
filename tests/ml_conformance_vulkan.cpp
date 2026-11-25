@@ -8,6 +8,7 @@
 //
 //   ffx_ml_runtime_test [--gpu N] [--width W] [--height H] [--iterations N]
 
+#include "tosa_graph.h"
 #include "vulkan_network.h"
 
 #include <nfru_mfg_v14_int8.h>
@@ -591,51 +592,71 @@ int main(int argc, char** argv)
     bool allPass = true;
     for (const Model& model : models)
     {
-        std::mt19937                            rng(1234);
-        std::uniform_int_distribution<int>      dist(-128, 127);
-        std::map<uint32_t, std::vector<int8_t>> inputs, reference;
-        for (const auto& [binding, shape] : model.desc.inputShapes)
-        {
-            size_t n = 1;
-            for (int64_t d : shape)
-                n *= size_t(d);
-            auto& v = inputs[binding];
-            v.resize(n);
-            for (auto& x : v)
-                x = int8_t(dist(rng));
-        }
-        std::string error;
-        if (!ffx_ml::RunReference(model.desc, inputs, reference, &error))
-        {
-            printf("%s: reference failed: %s\n", model.name, error.c_str());
-            return 1;
-        }
         const auto& inShape = model.desc.inputShapes.begin()->second;
-        printf("%s (input %" PRId64 "x%" PRId64 "x%" PRId64 ")\n", model.name, inShape[1], inShape[2], inShape[3]);
-        for (const Config& config : configs)
+        printf("%s (input %" PRId64 "x%" PRId64 "x%" PRId64 "), largest partial sum %" PRId64 " of 16777216\n", model.name, inShape[1], inShape[2], inShape[3], ffx_ml::AccumulatorBound(model.desc));
+        // The extremes of the accumulators: constant, alternating, and the signs of the first layer's weights.
+        std::vector<int32_t> signs(size_t(inShape[3]), 0);
         {
-            // FFX_ML_TEST_PATHS=dot4,scalar,... limits the paths run (faster tuning loops).
-            if (const char* only = getenv("FFX_ML_TEST_PATHS"))
-                if (!strstr(only, ffx_ml::ToString(config.path)))
-                    continue;
-            std::string name;
-            if (config.env)
+            ffx_ml::tosa::Graph  graph;
+            ffx_ml::LoweredGraph lowered;
+            if (ffx_ml::tosa::Parse(model.desc, graph, nullptr) && ffx_ml::Lower(graph, lowered, nullptr))
+                for (const ffx_ml::FusedConv& fc : lowered.convs)
+                    if (fc.inC == int32_t(inShape[3]))
+                    {
+                        const auto& w = fc.conv->weights;
+                        for (size_t i = 0; i < w.size() / size_t(fc.outC); ++i)  // output channel 0
+                            signs[i % signs.size()] += w[i];
+                        break;
+                    }
+        }
+        const char* patterns[] = {"random", "all -128", "all 127", "alternating", "weight signs"};
+        for (int pattern = 0; pattern < 5; ++pattern)
+        {
+            printf("  inputs: %s\n", patterns[pattern]);
+            std::mt19937                            rng(1234);
+            std::uniform_int_distribution<int>      dist(-128, 127);
+            std::map<uint32_t, std::vector<int8_t>> inputs, reference;
+            for (const auto& [binding, shape] : model.desc.inputShapes)
             {
-                const char* eq = strchr(config.env, '=');
-                name           = std::string(config.env, eq);
-                if (getenv(name.c_str()))
-                    continue;  // the caller forced this variable for every run, so the variant run would be a duplicate
-                SetEnv(name.c_str(), eq + 1);
+                size_t n = 1;
+                for (int64_t d : shape)
+                    n *= size_t(d);
+                auto& v = inputs[binding];
+                v.resize(n);
+                const size_t ch = size_t(shape.back());
+                for (size_t i = 0; i < n; ++i)
+                    v[i] = int8_t(pattern == 0 ? dist(rng) : pattern == 1 ? -128 : pattern == 2 ? 127 : pattern == 3 ? ((i ^ (i / ch)) & 1 ? 127 : -128) : signs[i % ch % signs.size()] < 0 ? -128 : 127);
             }
-            bool skipped = false;
-            allPass &= RunConfig(ctx, model, config, inputs, reference, iterations, skipped);
-            if (config.env)
-                SetEnv(name.c_str(), nullptr);
-            if (skipped)
-                printf("  %-56s skipped (not supported)\n", (std::string(ffx_ml::ToString(config.path)) + " " + ffx_ml::ToString(config.type)).c_str());
+            std::string error;
+            if (!ffx_ml::RunReference(model.desc, inputs, reference, &error))
+            {
+                printf("%s: reference failed: %s\n", model.name, error.c_str());
+                return 1;
+            }
+            for (const Config& config : configs)
+            {
+                // FFX_ML_TEST_PATHS=dot4,scalar,... limits the paths run (faster tuning loops).
+                if (const char* only = getenv("FFX_ML_TEST_PATHS"))
+                    if (!strstr(only, ffx_ml::ToString(config.path)))
+                        continue;
+                std::string name;
+                if (config.env)
+                {
+                    const char* eq = strchr(config.env, '=');
+                    name           = std::string(config.env, eq);
+                    if (getenv(name.c_str()))
+                        continue;  // the caller forced this variable for every run, so the variant run would be a duplicate
+                    SetEnv(name.c_str(), eq + 1);
+                }
+                bool skipped = false;
+                allPass &= RunConfig(ctx, model, config, inputs, reference, iterations, skipped);
+                if (config.env)
+                    SetEnv(name.c_str(), nullptr);
+                if (skipped)
+                    printf("  %-56s skipped (not supported)\n", (std::string(ffx_ml::ToString(config.path)) + " " + ffx_ml::ToString(config.type)).c_str());
+            }
         }
     }
-
     vkDestroyQueryPool(ctx.device, ctx.queries, nullptr);
     vkDestroyCommandPool(ctx.device, ctx.pool, nullptr);
     vkDestroyDevice(ctx.device, nullptr);

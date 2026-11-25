@@ -93,6 +93,20 @@ std::vector<uint8_t> Link(const std::string& ptx, LUID luid, std::string* error)
     return out;
 }
 
+// At sm_75: whole words only. A word that begins with RTX, or is T4 (not T400).
+}  // namespace
+bool HasTensorCores(const char* name)
+{
+    for (const char* w = name; *w;)
+    {
+        const size_t n = strcspn(w, " ");
+        if (!strncmp(w, "RTX", 3) || (n == 2 && !strncmp(w, "T4", 2)) || (n == 3 && !strncmp(w, "T4G", 3))) return true;
+        w += n + (w[n] != 0);
+    }
+    return false;
+}
+namespace
+{
 // The adapter's compute capability (75, 80, 89 ...); 0 without int8 tensor cores. GTX 16 reports 75 as RTX 20 does, and has none.
 int ComputeCapability(LUID luid, std::string* error)
 {
@@ -115,7 +129,7 @@ int ComputeCapability(LUID luid, std::string* error)
         if (get(&d, i) || getLuid(l, &mask, d) || memcmp(l, &luid, 8)) continue;
         attribute(&major, 75, d), attribute(&minor, 76, d), getName(name, sizeof(name), d);  // COMPUTE_CAPABILITY_MAJOR, _MINOR
         const int sm = major * 10 + minor;
-        if (sm >= 80 || (sm == 75 && (strstr(name, "RTX") || strstr(name, "T4")))) return sm;
+        if (sm >= 80 || (sm == 75 && HasTensorCores(name))) return sm;
         if (error) *error = std::string(name) + " (sm_" + std::to_string(sm) + ") has no int8 tensor cores";
         return 0;
     }
