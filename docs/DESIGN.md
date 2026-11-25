@@ -135,7 +135,7 @@ after v192, the reason for the pin) makes it treat every optional 1.1+ feature (
 ...) as absent; `minorVersion` is always given as 2 and no extensions are listed, whatever the GPU reports, as the host's own choice is not known. Below
 1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" is an assumption on both routes; the ones our call set uses are
 shaderStorageImageExtendedFormats and shaderInt64 (atomics rung only), which the loader adds. `queueFamily`: NRI takes a queue from the family it is
-given (0); it is never submitted to; the loader's record of the host's queue families is passed when known. enabled on the OptiScaler route:
+given (0); it is never submitted to; the loader's record of the host's queue families is passed when known. On the OptiScaler route the
 assumptions are exactly (a) 1.2, (b) shaderStorageImageExtendedFormats, logged at creation. A minimal-host test is A10.
 Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8 only (the runtime's fp16

@@ -281,15 +281,23 @@ static void Patch(HMODULE m)
     }
 }
 struct NOTIFY { ULONG Flags; const UNICODE_STRING *Full, *Base; PVOID DllBase; ULONG Size; };
-static VOID CALLBACK OnDll(ULONG reason, const NOTIFY* d, PVOID) { if (reason == 1 && _wcsnicmp(d->Full->Buffer, L"C:\\Windows", 10)) { Patch((HMODULE)d->DllBase); } }
+static wchar_t g_win[MAX_PATH]; static size_t g_winLen;
+static bool IsWindows(const UNICODE_STRING* n) { return g_winLen && n->Buffer && n->Length / 2 > g_winLen && !_wcsnicmp(n->Buffer, g_win, g_winLen); }
+static VOID CALLBACK OnDll(ULONG reason, const NOTIFY* d, PVOID) { if (reason == 1 && !IsWindows(d->Full)) { Patch((HMODULE)d->DllBase); } }
 BOOL WINAPI DllMain(HINSTANCE, DWORD r, LPVOID)
 {
     if (r == DLL_PROCESS_ATTACH)
     {
         auto reg = (NTSTATUS(NTAPI*)(ULONG, void*, void*, void**))GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
         void* cookie; if (reg) reg(0, (void*)OnDll, nullptr, &cookie);
-        Patch(GetModuleHandleA(nullptr));
-        if (auto m = GetModuleHandleA("sl.interposer.dll")) Patch(m);
+        // Every module already here that is not Windows' own.
+        wchar_t win[MAX_PATH] = {}; GetWindowsDirectoryW(win, MAX_PATH); g_winLen = wcslen(win); wcscpy_s(g_win, win);
+        auto* peb = NtCurrentTeb()->ProcessEnvironmentBlock;
+        for (auto* e = peb->Ldr->InMemoryOrderModuleList.Flink; e != &peb->Ldr->InMemoryOrderModuleList; e = e->Flink)
+        {
+            auto* m = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+            if (m->DllBase && !IsWindows(&m->FullDllName)) Patch((HMODULE)m->DllBase);
+        }
     }
     return TRUE;
 }
