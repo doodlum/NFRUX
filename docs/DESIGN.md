@@ -89,7 +89,7 @@ OutputInterpolated is always written too. A failure is returned only for a missi
 | OutputReal, HUDLess, UI, UIAlpha, NoWarp, BidirectionalDistortionField | optional | rule without it |
 | *Subrect{BaseX,BaseY,Width,Height} per input; InputBackbuffer* preferred over the deprecated Backbuffer* | region | whole image (or the back buffer's, same size) |
 | OutputInterpolatedSubrect*, OutputRealSubrect* | where the region goes in the output | the region's own place |
-| EvalFlags bit 0 (UpdateOnlyInsideExtents) | only the region is written: several viewports, a feature each, on one back buffer | the whole image is written (around the region: the back buffer) |
+| EvalFlags bit 0 (UpdateOnlyInsideExtents) | only the region is written: several viewports, a feature each, on one back buffer | the whole image is written (the back buffer around the region, as strips that do not overlap it) |
 | OutputDisableInterpolation | a 4-byte word: 1 when this batch holds copies only (menu, not rendering, reset failures, not ready), else 0; written at k = 1. D3D12: in UNORDERED_ACCESS. Vulkan: NGX buffer resource with TRANSFER_DST usage; a host that maps it waits for the submission | not written |
 | BackbufferFrameID | an id that is not the last or the last + 1 restarts the history | not used |
 | DynamicResolution, InternalWidth/Height | depth and vectors resampled (nearest) to one size, the given or half the colour's, so a changing region keeps the history | the region's size |
@@ -182,7 +182,7 @@ else is optional and needs to be *enabled*. Source of truth:
   appended), when supported per `vkGetPhysicalDeviceFeatures2`: shaderStorageImageExtendedFormats,
   cooperativeMatrix, vulkanMemoryModel (+ DeviceScope), shaderInt8, storageBuffer8BitAccess, shaderFloat16, storageBuffer16BitAccess, shaderIntegerDotProduct,
   subgroupSizeControl, computeFullSubgroups
-  and their extensions. It also wraps vkDestroyDevice (what is on the device is destroyed first). Merge rule: known structures of the pNext chain are copied, unknown ones kept in place (their pNext is changed for the call and put back); a feature that belongs to an aggregate
+  and their extensions (integer dot product and subgroup size control, without the 1.3 aggregate: only when the device lists the extension). It also wraps vkDestroyDevice (what is on the device is destroyed first). Merge rule: known structures of the pNext chain are copied, unknown ones kept in place (their pNext is changed for the call and put back); a feature that belongs to an aggregate
   present in the chain (VkPhysicalDeviceVulkan11/12/13Features, VkPhysicalDeviceFeatures2) is set in that copy; its individual struct
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the

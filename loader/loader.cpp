@@ -235,8 +235,8 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     if (f13) f13->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, f13->subgroupSizeControl |= s13.subgroupSizeControl, f13->computeFullSubgroups |= s13.computeFullSubgroups;
     else
     {
-        if (!fdot) chain(fdot = &dot);
-        if (!fsg) chain(fsg = &sg);
+        if (!fdot) { fdot = &dot; if (s13.shaderIntegerDotProduct) chain(fdot); }
+        if (!fsg) { fsg = &sg; if (s13.subgroupSizeControl) chain(fsg); }
         fdot->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, fsg->subgroupSizeControl |= s13.subgroupSizeControl, fsg->computeFullSubgroups |= s13.computeFullSubgroups;
     }
     if (cmS.cooperativeMatrix)

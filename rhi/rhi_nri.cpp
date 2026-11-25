@@ -405,9 +405,9 @@ public:
             if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
             if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8 && ffx_ml::AccumulatorBound(DescribeModel(w, h)) >= (1 << 24))
-                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Auto, ffx_ml::MatType::Int8);
             if (noFloats && topRung == 0 && sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8)
-                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+                sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Auto, ffx_ml::MatType::Int8);
             if (sel.path == ffx_ml::Path::CoopMat) lastFloat = sel.matType != ffx_ml::MatType::Int8;
             else lastFloat = false;
             rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;

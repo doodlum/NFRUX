@@ -528,7 +528,12 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     const Rect region = Whole(in.backRect, in.back) ? Rect{0, 0, in.back.width, in.back.height} : in.backRect;
     auto put = [&](const Texture& from, const Texture& to, const Rect& at) {
         const bool elsewhere = at.w && (at.x != region.x || at.y != region.y);
-        if (!in.onlyInside && elsewhere) m_dev.CopyTexture(back, to);
+        if (!in.onlyInside && elsewhere)  // the back buffer around it: four strips, nothing is written twice
+        {
+            const uint32_t x1 = std::min(at.x + region.w, to.width), y1 = std::min(at.y + region.h, to.height), y0 = std::min(uint32_t(at.y), to.height);
+            for (const Rect& s : {Rect{0, 0, to.width, at.y}, Rect{0, y1, to.width, to.height - y1}, Rect{0, y0, at.x, y1 - y0}, Rect{x1, y0, to.width - x1, y1 - y0}})
+                if (s.w && s.h) m_dev.CopyRect(back, s.x, s.y, to, s.x, s.y, s.w, s.h);
+        }
         if (in.onlyInside || elsewhere) m_dev.CopyRect(from, region.x, region.y, to, at.w ? at.x : region.x, at.w ? at.y : region.y, region.w, region.h);
         else m_dev.CopyTexture(from, to);
     };

@@ -792,6 +792,12 @@ static void Scenes(Api& a, Results& res)
         s.extra = [&](Params& p, int) { rect(p, "InputBackbuffer", 80, 60), rect(p, "OutputInterpolated", 20, 10), p.Set("DLSSG.EvalFlags", 1); };
         const Out moved = Run(a, s);
         Check(MaxDiff(Cut(moved.gen[0], 20, 10, W, H), Cut(whole.gen[0], 80, 60, W, H), All) == 0, "the region, at its place in the output", 0);
+        s.extra = [&](Params& p, int) { rect(p, "InputBackbuffer", 80, 60), rect(p, "OutputInterpolated", 20, 10); };
+        const Out around = Run(a, s);
+        keep("output subrect", around);
+        auto out2 = [](int x, int y) { return x < 20 || y < 10 || x >= 20 + int(W) || y >= 10 + int(H); };
+        Check(MaxDiff(Cut(around.gen[0], 20, 10, W, H), Cut(whole.gen[0], 80, 60, W, H), All) == 0, "the same without the flag", 0);
+        Check(MaxDiff(around.gen[0], around.back, out2) == 0, "and the back buffer around it", 0);
         // Only the region is written: the second viewport's leaves the first's.
         Params p;
         TexP back = a.Create(F_RGBA8, 2 * W, H, false), out = a.Create(F_RGBA8, 2 * W, H, true), depth = a.Create(F_R32F, W, H, false), mv = a.Create(F_RG16F, W, H, false);
