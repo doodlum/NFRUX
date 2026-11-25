@@ -108,7 +108,12 @@ bool Whole(const Rect& r, const ExternalImage& e) { return !r.w || !r.h || (!r.x
 bool SameSize(const ExternalImage& a, const ExternalImage& b) { return a && b && a.width == b.width && a.height == b.height; }
 }  // namespace
 
-FrameGenerator::~FrameGenerator() { m_dev.WaitIdle(); }
+FrameGenerator::~FrameGenerator()
+{
+    for (auto& e : m_entries) if (e->making.valid()) e->making.wait();  // a worker may still use the device
+    for (auto& e : m_retired) if (e.first->making.valid()) e.first->making.wait();
+    m_dev.WaitIdle();
+}
 
 FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const EvalInputs& in, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh)
 {
@@ -118,10 +123,14 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
         if (e.w == w && e.h == h && e.rw == rw && e.rh == rh && e.format == color.format && e.inverted == in.depthInverted)
         {
             if (i) std::rotate(m_entries.begin(), m_entries.begin() + i, m_entries.begin() + i + 1), m_restart = true;
-            return m_entries[0].get();
+            Entry* f = m_entries[0].get();
+            if (f->making.valid() && f->making.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                f->ip = f->making.get(), f->failed = !f->ip, m_restart = true;
+            return f;
         }
     }
-    auto e = std::make_unique<Entry>(Entry{nullptr, w, h, rw, rh, color.format, in.depthInverted});
+    auto e = std::make_unique<Entry>();
+    e->w = w, e->h = h, e->rw = rw, e->rh = rh, e->format = color.format, e->inverted = in.depthInverted;
     Settings s;
     s.displayWidth = w, s.displayHeight = h, s.renderWidth = rw, s.renderHeight = rh, s.depthInverted = in.depthInverted;
     s.colorLike = color, s.outputFormat = ClassOf(color, m_vulkan);
@@ -129,11 +138,14 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
         s.outputFormat = Format::RGBA8Unorm, s.swapRB = true;  // the bytes of BGRA8, copied raw
     CameraViewProjection(in, s.initialViewProjection);
     memcpy(m_vp, s.initialViewProjection, sizeof(m_vp));
-    std::string error;
-    e->ip     = Interpolator::Create(m_dev, s, &error);
-    e->failed = !e->ip;
-    if (e->failed)
-        Log("frame generation %ux%u (render %ux%u, format %u) not possible: %s; showing rendered frames", w, h, rw, rh, color.format, error.c_str());
+    e->making = std::async(std::launch::async, [this, s, w, h, rw, rh, format = color.format] {
+        std::string error;
+        auto        ip = Interpolator::Create(m_dev, s, &error);
+        if (!ip) Log("frame generation %ux%u (render %ux%u, format %u) not possible: %s; showing rendered frames", w, h, rw, rh, format, error.c_str());
+        return ip;
+    });
+    if (EnvFlag("NFRUX_SYNC_CREATE", false))  // tests
+        e->ip = e->making.get(), e->failed = !e->ip;
     m_entries.insert(m_entries.begin(), std::move(e));
     while (m_entries.size() > 2)
         m_retired.push_back({std::move(m_entries.back()), m_evaluations}), m_entries.pop_back();
@@ -362,8 +374,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     const uint32_t mw = cutMotion ? in.motionRect.w : motion.width, mh = cutMotion ? in.motionRect.h : motion.height;
     Entry* e = Get(color, in, l.back.w, l.back.h, rw, rh);
     m_current = e;
-    if (e->failed)
-        return false;
+    if (e->failed || !e->ip)
+        return false;  // not possible, or still being made
 
     FrameInputs f;
     f.color = color, f.depth = depth, f.motion = motion;

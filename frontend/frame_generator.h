@@ -3,6 +3,7 @@
 #pragma once
 #include "../core/interpolator.h"
 
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,7 @@ private:
         uint32_t w, h, rw, rh, format;
         bool     inverted;
         bool     failed = false;
+        std::future<std::unique_ptr<Interpolator>> making;  // on a worker thread: the game is not held up
     };
     Entry* Get(const ExternalImage& color, const EvalInputs& in, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh);
     bool   Generate(const EvalInputs& in);
