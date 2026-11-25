@@ -22,6 +22,9 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
+#ifndef NFRUX_AGILITY
+#define NFRUX_AGILITY 620
+#endif
 
 // --- NGX parameters, as a core's
 struct Params : NgxParameter
@@ -114,11 +117,18 @@ struct Api12 : Api
     {
         if (getenv("NFRUX_D3D12_DEBUG"))
         {
+            // From the Agility SDK package in .\D3D12 beside the exe (Windows' own core would want Graphics Tools).
+            ComPtr<ID3D12SDKConfiguration1> sdk;
+            ComPtr<ID3D12DeviceFactory> factory;
             ComPtr<ID3D12Debug1> dbg;
-            if (FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) return printf("  no D3D12 debug layer\n"), false;
+            HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdk));
+            if (SUCCEEDED(hr)) hr = sdk->CreateDeviceFactory(NFRUX_AGILITY, ".\\D3D12\\", IID_PPV_ARGS(&factory));
+            if (SUCCEEDED(hr)) hr = factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&dbg));
+            if (FAILED(hr)) return printf("  no D3D12 debug layer: %08lx\n", hr), false;
             dbg->EnableDebugLayer(), dbg->SetEnableGPUBasedValidation(atoi(getenv("NFRUX_D3D12_DEBUG")) > 1);
+            if (FAILED(hr = factory->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  debug device: %08lx\n", hr), false;
         }
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return false;
+        if (!d && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return false;
         if (SUCCEEDED(d.As(&info)))
         {
             info->SetMessageCountLimit(100000);
@@ -834,12 +844,6 @@ static void Soak(Api& a, uint32_t n)
     Check(int(h1) - int(h0) < 20, "handles flat", double(int(h1) - int(h0)));
     a.Release(h);
 }
-
-// With an app-local Agility SDK next to the exe (D3D12 debug layers without Windows' Graphics Tools).
-#ifdef NFRUX_AGILITY
-extern "C" __declspec(dllexport) extern const UINT D3D12SDKVersion = NFRUX_AGILITY;
-extern "C" __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
-#endif
 
 int main(int argc, char** argv)
 {

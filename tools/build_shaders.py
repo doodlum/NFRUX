@@ -197,6 +197,6 @@ KERNELS = {"scalar": ["-DML_PATH_SCALAR=1"], "dot4": ["-DML_PATH_DOT4=1"], "dot4
            "coopmat_int8": ["-DML_PATH_COOPMAT=1", "-DML_MAT_INT8=1"], "coopmat_fp16": ["-DML_PATH_COOPMAT=1", "-DML_MAT_FP16=1"],
            "coopmat_bf16": ["-DML_PATH_COOPMAT=1", "-DML_MAT_BF16=1"]}
 for n, d in KERNELS.items():
-    run([GLSLANG, "-V", "--target-env", "vulkan1.3", "-S", "comp", *d, "--vn", "ffx_ml_conv2d_" + n,
+    run([GLSLANG, "-V", "--target-env", "vulkan1.2", "-S", "comp", *d, "--vn", "ffx_ml_conv2d_" + n,
          "-o", os.path.join(out, f"ffx_ml_conv2d_{n}_spv.h"), os.path.join("ml", "ffx_ml_conv2d.comp")])
 print(f"{len(built)} shaders, {os.path.getsize(os.path.join(out, 'nfrux_shaders.h')) >> 10} KB")
