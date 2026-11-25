@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 8, under review (revision 6 was agreed by all three reviewers, 7 was not; docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
+Status: revision 8, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
