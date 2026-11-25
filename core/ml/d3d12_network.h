@@ -20,7 +20,7 @@ public:
 
     // The input (tight NHWC int8) and outputs (four channels a pixel) as buffers: input in UNORDERED_ACCESS or a shader
     // read state, outputs in UNORDERED_ACCESS before and after.
-    void Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs) const;
+    void Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch = 0) const;  // outputPitch: bytes a row of the outputs (0: tight)
     // Weights: uploaded by the first recording (the upload buffer lives as long as the graph).
     uint32_t                      outputCount() const { return uint32_t(m_outputBindings.size()); }
     uint32_t                      outputBinding(uint32_t i) const { return m_outputBindings[i]; }

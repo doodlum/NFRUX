@@ -879,7 +879,7 @@ void StoreInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN InputTen
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_OUTPUT, OUTPUT_IMG_FORMAT) uniform image2D rw_output;
 void StoreFrameinterpolationOutput(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FFX_MIN16_F4 val)
 {
-    imageStore(rw_output, iPxPos, val);
+    imageStore(rw_output, iPxPos, (cbFI._Options & 0x1000u) != 0u ? val.bgra : val);  // NFRUX: blue first (BGRA8 outputs)
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_OUTPUT)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_OUTPUT) out mediump FfxFloat32x4 rw_output;

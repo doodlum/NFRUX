@@ -158,7 +158,7 @@ std::unique_ptr<D3D12Graph> D3D12Graph::Create(ID3D12Device* device, const ffx_m
             memcpy(&p[3 * stride], fc.table->table.data(), 256);
         constants.insert(constants.end(), reinterpret_cast<uint8_t*>(p.data()), reinterpret_cast<uint8_t*>(p.data() + p.size()));
         const int32_t k[20] = {fc.inW, fc.inH, fc.outW, fc.outH, t0.w, t0.h, c.pad[2], c.pad[0], s0.scale[0], s0.scale[1], s0.scale[2], s0.scale[3],
-                               s0.offset[0], s0.offset[1], r.rescaleOutZp, c.inputZp, dst.channelStride / 4};
+                               s0.offset[0], s0.offset[1], r.rescaleOutZp, c.inputZp, dst.channelStride / 4, fc.outW * (dst.channelStride / 4)};
         memcpy(l.constants, k, sizeof(k));
         l.src[0] = slot[s0.tensor];
         l.src[1] = two ? slot[fc.sources[1].tensor] : l.src[0];
@@ -178,7 +178,7 @@ std::unique_ptr<D3D12Graph> D3D12Graph::Create(ID3D12Device* device, const ffx_m
     return out;
 }
 
-void D3D12Graph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs) const
+void D3D12Graph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch) const
 {
     auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER x = {};
@@ -214,6 +214,8 @@ void D3D12Graph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRE
         auto va = [&](int32_t t) { return t >= 0 ? m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? input : outputs[-2 - t]->GetGPUVirtualAddress(); };
         list->SetPipelineState(l.pso.Get());
         list->SetComputeRoot32BitConstants(0, 20, l.constants, 0);
+        if (l.dst < -1 && outputPitch)
+            list->SetComputeRoot32BitConstant(0, outputPitch / 4, 17);
         list->SetComputeRootShaderResourceView(1, va(l.src[0]));
         list->SetComputeRootShaderResourceView(2, va(l.src[1]));
         list->SetComputeRootShaderResourceView(3, base + l.weights);

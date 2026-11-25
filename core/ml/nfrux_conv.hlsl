@@ -15,6 +15,7 @@ cbuffer Layer : register(b0)
     int  gOutZp;
     int  gInZp;
     uint gOutStrideWords;
+    uint gOutRowWords;
 };
 ByteAddressBuffer   gSrc0 : register(t0);
 ByteAddressBuffer   gSrc1 : register(t1);
@@ -165,7 +166,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 group : SV_GroupID)
 #if IMAGE
             if (q == 0) gDst[uint2(ox, oy)] = packed;
 #else
-            gDst.Store(((oy * gOut.x + ox) * gOutStrideWords + (block * OCB + q) / 4) * 4, packed);
+            gDst.Store((oy * gOutRowWords + ox * gOutStrideWords + (block * OCB + q) / 4) * 4, packed);
 #endif
         }
     }
