@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 4 (NRI, M0a findings, M0d / M0e gates), for review. Revision 3 was agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
+Status: revision 5 (NRI feature handling, locks, M0e, acceptance rows), for review. Revision 3 was agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -123,16 +123,21 @@ The training model used half precision in flow; moving to fp32 is measured in A3
 64-bit atomic scatter (SM 6.6 / shaderBufferInt64Atomics) and the two 32-bit passes are exact equivalents (tested in A7,
 `NFRUX_SCATTER=64|32`).
 
-**D1b. NRI.** (Adopted 2026-11-25.) rhi.h has one implementation, on NVIDIA's NRI v192 (MIT), which wraps the host's
-VkDevice / ID3D12Device, command buffer and images. It replaces two hand-written backends; the native D3D12 one that existed was
-bit-identical to it and no faster in the sample (564 against 572 fps at 4x), and was deleted. Kept ours, on native handles: state
-tracking (NRI has no automatic barriers), descriptor recycling, completion tokens, the network kernels, CUDA. Built without Agility SDK,
-NVAPI, AGS and NVTX (its wrapped-device teardown crashed with them). Cost: Vulkan 1.2 + synchronization2 is the minimum (DLSS-G hosts
-submit with vkQueueSubmit2), and NRI's statement that all supported Vulkan 1.0 features must be
-enabled, which a host may not do: in practice what the passes use is the D3 baseline; the loader's hook adds the rest. Enhanced barriers off.
-Pinned by commit; updates go through A1 and A2. Images' first transition waits for earlier work (a corruption at 5x and more on Vulkan
-otherwise). D3D12's legacy COMMON and Vulkan's GENERAL are the host states, as M0a found.
+**D1b. NRI.** (Adopted 2026-11-25.) rhi.h has one implementation, on NVIDIA's NRI (MIT), commit 993db1a, built by
+`tools/build_nri.ps1` with D3D11, Agility SDK, NVAPI, AGS and NVTX off (its wrapped-device teardown crashed with them; which one was not
+established). It wraps the host's device, command buffer and images. The native D3D12 backend that existed was bit-identical and no faster in
+the sample (564 against 572 fps at 4x) and was deleted; that removes an independent implementation, so correctness evidence is A3 and A14
+(outside references), and the validation runs, and A3 is required before M5's exit. Ours, on native handles: state tracking, descriptor recycling,
+completion tokens, network kernels.
 
+What NRI needs of a wrapped Vulkan device: 1.2 and the Vulkan 1.0 features the GPU reports. `DeviceCreationVKDesc::unknownFeatures = true` (new
+after v192, the reason for the pin) makes it treat every optional 1.1+ feature (bufferDeviceAddress, synchronization2, maintenance*, memoryPriority,
+...) as absent; `minorVersion` is always given as 2 and no extensions are listed, whatever the GPU reports, as the host's own choice is not known. Below
+1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" is an assumption on both routes; the ones our call set uses are
+shaderStorageImageExtendedFormats and shaderInt64 (atomics rung only), which the loader adds. `queueFamily`: NRI takes a queue from the family it is
+given (0); it is never submitted to; the loader's record of the host's queue families is passed when known. enabled on the OptiScaler route:
+assumptions are exactly (a) 1.2, (b) shaderStorageImageExtendedFormats, logged at creation. A minimal-host test is A10.
+Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8 only (the runtime's fp16
 preference is overridden). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Decky's
 float requantisation is off. `nfrux_conv.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
@@ -149,7 +154,7 @@ params / gate textures on every path (paths that write images directly are an op
 | D3D12 NVIDIA | CUDA via NVAPI (gate M0b) | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other | SM 6.4 dot4 | - | SM 6.0 |
 
-Vulkan baseline (passes and floor): 1.2 with synchronization2 (NRI) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
+Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). Storing to BGRA8 goes through an R32_UINT view with the swizzle in
 the shader (the output made MUTABLE by the host or, else, D9's convert pass), never a mismatched format qualifier. Everything
 else is optional and needs to be *enabled*. Source of truth:
@@ -191,11 +196,13 @@ source, opt-in (`NFRUX_FLOW=nvof`), delivered as:
 - D3D12: NVOF API (`nvofapi64.dll`) with input luma at flow size. Needs CmdQueue, CmdAlloc and IsRecording = 1: close, submit, queue
   signal, flow waits and signals, queue waits, `Reset(list, alloc)` (allocator not reset), all own state rebound. Absent: block
   match.
-- Vulkan: `VK_NV_optical_flow`. M0a found that Evaluate gets a VkQueue (`DLSSG.CmdQueue`), a VkCommandPool (`CmdAlloc`) and IsRecording = 1 on
-  Vulkan too, and that Streamline creates its devices with native optical flow. So the same split is possible in principle: end and submit
-  the command buffer, flow on the optical-flow queue between two timeline semaphore points, continue in the reset command buffer. What is
-  unknown: whether a command buffer Streamline handed over may be ended, submitted and begun again by us, and how to get the optical-flow
-  queue (the loader sees the queue create infos). Gate M0e: proven in the sample -> delivered as on D3D12; refused -> offline only.
+- Vulkan: `VK_NV_optical_flow`. Evaluate gets a VkQueue, a pool and IsRecording = 1, and Streamline creates devices with native optical flow (M0a). Ending,
+  submitting and re-beginning the host's command buffer is not valid Vulkan (it is pending), so that is not done. Candidate for gate M0e: NFRUX's
+  own command buffer and pool submit the luma work to CmdQueue, the flow queue follows on a timeline semaphore, and a third submission on CmdQueue
+  makes later work wait. It works only if the back buffer is already valid in submission order at that point, and if CmdQueue may be submitted to from
+  here (Streamline must not be using it at the same time: shown by its own lock or a hook, else not done). M0e passes with 1000 evaluates under
+  validation and synchronization validation with 0 errors, no CPU wait inside Evaluate, flow bytes equal to the offline run, presented count unchanged.
+  Otherwise Vulkan stays offline only and NVOF opt-in on D3D12.
 Rule: NVOF is never a default unless both APIs can use it on that device class and A12 shows quality within 0.05 dB and lower cost;
 otherwise opt-in, and opt-in output is compared only with the same source on the other API.
 **D5. Lifetime, threads, latency.** Completion token: at the end of every recording the list writes that recording's own value into that recording's own slot of host
@@ -207,7 +214,8 @@ feature's destruction handles them.
 Release: the feature stays warm (history restart on next use), keyed by device, as Decky does. Shutdown: the caller must be idle
 (NGX's rule); NFRUX waits up to 2 s for tokens, then leaks the rest with a log line rather than free in-flight memory. Device
 removed: no waits.
-Locks: one mutex per feature around Create/Evaluate/Release; a process mutex for caps, the pipeline cache and the NVAPI/nvcuda
+Locks: each feature owns its own rhi Device (recording state is never shared) and one mutex around Evaluate; Evaluate holds shared ownership, so a
+concurrent Release cannot destroy it; released generators are kept warm per host device; a process mutex for caps, the pipeline cache and the NVAPI/nvcuda
 tables. Pipelines and networks (including the next lower rung) are built on a worker thread; until ready, outputs are the back
 buffer, and the first real batch counts as a reset. Two interpolators per feature are kept (format switch), older ones retired by token. D3D12 and Vulkan features may coexist.
 
@@ -216,9 +224,9 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
    parameters and presentation.
 2. Standalone. The NGX static library inside Streamline loads the core `_nvngx.dll` from the driver folder named in the registry,
    and no machine-wide setting may be changed.
-   Mechanism, proven in M0a (RESULTS): `loader` as a `dbghelp.dll` proxy (sl.interposer.dll imports it; `version.dll` / `winmm.dll` for hosts
+   Mechanism, shown to work in M0a's short runs (RESULTS); validation and 60 s runs still owed: `loader` as a `dbghelp.dll` proxy (sl.interposer.dll imports it; `version.dll` / `winmm.dll` for hosts
    that do not) in the game folder hooks
-   `LoadLibraryExW/A/W` and `GetProcAddress` by import-table patching of every non-Windows module, later ones through
+   `LoadLibraryExW/A/W` and `GetProcAddress` by import-table patching of the modules loaded at attach (enumerated) and later ones through
    LdrRegisterDllNotification (in-process only; Streamline loads its over-the-air plugins from ProgramData). When the core is loaded, the returned exports of interest are wrapped:
    Init*/Shutdown* (note device), GetCapabilityParameters / AllocateParameters / GetParameters / PopulateParameters (add the
    section 4 capability values), GetFeatureRequirements (feature 11 supported), VULKAN_RequiredExtensions and
@@ -261,9 +269,9 @@ through a swizzling convert pass into a render-legal copy source of that family 
 | M0d | (requested) SM 6.9 cooperative vectors, when the host exposes them or through NVAPI, and DirectML / metacommand integer convolution (exact int32 sums, our rescale after): one 3x3 layer each, exactness and time against dot4 and CUDA | each becomes a rung if exact and faster on some device class, else dropped with numbers |
 | M0e | Vulkan optical flow re-examined: Evaluate does get a queue and pool (M0a) | D4 rewritten either way |
 | M0c | THIRD_PARTY.md, notices | written |
-| M1 | rhi_vulkan, network, completion token, build system | A1 Vulkan |
+| M1 | NRI rhi, network, completion token, build system (done, A1 partly) | A1 |
 | M2 | core on Vulkan, capture/replay | A3, A14 |
-| M3 | rhi_d3d12, dot4 and floor | A1 D3D12, A2 |
+| M3 | D3D12 through NRI, dot4 and floor (done, A2 partly); Graphics Tools or an app-local D3D12SDKLayers for the debug layer, and the section 4 state check with it, before M5 exits | A1 D3D12, A2 |
 | M4 | frontend, NGX harness | A10, A11 |
 | M5 | sample runs | A4, A5 |
 | M6 | CUDA rung, NVOF D3D12 | A1, A7, A12 |
@@ -280,6 +288,8 @@ M1-M3 do not depend on M0a.
 | CUDA launch refused, hangs | M0b; crash marker (D3) |
 | Streamline limits multi-frame on RTX 40 | A4 records what it grants; 3x-6x then proven by A10 and A2, said so |
 | Cross-API rounding larger than budget | intermediates dumped per pass; the first differing pass is found |
+| First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
+| NRI changes | pinned commit; A1 and A2 on update |
 
 ## 8. Acceptance
 
@@ -294,16 +304,16 @@ inverted depth; odd size 1366x767.
 | # | Test (`tests/`) | Pass |
 |---|---|---|
 | A1 | `ml_conformance`: each rung vs CPU reference graph outputs, and per fused layer via a debug output build; sizes 64x64, 744x464, 960x544; 20 random seeds, all -128, all 127, alternating, 8 recorded tensors; batches 1 and 5 | 0 differing bytes |
-| A2 | `parity`: replay S1-S4 at 2x, 4x, 6x, D3D12 vs Vulkan, default rung and floor | after encoding to the output's own code values (8-bit, 10-bit, or PQ-10 of scRGB): PSNR >= 60 dB, >= 99.9% of channels within 1 code; pixels off by > 3 codes <= 0.01% and each explained as a discrete flip by the intermediate dump; tensor bytes equal >= 99.9% in every frame; no drift: frame 64 no worse than 1 dB below frame 8 |
+| A2 | `parity` (exit code from these limits): replay S1-S4 at 2x, 4x, 6x, D3D12 vs Vulkan, default rung and floor | after encoding to the output's own code values (8-bit, 10-bit, or PQ-10 of scRGB): PSNR >= 60 dB, >= 99.9% of channels within 1 code; pixels off by > 3 codes <= 0.01% and each explained as a discrete flip by the intermediate dump; tensor bytes equal >= 99.9% in every frame; no drift: frame 64 no worse than 1 dB below frame 8 |
 | A3 | `reference`: (i) port with v2 weights (test-only build switch `NFRUX_TEST_V2`: 4-word tensor, v2 model and constants, never shipped) vs DeckyUpscaler's passes (its own Vulkan build, same inputs): >= 45 dB, half precision being the intended difference; (ii) port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips) | (i) as stated; (ii) PSNR against the true frames within 0.2 dB of torch per multiplier |
 | A4 | Sample, D3D12 and Vulkan, scripting patch: 2x and the maximum granted, 1920x1080, 5 min each on release DLLs; 60 s with D3D12 debug layer + GPU validation / Vulkan validation + sync | no crash; 0 messages naming NFRUX objects or thrown inside its recordings; `numFramesActuallyPresented` = n + 1 for >= 95% of states logged; OutputReal written every evaluate; dumped generated frames lie between neighbours (mean luma distance to both <= distance between them + 2 codes, >= 99% of frames) |
-| A5 | Sample with fixed timestep, scripted camera, UI off, DLSS off: dump 64 frames on both APIs; replay each API's dump on the other | replay meets A2; live D3D12 vs Vulkan generated PSNR no more than 1 dB below their inputs' PSNR and >= 35 dB; image pairs kept |
+| A5 | Sample with fixed timestep, scripted camera, UI off, DLSS off: dump 64 frames on both APIs; replay each API's dump on the other | replay meets A2; live: generated PSNR between the APIs no more than 1 dB below their inputs' PSNR (the absolute 35 dB of earlier revisions is dropped: the sample's own renderers differ by 31.4 dB, so it measured them, not NFRUX); image pairs kept |
 | A6 | OptiScaler release (version, commit, ini recorded) with the sample, D3D12; Vulkan if that version supports it | DLL loaded, `MultiFrameCountMax` read, >= 1000 evaluates, frames presented; result per API stated |
 | A7 | Detection log; each rung, both scatter variants, forced; negative: nvapi / nvcuda absent, feature off, bad self-check, stale marker | A1 + A2 each; falls to the expected rung |
 | A8 | Idle GPU, timestamps, 120 warm-up, median of 600: each rung, API, 1080p / 1440p / 4K, 2x / 4x / 6x; VRAM | recorded; default rung at 1080p 2x <= 2.5 ms on RTX 4070 or the miss explained |
 | A9 | `ui_scenes` (from fg_vk_test): each D8 rule with expected pixels, SDR + PQ + scRGB, reset + HUD-less, distortion at 4x, both APIs | all |
-| A10 | `ngx_harness`: loads the DLL like `Nvngx_DllProxy`; protocol cases of section 4 (missing, repeated (a new batch between identical frames: outputs equal the frame within A2), out of order, n changing, n > 5), release/recreate, resize, format and HDR switches, D3D12 and Vulkan together, 2000 frames | outputs as specified; no leak (VRAM and handles flat) |
-| A11 | Import table and API call check: the DLL opens no shared handles and imports no other graphics API at run time (nvapi, nvcuda, nvofapi64 exempt on their rungs) in each mode | pass |
+| A10 | `ngx_harness`: loads the DLL like `Nvngx_DllProxy`; protocol cases of section 4 (missing, repeated (a new batch between identical frames: outputs equal the frame within A2), out of order, n changing, n > 5), release/recreate, resize, format and HDR switches, D3D12 and Vulkan together, two features on one device with a concurrent Release, a minimal Vulkan 1.2 host (only shaderStorageImageExtendedFormats) under validation, 2000 frames | outputs as specified; no leak (VRAM and handles flat) |
+| A11 | Import table and API call check: the DLL opens no shared handles and loads no other graphics API's DLL at run time (both are delay-loaded) (nvapi, nvcuda, nvofapi64 exempt on their rungs) in each mode | pass |
 | A12 | NVOF vs block match: true-frame PSNR on `test_bal`, `test_new` and cost, D3D12 replay (and offline Vulkan) | recorded; opt-in path runs 5 min in the sample |
 | A13 | Licensing: THIRD_PARTY.md, model license shipped, changes stated | recorded |
 | A14 | Quality: PSNR vs true frames, 2x-6x, NFRUX vs Arm NFRU v2 reference, held-out clips | recorded; mean not below Arm's at any multiplier |

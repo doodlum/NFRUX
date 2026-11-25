@@ -55,7 +55,9 @@ const nri::AccessLayoutStage kUav = {nri::AccessBits::SHADER_RESOURCE_STORAGE, n
 const nri::AccessLayoutStage kSrc = {nri::AccessBits::COPY_SOURCE, nri::Layout::COPY_SOURCE, nri::StageBits::COPY};
 const nri::AccessLayoutStage kDst = {nri::AccessBits::COPY_DESTINATION, nri::Layout::COPY_DESTINATION, nri::StageBits::COPY};
 // The host's images: D3D12 COMMON, Vulkan GENERAL, in and out.
-const nri::AccessLayoutStage kHost = {nri::AccessBits::NONE, nri::Layout::GENERAL, nri::StageBits::ALL};
+const nri::AccessLayoutStage kHostD3D12 = {nri::AccessBits::NONE, nri::Layout::GENERAL, nri::StageBits::ALL};
+const nri::AccessLayoutStage kHostVk = {nri::AccessBits::SHADER_RESOURCE | nri::AccessBits::SHADER_RESOURCE_STORAGE | nri::AccessBits::COPY_SOURCE | nri::AccessBits::COPY_DESTINATION,
+                                        nri::Layout::GENERAL, nri::StageBits::ALL};
 bool Same(const nri::AccessLayoutStage& a, const nri::AccessLayoutStage& b) { return a.access == b.access && a.layout == b.layout; }
 
 class DevN;
@@ -111,6 +113,7 @@ public:
     nri::DescriptorPool*    pools[kSlots] = {};
     nri::Buffer *           constants = nullptr, *tokenUp = nullptr, *tokenBack = nullptr, *ones = nullptr;
     uint64_t                onesSize = 0;
+    std::vector<nri::Buffer*> old;
     std::vector<nri::Descriptor*> cbv;
     uint8_t*                map = nullptr;
     uint32_t*               tokenUpMap = nullptr;
@@ -122,6 +125,7 @@ public:
     std::vector<nri::AccessLayoutStage> wrappedHome;
     std::vector<nri::TextureBarrierDesc> tb;
     std::vector<nri::BufferBarrierDesc>  bb;
+    std::vector<const BufN*>             used;  // buffers touched by this recording
     struct Retired { std::vector<std::unique_ptr<TexN>> t; nri::CommandBuffer* cmd; uint32_t slot, value; };
     std::vector<Retired>    retired;
     struct Read { nri::Buffer* buf; std::shared_ptr<std::vector<uint8_t>> out; uint32_t pitch, row, rows; };
@@ -135,6 +139,7 @@ public:
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
         for (auto* x : {constants, tokenUp, tokenBack, ones}) if (x) n.DestroyBuffer(x);
+        for (auto* x : old) n.DestroyBuffer(x);
         if (dev) nri::nriDestroyDevice(dev);
     }
     const Caps& caps() const override { return c; }
@@ -214,6 +219,7 @@ public:
         nri::DeviceCreationVKDesc d = {};
         d.vkInstance = h.instance, d.vkDevice = h.device, d.vkPhysicalDevice = h.physicalDevice, d.minorVersion = uint8_t(h.minorVersion);
         d.queueFamilies = &q, d.queueFamilyNum = 1;
+        d.unknownFeatures = true;  // only what Vulkan 1.0 reports: the host's enabled set is not ours to assume
         d.vkExtensions.deviceExtensions = h.deviceExtensions, d.vkExtensions.deviceExtensionNum = h.deviceExtensionCount;
         d.callbackInterface.MessageCallback = Message;
         d.enableNRIValidation = EnvFlag("NFRUX_VALIDATE", false);
@@ -317,8 +323,10 @@ public:
         {
             const ffx_ml::DeviceContext dc = {vk.instance, vk.physicalDevice, vk.device, vk.gipa, vk.gdpa, vk.mlFeatures};
             ffx_ml::Path path = ffx_ml::Path::Auto;
+            if (ml && strcmp(ml, "coopmat") && strcmp(ml, "dot4") && strcmp(ml, "scalar")) { if (error) *error = "NFRUX_ML: unknown path"; return nullptr; }
             if (ml) path = !strcmp(ml, "coopmat") ? ffx_ml::Path::CoopMat : !strcmp(ml, "dot4") ? ffx_ml::Path::Dot4 : ffx_ml::Path::Scalar;
             ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, path == ffx_ml::Path::CoopMat ? ffx_ml::MatType::Int8 : ffx_ml::MatType::None);
+            if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
             sel.rescaleFloat = false;  // exact
             if (path != ffx_ml::Path::Auto && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
             net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
@@ -327,6 +335,7 @@ public:
         }
         else
         {
+            if (ml && strcmp(ml, "scalar") && (strcmp(ml, "dot4") || !c.dot4)) { if (error) *error = "NFRUX_ML: path unavailable on D3D12"; return nullptr; }
             const bool dot4 = c.dot4 && !(ml && !strcmp(ml, "scalar"));
             net->d3d = D3D12Graph::Create(d3d, DescribeModel(w, h), dot4, error);
             if (!net->d3d) return nullptr;
@@ -403,7 +412,32 @@ public:
     {
         for (size_t i = 0; i < wrapped.size(); ++i) To(*wrapped[i], wrappedHome[i]);
         Flush();
-        n.CmdCopyBuffer(*cmd, *tokenBack, slot * 4, *tokenUp, slot * 4, 4);
+        // Everything recorded before finished: then this recording's own value into its own slot, visible to the host.
+        if (isVk)
+        {
+            auto* vc = static_cast<VkCommandBuffer>(nativeCmd);
+            const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(vk.gdpa(vk.device, "vkCmdPipelineBarrier"));
+            const auto fill    = reinterpret_cast<PFN_vkCmdFillBuffer>(vk.gdpa(vk.device, "vkCmdFillBuffer"));
+            VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT};
+            barrier(vc, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+            fill(vc, VkBuffer(n.GetBufferNativeObject(tokenBack)), slot * 4, 4, slotValue[slot]);
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            barrier(vc, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+        else
+        {
+            ID3D12GraphicsCommandList2* l2 = nullptr;
+            auto* r = reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(tokenBack));
+            if (SUCCEEDED(static_cast<ID3D12GraphicsCommandList*>(nativeCmd)->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&l2))))
+            {
+                const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER p = {r->GetGPUVirtualAddress() + slot * 4, slotValue[slot]};
+                const D3D12_WRITEBUFFERIMMEDIATE_MODE      m = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                l2->WriteBufferImmediate(1, &p, &m);
+                l2->Release();
+            }
+            for (const BufN* b : used) b->state = {nri::AccessBits::NONE, nri::StageBits::ALL};  // buffers decay to COMMON after the list
+        }
+        used.clear();
         retired.push_back({std::move(wrapped), cmd, slot, slotValue[slot]});
         wrapped.clear(), wrappedHome.clear();
         cmd = nullptr;
@@ -432,8 +466,9 @@ public:
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
         if (!Views(*t, f, false)) return nullptr;
-        t->state = kHost;
-        wrapped.push_back(std::move(t)), wrappedHome.push_back(kHost);
+        const nri::AccessLayoutStage& home = isVk ? kHostVk : kHostD3D12;
+        t->state = home;
+        wrapped.push_back(std::move(t)), wrappedHome.push_back(home);
         return wrapped.back().get();
     }
     void To(const TexN& t, const nri::AccessLayoutStage& s)
@@ -447,6 +482,7 @@ public:
     void To(const BufN& t, nri::AccessBits a, nri::StageBits s)
     {
         if (t.state.access == a && a != nri::AccessBits::SHADER_RESOURCE_STORAGE) return;
+        if (std::find(used.begin(), used.end(), &t) == used.end()) used.push_back(&t);
         nri::BufferBarrierDesc b = {};
         b.buffer = t.buf, b.before = t.state, b.after = {a, s};
         bb.push_back(b);
@@ -481,6 +517,7 @@ public:
     bool Ones(uint64_t size)
     {
         if (ones && onesSize >= size) return true;
+        if (ones) old.push_back(ones);  // maybe in flight: freed with the device
         ones = Committed(size, nri::MemoryLocation::HOST_UPLOAD, nri::BufferUsageBits::NONE);  // an older, smaller one is in flight: kept
         if (!ones) return false;
         onesSize = size;

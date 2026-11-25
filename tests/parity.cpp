@@ -314,7 +314,7 @@ static bool RunVulkan(Results& out)
     };
     VulkanHost host;
     host.instance = inst, host.physicalDevice = pd, host.device = dv, host.gipa = vkGetInstanceProcAddr, host.gdpa = vkGetDeviceProcAddr;
-    host.queueFamily = family, host.minorVersion = 3, host.deviceExtensions = ext.data(), host.deviceExtensionCount = uint32_t(ext.size());
+    host.queueFamily = family, host.minorVersion = 2, host.deviceExtensions = ext.data(), host.deviceExtensionCount = uint32_t(ext.size());
     host.mlFeatures = ml, host.atomic64 = v12.shaderBufferInt64Atomics && f2.features.shaderInt64;
     auto dev = CreateNriVulkanDevice(host);
     return dev ? Run(*dev, im, upload, submit, out) : (printf("  device failed\n"), false);

@@ -5,6 +5,7 @@
 | Network weights (core/model) | **Modified** from Arm's NFRU v2 (neural-frame-rate-upscaling): shrunk, perturbed, retrained on 20 input channels, quantised (nfru_mfg_v14_int8) | Arm AI Model Community License 1.0, `licenses/Arm_AI_Model_Community_License_v1_0_PRE-1154.pdf` |
 | Pass shaders, pass order, network runtime | Arm Neural Graphics SDK 1.1.1 through DeckyUpscaler (`core/UPSTREAM`), modified | MIT (`core/LICENSE-MIT.txt`) |
 | Optical flow shaders (`arm_*`) | Arm's ML Emulation Layer for Vulkan through DeckyUpscaler, modified | Apache-2.0 |
+| NRI 993db1a (statically linked), with Vulkan Memory Allocator and D3D12 Memory Allocator | NVIDIA-RTX/NRI; GPUOpen | MIT; MIT; MIT |
 | DeckyUpscaler code | doodlum/DeckyUpscaler | MIT (`LICENSE`) |
 
 Anyone receiving the weights or a product containing them is bound by clause 4 (Acceptable Use) of the Arm license above; a distribution

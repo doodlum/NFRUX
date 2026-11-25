@@ -12,7 +12,7 @@ add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
 add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
-set(NRI_DIR "C:/dev/nfrux-ref/NRI" CACHE PATH "NRI checkout, built")
+set(NRI_DIR "${CMAKE_SOURCE_DIR}/third_party/NRI" CACHE PATH "NRI, from tools/build_nri.ps1")
 add_library(nfrux_core STATIC core/log.cpp core/model.cpp core/ml/ffx_vk_ml_graph.cpp core/ml/ffx_vk_ml_reference.cpp core/ml/d3d12_network.cpp core/ml/ffx_vk_ml_runtime.cpp core/interpolator.cpp rhi/rhi_nri.cpp)
 add_dependencies(nfrux_core nfrux_shaders)
 target_include_directories(nfrux_core PUBLIC core core/ml core/model rhi ${GEN} $ENV{VULKAN_SDK}/Include ${NRI_DIR}/Include)

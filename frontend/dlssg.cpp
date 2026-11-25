@@ -44,7 +44,9 @@ std::unique_ptr<Device> DeviceForVk()
     if (!h.gipa || !h.gdpa) return nullptr;
     VkPhysicalDeviceProperties p = {};
     reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(h.gipa(h.instance, "vkGetPhysicalDeviceProperties"))(h.physicalDevice, &p);
-    h.minorVersion = std::clamp(VK_API_VERSION_MINOR(p.apiVersion), 2u, 3u);
+    if (VK_API_VERSION_MINOR(p.apiVersion) < 2)
+        return Log("Vulkan 1.2 is needed"), nullptr;
+    h.minorVersion = 2;  // whatever the GPU reports: the host may have asked for less
     if (g_vkKnown) h.mlFeatures = g_vkMl, h.atomic64 = g_vkAtomic64;
     else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", false))
     {

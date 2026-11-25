@@ -20,3 +20,7 @@ Revision 3: that blocker (D3, D6 gate), plus the reviewers' suggestions on token
 | 3 | readiness and tests | AGREE | 0 |
 
 Architecture and code accuracy agreed on revision 2; revision 3 changed only what the third reviewer required plus their own suggestions.
+
+| 4 | architecture | DISAGREE | 2 |
+| 4 | code accuracy | DISAGREE | 2 |
+| 4 | readiness and tests | DISAGREE | 4 |

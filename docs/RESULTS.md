@@ -20,8 +20,8 @@ Worst-case inputs not yet run on Vulkan; fp16 stays off by default until the sum
 
 ## M0a loader probe (2026-11-25, Streamline 2.14.16, driver 610.88, Streamline_Sample built from source + scripting patch)
 
-`loader/probe.cpp` as `dbghelp.dll` beside the sample (sl.interposer imports it): IAT patch of GetProcAddress / LoadLibraryExW in every non-Windows
-module, LdrRegisterDllNotification for later ones. NGX core loaded from the DriverStore; exports of interest wrapped; no system setting changed.
+`loader/probe.cpp` as `dbghelp.dll` beside the sample (sl.interposer imports it): IAT patch of GetProcAddress / LoadLibraryExW in the exe, sl.interposer and every non-Windows module
+loaded later (LdrRegisterDllNotification); modules already loaded otherwise were not patched. NGX core loaded from the DriverStore; exports of interest wrapped; no system setting changed.
 Runner: `C:\dev\nfrux-ref\run_sample.ps1` (gives the window focus; DLSS-G does not interpolate unfocused).
 
 | API | asked | `numFramesActuallyPresented` | stub |
@@ -43,8 +43,8 @@ Found:
   GEMM and QuantizedGEMM. D3D12 debug layer is not installed (so A1 on D3D12 ran without it).
 ## A2, first results (2026-11-25, RTX 4070, synthetic pan + moving square, RGBA8, `tests/parity.cpp`)
 
-D3D12 (rhi_d3d12, SM 6.4 dot4 network) against Vulkan (rhi_nri on NRI v192, int8 cooperative matrix): **every generated frame and every
-intermediate compared byte for byte, 0 differ**, at 1280x720 (2x, 3x, 5x, 6x), and 4x at 1920x1080, 1920x1080 from 1280x720, 1280x800 from
+D3D12 (rhi_d3d12, SM 6.4 dot4 network) against Vulkan (rhi_nri on NRI v192, int8 cooperative matrix): **every generated frame, and 13 intermediates of the first
+generated frame of the last rendered one, compared byte for byte, 0 differ**, at 1280x720 (2x, 3x, 5x, 6x), and 4x at 1920x1080, 1920x1080 from 1280x720, 1280x800 from
 742x464, 2560x1440 from 1707x960, 1366x767. Mean PSNR against the true in-between frames 43-45 dB (the same on both, by construction).
 
 Faults the comparison found, all fixed in the shared source or backend:
@@ -54,7 +54,7 @@ Faults the comparison found, all fixed in the shared source or backend:
   more (not reported by synchronization validation, whose activation was not proven; mechanism not established);
 - `log` / `exp` written as `log2` / `exp2`.
 
-Not covered yet: NRI on D3D12 (crashes, being looked at), HDR formats, BGRA8, inverted depth, UI inputs, real captures, 4K, other GPUs, the
+Not covered by this run (some later, below): NRI on D3D12, HDR formats, BGRA8, inverted depth, the input tensor, later generated frames' intermediates, UI inputs, real captures, 4K, other GPUs, the
 32-bit scatter (checked at 1280x720 before the last fixes), validation layers on D3D12.
 ## A4 / A5, first runs with the real DLL (2026-11-25, Streamline_Sample 1280x701, RTX 4070)
 
@@ -77,3 +77,8 @@ APIs match at 31.4 dB (the sample's renderers differ: ray-traced shadows, foliag
 NRI built without Agility SDK, NVAPI, AGS, NVTX (its wrapped-device teardown crashed with them on). D3D12 (NRI) against Vulkan (NRI), 4x, 5 frames: RGB10A2, BGRA8, inverted depth, 4K from 1440p, 4K from 1080p RGB10A2: 0 bytes differ. RGBA16F scRGB (+ inverted, 1080p from 720p): PSNR >= 116 dB over the raw bytes, no byte off by more than 1.
 The native D3D12 backend was bit-identical to NRI's and no faster in the sample (564 against 572 fps at 4x): removed, NRI is the only backend.
 4K flow still runs at display size (the 01 reduction pass of the design is not in).
+
+## Corrections after the revision 4 review (2026-11-25)
+
+The two wordings above were narrowed (they claimed more than was compared or patched). Fixed in code: NRI took features from the GPU instead of the host (now unknownFeatures, API 1.2); completion token ordering (D3D12 MARKER_OUT, Vulkan full barrier + fill + host barrier); host image access masks on Vulkan; D3D12 buffer decay; slot reuse; shared device state; use after free on Release; int8 forced for Auto; unknown NFRUX_ML values refused. Parity after these: 0 bytes differ (6x 720p, BGRA8 3x), FP16 4x 120 dB.
+The validation claim earlier (no synchronization errors) is withdrawn: the layer's activation was never proven.
