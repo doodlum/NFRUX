@@ -115,6 +115,7 @@ public:
     virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader) = 0;
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;
 
+    virtual bool DropRung() = 0;  // the next network is made one rung lower; false: there is none
     // A frame's recording into the host's command buffer / list; every wrapped image is back in its own state at EndFrame.
     virtual bool BeginFrame(void* commands) = 0;
     virtual void EndFrame() = 0;

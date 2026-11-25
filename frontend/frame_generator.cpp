@@ -2,6 +2,7 @@
 #include "frame_generator.h"
 
 #include "../core/log.h"
+#include "../core/model.h"
 #include "nfrux_shaders.h"
 
 #include <windows.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 
 namespace nfrux
 {
@@ -191,6 +193,64 @@ Texture* FrameGenerator::Keep(std::unique_ptr<Texture>& t, Format f, uint32_t w,
         t = m_dev.CreateTexture(f, w, h);
     }
     return t.get();
+}
+
+bool FrameGenerator::Checked()
+{
+    if (m_check == kCheckOk || m_check == kCheckFailed)
+        return m_check == kCheckOk;
+    constexpr uint32_t S = 64;
+    if (m_check == kCheckWaiting)
+    {
+        if (m_checkRead[0]->empty() || m_checkRead[1]->empty())
+            return false;  // not back yet: not a mismatch
+        size_t bad = 0;
+        for (int o = 0; o < 2; ++o)
+            for (size_t i = 0; i < m_checkWant[o].size(); ++i) bad += i % 4 < m_checkChannels[o] && (*m_checkRead[o])[i] != m_checkWant[o][i];
+        const char* test = Env("NFRUX_TEST_BAD_CHECK");
+        if (test && int(m_checks) <= atoi(test)) bad += 1;  // fault injection: this many checks fail
+        m_oldNets.push_back(std::move(m_checkNet));  // its recording has finished, but kept simple: a handful at most
+        if (!bad) { Log("network self-check passed"); m_check = kCheckOk; return true; }
+        m_check = m_dev.DropRung() ? kCheckNone : kCheckFailed;
+        Log("network self-check FAILED (%zu bytes): %s", bad, m_check == kCheckNone ? "trying the next way to run it" : "no frame generation");
+        if (m_check == kCheckFailed) return false;
+    }
+    std::string error;
+    if (!m_checkPass) m_checkPass = m_dev.CreatePass(shaders::kCheck);
+    m_checkNet = m_dev.CreateNetwork(S, S, &error);
+    if (!m_checkNet && m_dev.DropRung()) m_checkNet = m_dev.CreateNetwork(S, S, &error);
+    if (!m_checkNet || !m_checkPass)
+        return Log("network not possible: %s", error.c_str()), m_check = kCheckFailed, false;
+    if (m_checkWant[0].empty())
+    {
+        std::vector<int8_t> x(S * S * kInputChannels);
+        for (uint32_t i = 0; i < x.size() / 4; ++i)
+        {
+            uint32_t h = i * 2654435761u + 1013904223u;
+            h = (h ^ (h >> 15)) * 2246822519u, h = (h ^ (h >> 13)) * 3266489917u, h ^= h >> 16;
+            memcpy(&x[i * 4], &h, 4);
+        }
+        const ModelBindings mb = GetModelBindings();
+        std::map<uint32_t, std::vector<int8_t>> in{{mb.input, x}}, out;
+        if (!ffx_ml::RunReference(DescribeModel(S, S), in, out, &error))
+            return Log("self-check reference: %s", error.c_str()), m_check = kCheckFailed, false;
+        for (int o = 0; o < 2; ++o)
+        {
+            const auto& v = out[o ? mb.gate : mb.params];
+            const size_t px = S / 2 * S / 2, ch = v.size() / px;
+            m_checkChannels[o] = uint32_t(std::min<size_t>(4, ch));
+            m_checkWant[o].assign(px * 4, 0);
+            for (size_t p = 0; p < px; ++p) for (size_t c = 0; c < ch && c < 4; ++c) m_checkWant[o][p * 4 + c] = uint8_t(v[p * ch + c]);
+        }
+    }
+    const Bind b[] = {Bind::Buf(0, *m_checkNet->input)};
+    if (!m_checkPass->Dispatch(b, 1, S * S * kInputChannels / 4 / 64, 1))
+        return m_check = kCheckFailed, false;
+    Network* net = m_checkNet.get();
+    m_dev.RunNetworks(&net, 1);
+    for (int o = 0; o < 2; ++o) m_checkRead[o] = std::make_shared<std::vector<uint8_t>>(), m_dev.ReadBack(o ? *net->gate : *net->params, m_checkRead[o]);
+    ++m_checks, m_check = kCheckWaiting;
+    return false;
 }
 
 bool FrameGenerator::InMenu(const EvalInputs& in)
@@ -399,6 +459,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
             Log("%s", in.notRendering ? "not rendering game frames: no interpolation" : "game frames again"), m_menu = in.notRendering;
         const bool menu = InMenu(in);
         if (in.notRendering || menu) m_restart = true;
+        else if (!Checked()) m_restart = true;
         else if (!Generate(in) && m_generated == 0 && m_evaluations == 1) Log("first frame not generated");
         static uint32_t logged = 0;
         if (in.count != logged) Log("%u generated frame(s) per rendered frame", in.count), logged = in.count;

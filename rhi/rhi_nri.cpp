@@ -320,6 +320,13 @@ public:
         return p;
     }
 
+    int rung = -1, topRung = 0;  // 0 cooperative matrices / CUDA, 1 dot4, 2 integers: the last made, the highest allowed
+    bool DropRung() override
+    {
+        if (rung < 0 || rung >= 2) return false;
+        topRung = rung + 1;
+        return true;
+    }
     std::unique_ptr<Network> CreateNetwork(uint32_t w, uint32_t h, std::string* error) override
     {
         auto net = std::make_unique<NetN>();
@@ -334,8 +341,11 @@ public:
             if (ml) path = !strcmp(ml, "coopmat") ? ffx_ml::Path::CoopMat : !strcmp(ml, "dot4") ? ffx_ml::Path::Dot4 : ffx_ml::Path::Scalar;
             ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, path == ffx_ml::Path::CoopMat ? ffx_ml::MatType::Int8 : ffx_ml::MatType::None);
             if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+            if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
+            if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
+            rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
             sel.rescaleFloat = false;  // exact
-            if (path != ffx_ml::Path::Auto && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
+            if (path != ffx_ml::Path::Auto && !topRung && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
             net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
             if (!net->vk) return nullptr;
             what = sel.Describe();
@@ -343,8 +353,8 @@ public:
         else
         {
             if (ml && strcmp(ml, "scalar") && strcmp(ml, "cuda") && (strcmp(ml, "dot4") || !c.dot4)) { if (error) *error = "NFRUX_ML: path unavailable on D3D12"; return nullptr; }
-            const bool forced = ml && !strcmp(ml, "cuda");
-            if (forced || (!ml && c.vendorId == uint32_t(nri::Vendor::NVIDIA)))
+            const bool forced = ml && !strcmp(ml, "cuda") && !topRung;
+            if (forced || (!ml && !topRung && c.vendorId == uint32_t(nri::Vendor::NVIDIA)))
             {
                 std::string why;
                 if (cudaState == 0) cudaState = forced || MarkerBegin(Rung()) ? 1 : -1;
@@ -352,9 +362,10 @@ public:
                 if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(Rung()), cudaState = -1;
                 if (forced && !net->cuda) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
             }
-            const bool dot4 = c.dot4 && !(ml && !strcmp(ml, "scalar"));
+            const bool dot4 = c.dot4 && topRung < 2 && !(ml && !strcmp(ml, "scalar"));
             if (!net->cuda) net->d3d = D3D12Graph::Create(d3d, DescribeModel(w, h), dot4, error);
             if (!net->d3d && !net->cuda) return nullptr;
+            rung = net->cuda ? 0 : dot4 ? 1 : 2;
             what = net->cuda ? "CUDA kernels, int8 tensor cores" : dot4 ? "shader model 6.4 packed dot product" : "shader model 6.0 integers";
             for (uint32_t i = 0; i < 2; ++i) net->order[i] = (net->cuda ? net->cuda->outputBinding(i) : net->d3d->outputBinding(i)) == mb.params ? 0 : 1;
         }

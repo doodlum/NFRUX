@@ -48,7 +48,16 @@ private:
     // UI rules, colour regions and the distortion field around the interpolator (section 4, D8 of docs/DESIGN.md).
     bool   Staged(const EvalInputs& in, const struct Layout& l);
     bool   InMenu(const EvalInputs& in);
+    // D7: the network gives the CPU reference's bytes on this device before any frame of its is shown.
+    bool   Checked();
+    std::unique_ptr<Network> m_checkNet;
+    std::unique_ptr<Pass>    m_checkPass;
+    std::shared_ptr<std::vector<uint8_t>> m_checkRead[2];
+    std::vector<uint8_t>     m_checkWant[2];  // four bytes a pixel as read; m_checkChannels of them count
+    uint32_t m_checkChannels[2] = {}, m_checks = 0;
+    enum { kCheckNone, kCheckWaiting, kCheckOk, kCheckFailed } m_check = kCheckNone;
     Texture* Keep(std::unique_ptr<Texture>& t, Format f, uint32_t w, uint32_t h);
+    std::vector<std::unique_ptr<Network>> m_oldNets;
     std::vector<std::unique_ptr<Pass>> m_oldPasses;
     std::unique_ptr<Pass>    m_prepare, m_compose, m_menuPass;
     std::unique_ptr<Texture> m_prepared, m_composed[kMaxGenerated], m_menuCounts;

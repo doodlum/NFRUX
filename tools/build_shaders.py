@@ -65,7 +65,8 @@ for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
     passes.append((n, s, d, INV, 60))
 for n, f in [("kCropR32f", "r32f"), ("kCropRg16f", "rg16f")]:
     passes.append((n, "shaders/frontend/crop", fmt(f), "NFRUX_UNUSED", 60))
-passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("kMenu", "shaders/frontend/menu", [], "NFRUX_UNUSED", 60)]
+passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("kMenu", "shaders/frontend/menu", [], "NFRUX_UNUSED", 60),
+           ("kCheck", "shaders/frontend/check", [], "NFRUX_UNUSED", 60)]
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kCompose{suffix}", "shaders/frontend/compose", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
