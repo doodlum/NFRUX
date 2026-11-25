@@ -45,7 +45,7 @@ tests/      conformance, parity, NGX harness
 | OptiScaler, dlssg-to-fsr3 | GPL-3.0: interface facts only | - |
 
 Model license, read in full: clause 2 grants modification, derivatives and distribution. Clause 3 requires shipping the
-license, its clause 4 as an enforceable term, original notices, and a statement of changes.
+license, its clause 4 as an enforceable term, original notices, and a statement of changes. Distribution is governed by the clause 3.1 and 3.2 duties (THIRD_PARTY.md, A13).
 
 ## 3. Pipeline
 
