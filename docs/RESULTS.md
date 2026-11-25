@@ -41,3 +41,18 @@ Found:
   "infeasible on Vulkan" has to be re-examined.
 - D3D12: inbox runtime tops out at SM 6.8 (6.9 needs the host's Agility SDK); DirectML 1.15.6 inbox; driver metacommands include Convolution,
   GEMM and QuantizedGEMM. D3D12 debug layer is not installed (so A1 on D3D12 ran without it).
+## A2, first results (2026-11-25, RTX 4070, synthetic pan + moving square, RGBA8, `tests/parity.cpp`)
+
+D3D12 (rhi_d3d12, SM 6.4 dot4 network) against Vulkan (rhi_nri on NRI v192, int8 cooperative matrix): **every generated frame and every
+intermediate compared byte for byte, 0 differ**, at 1280x720 (2x, 3x, 5x, 6x), and 4x at 1920x1080, 1920x1080 from 1280x720, 1280x800 from
+742x464, 2560x1440 from 1707x960, 1366x767. Mean PSNR against the true in-between frames 43-45 dB (the same on both, by construction).
+
+Faults the comparison found, all fixed in the shared source or backend:
+- `findMSB(0)`: -1 in GLSL, unsigned ~0 after SPIRV-Cross (zero-flow texels got exponent 15 on D3D12);
+- SPIRV-Cross emits the 32-bit `InterlockedMin` for 64-bit raw buffer atomics (D3D12's 64-bit scatter was wrong; `InterlockedMin64` now);
+- Vulkan: an image's first layout transition needs earlier work as its source, else the first interpolated frame was corrupted at 5x and
+  more (not reported by synchronization validation, whose activation was not proven; mechanism not established);
+- `log` / `exp` written as `log2` / `exp2`.
+
+Not covered yet: NRI on D3D12 (crashes, being looked at), HDR formats, BGRA8, inverted depth, UI inputs, real captures, 4K, other GPUs, the
+32-bit scatter (checked at 1280x720 before the last fixes), validation layers on D3D12.
