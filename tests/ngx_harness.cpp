@@ -218,9 +218,13 @@ struct Api12 : Api
         D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, output && f == F_RGBA8S ? DXGI_FORMAT_R8G8B8A8_TYPELESS : output && f == F_BGRA8S ? DXGI_FORMAT_B8G8R8A8_TYPELESS : kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                                  output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        bool told = false;
         if (output) t->home = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (const char* s = getenv("NFRUX_TEST_INPUT_STATE"); s && !output)  // inputs in another state, told as the loader tells it
+            t->home = D3D12_RESOURCE_STATES(strtoul(s, nullptr, 16)), told = true;
         if (!output && getenv("NFRUX_TEST_WRONG_STATE")) t->home = D3D12_RESOURCE_STATE_COPY_SOURCE;  // the layers' control: must be reported
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, t->home, nullptr, IID_PPV_ARGS(&t->r));
+        if (dll) if (auto note = reinterpret_cast<void (*)(void*, uint32_t)>(GetProcAddress(dll, "NFRUX_NoteState"))) if (told || !output) note(t->r.Get(), t->home == D3D12_RESOURCE_STATE_COPY_SOURCE && !told ? 0x40 : t->home);
         return t;
     }
     void Copy(Tex& t, ID3D12Resource* buf, uint32_t pitch, bool up)

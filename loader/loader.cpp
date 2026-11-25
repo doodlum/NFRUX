@@ -42,6 +42,7 @@ template <class T> static NgxResult Keep(NgxResult r, T** h) { if (r == kNgxSucc
 
 // --- D3D12
 namespace nfrux { void LogD3D12Messages(ID3D12Device* device); }
+static std::atomic<bool> g_feature12;
 static NgxResult __cdecl Create12(ID3D12GraphicsCommandList* c, int f, NgxParameter* p, NgxHandle** h)
 {
     if (f == kFeatureFrameGeneration && getenv("NFRUX_TEST_PASSTHROUGH"))  // the control: NVIDIA's own feature, the debug layer's messages logged
@@ -52,7 +53,7 @@ static NgxResult __cdecl Create12(ID3D12GraphicsCommandList* c, int f, NgxParame
         d->Release();
         return Real<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature")(c, f, p, h);
     }
-    if (auto o = f == kFeatureFrameGeneration ? Ours<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature") : nullptr) return Keep(o(c, f, p, h), h);
+    if (auto o = f == kFeatureFrameGeneration ? Ours<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature") : nullptr) { g_feature12 = true; return Keep(o(c, f, p, h), h); }  // (see Tags)
     return Real<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature")(c, f, p, h);
 }
 static NgxResult __cdecl Eval12(ID3D12GraphicsCommandList* c, const NgxHandle* h, NgxParameter* p, void* cb)
@@ -322,29 +323,35 @@ static const std::map<std::string, void*> kWrap = {
     {"NVSDK_NGX_D3D12_EvaluateFeature_C", (void*)Eval12C}, {"NVSDK_NGX_VULKAN_EvaluateFeature_C", (void*)EvalVkC}, {"NVSDK_NGX_VULKAN_GetFeatureRequirements", (void*)ReqVk}, {"NVSDK_NGX_VULKAN_Init_Ext", (void*)InitVkE},
     {"NVSDK_NGX_D3D12_Shutdown", (void*)Shut12}, {"NVSDK_NGX_D3D12_Shutdown1", (void*)Shut12D}, {"NVSDK_NGX_VULKAN_Shutdown", (void*)ShutVk}, {"NVSDK_NGX_VULKAN_Shutdown1", (void*)ShutVkD}};
 
-// --- Streamline's tags (D3D12). DLSS-G's inputs reach the feature in the state they were tagged with, and Streamline does not transition them;
-// RENDER_TARGET and others are not legal on the compute list they are read on. Such tags are passed on as valid only now: Streamline copies them
-// at once, on the game's own list, and the copies' state is known. (sl_core_types.h: BaseStructure is next, 16-byte type, version.)
+// --- Streamline's tags (D3D12). DLSS-G's inputs reach the feature in the state they were tagged with ("its state when it is used"): Streamline does
+// not transition them. The state is handed to the feature. Where a COMPUTE list cannot use it (RENDER_TARGET, DEPTH_WRITE ...), the tag is passed on as
+// valid only now: Streamline copies it on the game's list, taking the declared state for the one it has there, and the copy's state is known. Not done for
+// any other state, nor before NFRUX's feature exists. (Streamline 2.14 sl_core_types.h: BaseStructure is next, 16-byte type, version.)
 struct SlResource { void* next; uint32_t type[4]; size_t version; char kind; void *native, *memory, *view; uint32_t state; };
 struct SlTag { void* next; uint32_t type[4]; size_t version; SlResource* resource; uint32_t buffer; int lifecycle; uint32_t extent[4]; };
 static_assert(sizeof(SlTag) == 64);
 static std::vector<SlTag> Tags(const SlTag* t, uint32_t n, void* list)
 {
     std::vector<SlTag> o;
-    if (!t || !n || n > 64 || !list || g_featureDevice) return o;
+    if (reinterpret_cast<uintptr_t>(t) < 65536 || !n || n > 64 || !g_feature12 || g_featureDevice) return o;  // (Streamline 1's slSetTag has other arguments)
     for (uint32_t i = 0; i < n; ++i) if (t[i].type[0] != 0x4c6a5aad) return o;
+    static auto note = Ours<void(__cdecl*)(void*, uint32_t)>("NFRUX_NoteState");
+    bool changed = false;
     o.assign(t, t + n);
     for (SlTag& x : o)
         for (uint32_t b : {0u, 1u, 2u, 23u, 50u, 54u, 69u})  // depth, vectors, HUD-less, UI, distortion, no-warp, UI alpha
-            if (x.buffer == b && x.lifecycle == 1 && x.resource && x.resource->native && x.resource->state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE && x.resource->state != UINT32_MAX)
+            if (x.buffer == b && x.lifecycle == 1 && x.resource && x.resource->native && x.resource->state != UINT32_MAX)
             {
+                const uint32_t s = x.resource->state, usable = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE;
+                const bool readable = (s & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) != 0, copied = b == 2 || b == 23;  // colours are copied from as well as read
+                if ((s & ~usable) == 0 || (readable && !copied)) { if (note) note(x.resource->native, s); continue; }
                 static uint32_t said = 0;
-                if (!(said >> (b % 32) & 1)) said |= 1u << (b % 32), L("tag %u in state 0x%x: copied when tagged", b, x.resource->state);
-                x.lifecycle = 0;
+                if (!(said >> (b % 32) & 1)) said |= 1u << (b % 32), L("tag %u in state 0x%x: %s", b, s, list ? "copied when tagged" : "no command list to copy it on: used as it is");
+                if (list) x.lifecycle = 0, changed = true;
             }
+    if (!changed) o.clear();
     return o;
-}
-using SlSetTag = int (*)(const void*, const SlTag*, uint32_t, void*);
+}using SlSetTag = int (*)(const void*, const SlTag*, uint32_t, void*);
 using SlSetTagForFrame = int (*)(const void*, const void*, const SlTag*, uint32_t, void*);
 static SlSetTag g_setTag;
 static SlSetTagForFrame g_setTagForFrame;

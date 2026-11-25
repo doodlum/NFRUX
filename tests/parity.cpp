@@ -251,7 +251,7 @@ static bool RunD3D12(Results& out)
         D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
         D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, fm[i], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE};
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex[i]));
-        im[i].handle = tex[i].Get(), im[i].width = w, im[i].height = h;
+        im[i].state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, im[i].handle = tex[i].Get(), im[i].width = w, im[i].height = h;
     }
     bool uploaded = false;
     auto upload = [&](const Frame& f) {

@@ -135,6 +135,7 @@ public:
     bool                    stalled = false;
     std::vector<std::unique_ptr<TexN>> wrapped;
     std::vector<nri::AccessLayoutStage> wrappedHome;
+    std::vector<D3D12_RESOURCE_BARRIER> hostBack;  // host inputs that arrived in another state than the guide's: back to it at the end
     std::vector<nri::TextureBarrierDesc> tb;
     std::vector<nri::BufferBarrierDesc>  bb;
     std::vector<const BufN*>             used;  // buffers touched by this recording
@@ -171,7 +172,9 @@ public:
         nri::BufferDesc d = {};
         d.size = (size + 255) & ~255ull, d.usage = usage, d.byteAddress = raw;
         nri::Buffer* b = nullptr;
-        return NRI_OK(n.CreateCommittedBuffer(*dev, where, 0.0f, d, b)) ? b : nullptr;
+        if (!NRI_OK(n.CreateCommittedBuffer(*dev, where, 0.0f, d, b))) return nullptr;
+        if (Env("NFRUX_TEST_NAMES")) n.SetDebugName(b, "NFRUX buffer");
+        return b;
     }
     bool Init()
     {
@@ -256,6 +259,7 @@ public:
         const bool uav = storage && (uint32_t(n.GetFormatSupport(*dev, f)) & uint32_t(nri::FormatSupportBits::STORAGE_TEXTURE)) != 0;
         if (uav) d.usage |= nri::TextureUsageBits::SHADER_RESOURCE_STORAGE;
         if (!NRI_OK(n.CreateCommittedTexture(*dev, nri::MemoryLocation::DEVICE, 0.0f, d, t->tex))) return nullptr;
+        if (Env("NFRUX_TEST_NAMES")) n.SetDebugName(t->tex, "NFRUX texture");
         return Views(*t, f, uav) ? std::move(t) : nullptr;
     }
     bool Views(TexN& t, nri::Format f, bool storage)
@@ -367,6 +371,7 @@ public:
         if (!NRI_OK(n.CreatePipelineLayout(*dev, ld, p->layout))) return Log("%s: layout failed", s.name), nullptr;
         cd.pipelineLayout = p->layout;
         if (!NRI_OK(n.CreateComputePipeline(*dev, cd, p->pipeline))) return Log("%s: pipeline failed", s.name), nullptr;
+        if (Env("NFRUX_TEST_NAMES")) n.SetDebugName(p->pipeline, "NFRUX pipeline");
         return p;
     }
 
@@ -536,6 +541,7 @@ public:
     {
         for (size_t i = 0; i < wrapped.size(); ++i) To(*wrapped[i], wrappedHome[i]);
         Flush();
+        if (!hostBack.empty()) static_cast<ID3D12GraphicsCommandList*>(nativeCmd)->ResourceBarrier(UINT(hostBack.size()), hostBack.data()), hostBack.clear();
         // Everything recorded before finished: then this recording's own value into its own slot, visible to the host.
         if (isVk)
         {
@@ -596,6 +602,20 @@ public:
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
         if (!IsSrgb(e) && !Views(*t, f, false)) return nullptr;
         const nri::AccessLayoutStage& home = isVk ? (!output && e.state == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? kHostVkRead : kHostVk) : output ? kUav : e.state == D3D12_RESOURCE_STATE_COPY_DEST ? kDst : kSrv;
+        if (!isVk && !output && e.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE && e.state != D3D12_RESOURCE_STATE_COPY_DEST)
+        {
+            // Another state: to the guide's and back, where this list can. A COMPUTE list cannot name states with pixel or attachment bits; one that has NON_PIXEL is readable as it is.
+            auto* list = static_cast<ID3D12GraphicsCommandList*>(nativeCmd);
+            const uint32_t compute = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE;
+            if (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT || (e.state & ~compute) == 0)
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Transition = {static_cast<ID3D12Resource*>(e.handle), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATES(e.state), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+                list->ResourceBarrier(1, &b);
+                std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+                hostBack.push_back(b);
+            }
+        }
         t->state = home;
         wrapped.push_back(std::move(t)), wrappedHome.push_back(home);
         return wrapped.back().get();

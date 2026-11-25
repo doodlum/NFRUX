@@ -101,6 +101,9 @@ Rect GetRect(NgxParameter* p, std::string n)
     n = "DLSSG." + n + "Subrect";
     return {uint32_t(Int(p, (n + "BaseX").c_str())), uint32_t(Int(p, (n + "BaseY").c_str())), uint32_t(Int(p, (n + "Width").c_str())), uint32_t(Int(p, (n + "Height").c_str()))};
 }
+// The states the host's images were tagged with (the loader's, NFRUX_NoteState). Else the guide's NON_PIXEL_SHADER_RESOURCE.
+std::mutex g_stateMutex;
+std::map<void*, uint32_t> g_states;
 ExternalImage Image12(NgxParameter* p, const char* n)
 {
     ID3D12Resource* r = nullptr;
@@ -108,7 +111,11 @@ ExternalImage Image12(NgxParameter* p, const char* n)
     ExternalImage e;
     if (!r) return e;
     const D3D12_RESOURCE_DESC d = r->GetDesc();
-    e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = 0;
+    e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        if (auto it = g_states.find(r); it != g_states.end()) e.state = it->second;
+    }
     // Streamline's copies of tags valid only when tagged stay in COPY_DEST (seen under the debug layer), not in the guide's state.
     wchar_t name[128] = {};
     UINT size = sizeof(name) - sizeof(wchar_t);
@@ -290,6 +297,12 @@ NFRUX_EXPORT NVSDK_NGX_VULKAN_EvaluateFeature_C(VkCommandBuffer c, const NgxHand
 NFRUX_EXPORT NVSDK_NGX_GetAPIVersion() { return 0x15; }
 NFRUX_EXPORT NVSDK_NGX_GetSnippetVersion() { return 0x00040000; }
 // The loader's record of what the game's Vulkan device has enabled.
+extern "C" __declspec(dllexport) void __cdecl NFRUX_NoteState(void* resource, uint32_t state)
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if (g_states.size() > 256) g_states.clear();
+    g_states[resource] = state;
+}
 extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkKnown = true; }
 // The loader saw vkDestroyDevice: everything on it goes first.
 extern "C" __declspec(dllexport) void __cdecl NFRUX_DropVulkanDevice(VkDevice d)
