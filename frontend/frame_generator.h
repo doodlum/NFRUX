@@ -67,7 +67,7 @@ private:
     std::unique_ptr<Pass>    m_prepare, m_compose, m_menuPass;
     std::unique_ptr<Texture> m_prepared, m_composed[kMaxGenerated], m_menuCounts;
     Format   m_composeFormat = Format::Unknown;
-    bool     m_staged = false, m_inMenu = false, m_hudlessLogged = false;
+    bool     m_staged = false, m_inMenu = false, m_hudlessLogged = false, m_formatLogged = false;
     uint32_t m_menuStep = 0;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> m_menuReads;
     const Texture* Crop(const ExternalImage& image, const Rect& r, bool depth);

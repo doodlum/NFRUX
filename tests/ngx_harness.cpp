@@ -764,32 +764,57 @@ static void Scenes(Api& a, Results& res)
         u = Run(a, st);
         Check(Psnr(u.gen[0], o.gen[0]) > 45, "sRGB back buffer, UNORM HUD-less of another order, dB", Psnr(u.gen[0], o.gen[0]));
     }
-    for (Fmt f : {F_BGRA8, F_RGB10, F_RGBA16F})
+    for (Fmt f : {F_BGRA8, F_RGB10})
     {
         Scene s = d;
         s.back = s.hud = f;
         Out u = Run(a, s);
-        keep(f == F_BGRA8 ? "bgra8" : f == F_RGB10 ? "rgb10" : "rgba16f", u);
+        keep(f == F_BGRA8 ? "bgra8" : "rgb10", u);
         Check(MaxDiff(u.gen[0], u.back, InUi) == 0, "opaque UI is the frame exactly", 0);
         const double q = Psnr(u.gen[0], o.gen[0], 0);
         Check(q > 40, "as in RGBA8, dB", q);
     }
-    printf("  scRGB: the difference test on compressed values\n");
+    printf("  a float (scRGB) back buffer\n");
     {
         Scene s = plain;
-        s.back = s.hud = F_RGBA16F, s.hdr = true;
-        s.hudI = [](int i) { return World(W, H, float(i), 6); };
-        s.backI = [](int i) { Image b = World(W, H, float(i), 6); for (uint32_t y = 0; y < H; ++y) for (uint32_t x = 0; x < W; ++x) for (int k = 0; k < 3; ++k) { if (InUi(x, y)) b.at(x, y)[k] = 12; else if (InSoft(x, y)) b.at(x, y)[k] += 0.1f; } return b; };
-        Out u = Run(a, s);
-        keep("scrgb", u);
-        Check(MaxDiff(u.gen[0], u.back, InUi) == 0, "bright UI is the frame", MaxDiff(u.gen[0], u.back, InUi));
-        Scene t = s;
-        t.backI = s.hudI;
-        Out v = Run(a, t);
-        // a 0.1 scRGB change where the scene is above about 0.7 is grain, not UI: interpolated
-        double same = 0, n = 0;
-        for (uint32_t y = 204; y < 276; ++y) for (uint32_t x = 304; x < 416; ++x) same += fabsf(u.gen[0].at(x, y)[0] - v.gen[0].at(x, y)[0]) < 1e-4f, ++n;
-        Check(same / n > 0.6, "a small change on bright pixels is not UI, share", same / n);
+        s.back = F_RGBA16F, s.hdr = true;
+        const Out u = Run(a, s);
+        Check(u.ok && MaxDiff(u.gen[0], u.back, All) == 0, "not supported: the frame, success", 0);
+    }
+    printf("  HDR10 UI (RGB10A2, PQ values)\n");
+    {
+        Scene s = d;
+        s.back = s.hud = F_RGB10, s.hdr = true;
+        const Out u = Run(a, s);
+        Check(MaxDiff(u.gen[0], u.back, InUi) == 0, "opaque UI is the frame exactly", 0);
+        Scene w = s;
+        w.hudI = nullptr, w.backI = world;
+        const Out v = Run(a, w);
+        Check(MaxDiff(u.gen[0], v.gen[0], outside) == 0, "outside the UI: as without it", MaxDiff(u.gen[0], v.gen[0], outside));
+    }
+    printf("  HDR quality: a moving object over a bright, fine background (PSNR of the PQ signal)\n");
+    {
+        auto pq = [](float nits) { const float y = powf(std::clamp(nits / 10000.0f, 0.0f, 1.0f), 0.1593017578125f); return powf((0.8359375f + 18.8515625f * y) / (1 + 18.6875f * y), 78.84375f); };
+        // Nits 4 to 1000: everything over 80 is past scRGB 1.0. A square moves against the background, so there are holes to fill.
+        auto nits = [](float t) {
+            Image o(W, H, 1);
+            for (uint32_t y = 0; y < H; ++y)
+                for (uint32_t x = 0; x < W; ++x)
+                {
+                    const bool in = x >= 250 - 10 * t && x < 350 - 10 * t && y >= 120 && y < 220;
+                    for (int k = 0; k < 3; ++k) o.at(x, y)[k] = in ? 4 + 100 * Smooth((x + 10 * t) / 7.0f + k * 31, y / 7.0f) : 200 + 800 * Smooth((x - 8 * t) / 13.0f + k * 91, (y - 2 * t) / 13.0f);
+                }
+            return o;
+        };
+        auto map = [](Image o, auto f) { for (size_t i = 0; i < o.p.size(); ++i) if (i % 4 != 3) o.p[i] = f(o.p[i]); return o; };
+        const Image truth1 = map(nits(2 + 1 / 3.0f), pq);
+        Scene s = plain;
+        s.hdr = true, s.back = F_RGB10;
+        s.backI = [&](int i) { return map(nits(float(i)), pq); };
+        const Out u = Run(a, s);
+        keep("rgb10 pq quality", u);
+        const double q = Psnr(u.gen[0], truth1, 24);
+        Check(q > 40, "RGB10A2 PQ, dB", q);
     }
     printf("  distortion field\n");
     {

@@ -334,3 +334,16 @@ sequence, same binary; not comparable with the table's sets):
 5x {'nfrux': 32.01, 'torch': 32.0, 'arm+prior': 32.41, 'arm': 32.06, 'blend': 21.31} n 12
 6x {'nfrux': 37.07, 'torch': 37.03, 'arm+prior': 36.39, 'arm': 36.02, 'blend': 29.2} n 15
 ```
+
+# After revision 6 (commit after fe45ffa; 2026-11-25)
+
+- One DLL, 4.1 MB; links KERNEL32 and USER32 (d3d12 and dxgi delay-loaded). Streamline_Sample with only `dbghelp.dll` added: D3D12 4x and Vulkan 4x presented. OptiScaler 0.9.5 slot:
+  D3D12 and Vulkan 2x. `version.dll` / `winmm.dll`: not shown yet (the sample run for them had a wrong copy path).
+- CUDA m8n8k16 (sm_75): exact at all three sizes; 0.153 ms at 744x464 and 0.196 at 960x544 (m16n8k16 0.156-0.172, 0.208-0.212). The same PTX links for sm_75, 80, 86, 89, 90, 100, 120 (the driver's linker); it
+  was run on the RTX 4070 only.
+- Cooperative matrices int8, fp16, bf16 forced: harness 61 of 61 each, self-check passed.
+- Other devices: WARP (D3D12, no vendor): dot4 chosen, 61 of 61. Mesa lavapipe (Vulkan on the CPU): 61 of 61 (the minimal-host repeat was not run to its end).
+- HDR10: PQ UI scenes pass; a moving object over a 200-1000 nit background 46.7 dB of PQ signal. scRGB was 38.0 dB on the same scene (the 8-bit stages clip at 80 nits); support
+  for it was removed by decision.
+- The 3x frame 1.93 dB below PyTorch: race_spaceship_002, a near-static clip; the three worst 3x frames are its, at 54.4-54.8 dB against 56.0-56.7 (under half an 8-bit code). Medians are 0.
+- Harness now: 124 checks (61 an API, 2 between), 53 outputs; strict 53 of 53 identical; shipped 0 failed.

@@ -16,6 +16,7 @@
 
 namespace nfrux
 {
+// SDR (8-bit) and HDR10 (10-bit PQ), as DLSS-G; float (scRGB) back buffers are shown as they are.
 Format ClassOf(const ExternalImage& e, bool vulkan)
 {
     if (vulkan)
@@ -24,8 +25,6 @@ Format ClassOf(const ExternalImage& e, bool vulkan)
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: return Format::RGBA8Unorm;
         case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: return Format::BGRA8Unorm;
         case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return Format::RGB10A2Unorm;
-        case VK_FORMAT_R16G16B16A16_SFLOAT: return Format::RGBA16Float;
-        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return Format::RG11B10Float;
         default: return Format::Unknown;
         }
     switch (DXGI_FORMAT(e.format))
@@ -33,8 +32,6 @@ Format ClassOf(const ExternalImage& e, bool vulkan)
     case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return Format::RGBA8Unorm;
     case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return Format::BGRA8Unorm;
     case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_TYPELESS: return Format::RGB10A2Unorm;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_TYPELESS: return Format::RGBA16Float;
-    case DXGI_FORMAT_R11G11B10_FLOAT: return Format::RG11B10Float;
     default: return Format::Unknown;
     }
 }
@@ -134,7 +131,7 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
     e->w = w, e->h = h, e->rw = rw, e->rh = rh, e->format = color.format, e->inverted = in.depthInverted;
     Settings s;
     s.displayWidth = w, s.displayHeight = h, s.renderWidth = rw, s.renderHeight = rh, s.depthInverted = in.depthInverted;
-    s.colorLike = color, s.outputFormat = ClassOf(color, m_vulkan);
+    s.colorLike = color, s.outputFormat = color ? ClassOf(color, m_vulkan) : Format::RGBA16Float;  // no image: the staged path's own
     if (m_vulkan && s.outputFormat == Format::BGRA8Unorm)
         s.outputFormat = Format::RGBA8Unorm, s.swapRB = true;  // the bytes of BGRA8, copied raw
     CameraViewProjection(in, s.initialViewProjection);
@@ -324,8 +321,7 @@ bool FrameGenerator::Staged(const EvalInputs& in, const Layout& l)
     if (!m_compose || m_composeFormat != f)
     {
         if (m_compose) m_oldPasses.push_back(std::move(m_compose));  // maybe in flight; a format change is rare: kept
-        m_compose = m_dev.CreatePass(f == Format::RGB10A2Unorm ? shaders::kComposeRgb10a2 : f == Format::RGBA16Float ? shaders::kComposeRgba16f
-                                     : f == Format::RG11B10Float ? shaders::kComposeR11 : shaders::kComposeRgba8);
+        m_compose = m_dev.CreatePass(f == Format::RGB10A2Unorm ? shaders::kComposeRgb10a2 : shaders::kComposeRgba8);
         m_composeFormat = f;
     }
     const Texture *frame = m_dev.Wrap(in.back, false), *base = l.hasHudless ? m_dev.Wrap(in.hudless, false) : frame;
@@ -335,7 +331,7 @@ bool FrameGenerator::Staged(const EvalInputs& in, const Layout& l)
         return false;
     const Rect fr = Whole(in.distortionRect, in.distortion) ? Rect{0, 0, in.distortion.width, in.distortion.height} : in.distortionRect;
     const Rect baseRect = l.hasHudless ? l.hudless : l.back;
-    struct { int32_t outSize[2], origin[2], size[2], base[2], ui[2], noWarp[2], fieldBase[2], fieldSize[2]; float scale[2], bias[2]; int32_t distort, uiKind, hasNoWarp, swapRB, scrgb, pad[3]; } k = {};
+    struct { int32_t outSize[2], origin[2], size[2], base[2], ui[2], noWarp[2], fieldBase[2], fieldSize[2]; float scale[2], bias[2]; int32_t distort, uiKind, hasNoWarp, swapRB; } k = {};
     k.outSize[0] = int32_t(in.back.width), k.outSize[1] = int32_t(in.back.height);
     k.origin[0] = int32_t(l.back.x), k.origin[1] = int32_t(l.back.y), k.size[0] = int32_t(l.back.w), k.size[1] = int32_t(l.back.h);
     k.base[0] = int32_t(baseRect.x), k.base[1] = int32_t(baseRect.y), k.ui[0] = int32_t(l.ui.x), k.ui[1] = int32_t(l.ui.y), k.noWarp[0] = int32_t(l.noWarp.x), k.noWarp[1] = int32_t(l.noWarp.y);
@@ -347,7 +343,7 @@ bool FrameGenerator::Staged(const EvalInputs& in, const Layout& l)
         const float    m    = in.mvScale[i] / float(std::max(1u, size));
         k.scale[i] = in.distortionScale * m, k.bias[i] = in.distortionBias * m;
     }
-    k.distort = in.distortion ? 1 : 0, k.hasNoWarp = l.hasNoWarp, k.swapRB = swap, k.scrgb = in.hdr && f == Format::RGBA16Float;
+    k.distort = in.distortion ? 1 : 0, k.hasNoWarp = l.hasNoWarp, k.swapRB = swap;
     k.uiKind = !l.hasHudless ? (l.uiAlpha ? 4 : l.uiLayer ? 5 : -1) : l.uiAlpha ? 2 : l.uiLayer ? 3 : 0;
     for (uint32_t i = 0; i < m_ready; ++i)
     {
@@ -366,6 +362,7 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     l.back = Whole(in.backRect, in.back) ? Rect{0, 0, in.back.width, in.back.height} : in.backRect;
     l.hudless = RegionOf(in.hudless, in.hudlessRect, in.back, l.back);
     const Format bf = ClassOf(in.back, m_vulkan), hf = in.hudless ? ClassOf(in.hudless, m_vulkan) : Format::Unknown;
+    if (bf == Format::Unknown && !m_formatLogged) Log("back buffer format %u is not supported (8-bit and RGB10A2 are): showing rendered frames", in.back.format), m_formatLogged = true;
     if (!in.depth || !in.motion || bf == Format::Unknown || !Fits(l.back, in.back, l.back))
         return false;
     // The frame interpolated: HUD-less when it fits the back buffer.
@@ -417,7 +414,6 @@ bool FrameGenerator::Generate(const EvalInputs& in)
         f.colorTexture = t;
     }
     const bool uiAlpha = l.uiAlpha, uiLayer = l.uiLayer;
-    f.scrgb = in.hdr && bf == Format::RGBA16Float;
     if (!staged && (hudless || uiAlpha || uiLayer))
     {
         f.uiSource = in.back;

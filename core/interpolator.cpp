@@ -207,7 +207,6 @@ bool Interpolator::Impl::Create(std::string* error)
     case Format::RGBA8Unorm: NFRUX_LANE(Rgba8) break;
     case Format::RGB10A2Unorm: NFRUX_LANE(Rgb10a2) break;
     case Format::RGBA16Float: NFRUX_LANE(Rgba16f) break;
-    case Format::RG11B10Float: NFRUX_LANE(R11) break;
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(warp, kFiWarpFlow) NFRUX_PASS(warpTm1, kFiWarpFlowTm1) NFRUX_PASS(fillTm1, kFiFillHolesTm1) NFRUX_PASS(preprocess, kFiPreprocess)
@@ -217,7 +216,6 @@ bool Interpolator::Impl::Create(std::string* error)
     case Format::RGBA8Unorm: case Format::BGRA8Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba8) break;
     case Format::RGB10A2Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgb10a2) break;
     case Format::RGBA16Float: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba16f) break;
-    case Format::RG11B10Float: NFRUX_PASS(post, kFiPostprocessNoHistoryR11) break;
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
@@ -390,8 +388,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     }
     k._Reset = reset ? 1 : 0;
     const bool down = allInput || colourDown;
-    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u) |
-                             (in.scrgb ? 0x2000u : 0u);
+    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u);
 
     if (ofColour)
     {

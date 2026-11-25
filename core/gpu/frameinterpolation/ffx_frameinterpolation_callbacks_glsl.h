@@ -244,11 +244,6 @@ FfxUInt32 UiKind()
     return cbFI._Options & 0xffu;
 }
 
-FfxBoolean ScRgb()
-{
-    return (cbFI._Options & 0x2000u) != 0u;
-}
-
 FfxBoolean HasNoWarpMask()
 {
     return (cbFI._Options & 0x100u) != 0u;

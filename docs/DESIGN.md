@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 6, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
+Status: revision 7, under review (revision 6 was agreed by all three reviewers; docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -24,13 +24,14 @@ Not goals: super resolution, presentation and pacing (Streamline / OptiScaler ow
 ## 2. Structure
 
 ```
-loader/     process-local NGX router for the standalone package (D6)
-frontend/   nvngx_dlssg.dll: NGX exports, parameter reading, batch protocol (section 4), installer
+loader/     process-local NGX router, active when the DLL is named as a Windows DLL (D6)
+frontend/   NGX exports, parameter reading, batch protocol (section 4)
 core/       interpolator: pass list, constants, histories, UI, subrects. API neutral
 core/ml     TOSA lowering and CPU reference; Vulkan, D3D12 and CUDA kernels
 rhi/        Device / Texture / Buffer / Pass / Network (rhi.h); one implementation on NVIDIA NRI (rhi_nri.cpp)
 tools/      build_shaders.py, build_nri.ps1
-tests/      conformance, parity, NGX harness
+tests/      conformance, parity, NGX harness, quality reference
+experiments/ measured and not used: DirectML, optical flow hardware; the CUDA launch spike
 ```
 
 | Part | Source | License |
@@ -154,9 +155,9 @@ params / gate textures on every path (paths that write images directly are an op
 
 | | 1st | 2nd | floor |
 |---|---|---|---|
-| Vulkan | cooperative matrix int8 | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
-| D3D12 NVIDIA | CUDA via NVAPI (gate M0b) | SM 6.4 dot4 | SM 6.0 |
-| D3D12 other | SM 6.4 dot4 | - | SM 6.0 |
+| Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | cooperative matrix: int8, else fp16, else bf16 (exact sums) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
+| D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
+| D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of
@@ -181,10 +182,15 @@ vkCreateDevice: Vulkan uses the floor, A4 claims only that, and the ladder text 
 M0d result (RESULTS): SM 6.9 cooperative vectors are in neither the inbox runtime (SM 6.8) nor the retail SDK; DirectML's integer convolution is
 exact but slower than dot4. Neither is a rung.
 
-CUDA: `core/ml/cuda_network.cpp` writes PTX (sm_80, `mma.sync` m16n8k16 s8, one kernel a layer); `cuLink*` from nvcuda.dll links it on the worker thread
-with a short-lived context matched by LUID; the cubin is cached on disk by hash. NVAPI `CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` by
-public interface id launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS.
+CUDA: `core/ml/cuda_network.cpp` writes PTX (sm_75, `mma.sync` m8n8k16 s8, one kernel a layer). Nothing is precompiled: the user's own driver links it for
+the GPU it is, on the worker thread, with a short-lived context matched by LUID (checked: the same PTX links for sm_75, 80, 86, 89, 90, 100 and 120). m8n8k16 is as
+fast here as sm_80's m16n8k16, so there is one form. GTX 16 reports sm_75 without tensor cores and is told apart by name; GTX 10 and 16 use dot4, the
+same hardware instruction CUDA would. Cubins are kept in memory only. NVAPI `CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` by public interface id
+launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS.
 
+AMD and Intel matrix hardware is reached through Vulkan cooperative matrices: any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of N on Intel when
+the size can be required. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to
+them (no cooperative vectors in the retail runtime; AMD's and Intel's are device-creation or vendor-driver extensions), so dot4.
 Crash safety for CUDA (the one rung that depends on vendor-specific launches): before the first use in a process an "attempts" file, named by device,
 adapter and driver file time, is counted up; it is removed when ten recordings have completed, or on an orderly end, and kept after a failed
 self-check or a device removal. At two, the rung is not used (one line in the log, `NFRUX_IGNORE_MARKERS`). No folder: not used. A device loss in the
@@ -212,7 +218,10 @@ tables. Interpolators, the self-check's network and its reference bytes are made
 buffer, and the first real batch counts as a reset. Two interpolators per feature are kept (format switch), older ones retired as above. Nothing is destroyed at process exit. D3D12 and Vulkan features may coexist.
 
 **D6. Loading.**
-1. OptiScaler, two routes:
+
+0. One file (2026-11-25): `nvngx_dlssg.dll` holds everything (shaders, weights, NRI, the loader, the C++ runtime statically). Its role is its file name:
+   `nvngx_dlssg.dll` or `dlssg_to_fsr3_amd_is_better.dll` the feature; `dbghelp.dll`, `version.dll` or `winmm.dll` the feature and the loader (their exports are
+   forwarded to Windows' own). Uninstalling is deleting it. The `package` target holds the DLL, INSTALL.txt, THIRD_PARTY.md and the license texts, nothing else.1. OptiScaler, two routes:
    a. Releases (0.9.5 the newest): the dlssg-to-fsr3 slot. The DLL as `dlssg_to_fsr3_amd_is_better.dll` beside OptiScaler, `FGInput=nukems`, `FGOutput=nukems`.
       That slot offers 2x only. This is the route R2 is judged by.
    b. Builds with `FGNvngxReplacement`: `OptiScaler/custom/NFRUX/dlssg/nvngx_dlssg.dll`, `FGNvngxReplacement=NFRUX`; up to
@@ -221,8 +230,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
    not known: NFRUX does not depend on it.
 2. Standalone. The NGX static library inside Streamline loads the core `_nvngx.dll` from the driver folder named in the registry,
    and no machine-wide setting may be changed.
-   Mechanism: `loader` as a `dbghelp.dll` proxy (sl.interposer.dll imports it; `version.dll` / `winmm.dll` for hosts
-   that do not) in the game folder hooks
+   Mechanism: the file as `dbghelp.dll` (sl.interposer.dll imports it; `version.dll` / `winmm.dll` for hosts that do not) in the game folder hooks
    `LoadLibraryExW` and `GetProcAddress` by import-table patching of the modules loaded at attach (enumerated) and later ones through
    LdrRegisterDllNotification (in-process only; Streamline loads its over-the-air plugins from ProgramData). When the core is loaded, the returned exports of interest are wrapped:
    Vulkan Init* (note device), Shutdown* (NFRUX first, then the core), GetCapabilityParameters / GetParameters (add the section 4 capability values),
@@ -244,15 +252,14 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
 Recorded when the worker is done, read back under the completion token; outputs stay the back buffer until it passes. "Not complete" is not "mismatch"; on mismatch the next lower rung
 is made and checked; after the last one NFRUX shows the back buffer. Fault injection (`NFRUX_TEST_BAD_CHECK=N` fails the first N checks) is tested.
 
-**D8. UI.** DLSS-G's rules: HUD-less + UI alpha / UI layer, difference test, no HUD-less, no-warp, subrects, menu detection,
-distortion. HUD-less in another format than the back buffer is converted to the back buffer's value range when both are the same
-transfer (else ignored, logged). Thresholds 0.07 and 0.4 are applied in the buffer's own values for SDR and PQ; for scRGB on
-values mapped by x / (1 + x) of the luminance-scaled (80 nits = 1) channels. These HDR rules are ours, tested in A9.
-
-**D9. Formats.** RGBA8, BGRA8 (and sRGB views as their UNORM), RGB10A2, RGBA16F, R11G11B10F. Values are always the stored ones: sRGB inputs are copied raw into a UNORM
-image of NFRUX's and read from there (a UNORM view of them is not always legal); outputs are copied raw. The composite stores into NFRUX's own image of
-the family; a D3D12 device without BGRA8 typed store cannot generate BGRA8 (said in the log). A2R10G10B10 is not supported.
-
+**D8. UI.** DLSS-G's rules: HUD-less + UI alpha / UI layer, difference test, no HUD-less, no-warp, subrects, menu detection, distortion. HUD-less in another
+format than the back buffer is converted when both are SDR formats (else ignored, logged); sRGB and UNORM images are compared as stored. Thresholds 0.07 and
+0.4 are applied in the buffer's own values, SDR or PQ. The UI tests decide per 2x2 block; DLSS-G has 2x2 and 4x4, and how it chooses is not known, so there is
+one.
+**D9. Formats.** RGBA8, BGRA8 (and their sRGB images), RGB10A2 (SDR or HDR10 PQ), as DLSS-G. Float back buffers (scRGB) are not supported (2026-11-25):
+the back buffer is shown, logged. Values are always the stored ones: sRGB inputs are copied raw into a UNORM image of NFRUX's and read from there (a UNORM
+view of them is not always legal); outputs are copied raw. fp16 is used only inside, for the staged path. A D3D12 device without BGRA8 typed store cannot
+generate BGRA8 (said in the log). A2R10G10B10 is not supported.
 **D10. Build.** CMake, MSVC x64, Vulkan SDK >= 1.4.363 tools and Python 3 (standard library only). Clean checkout:
 `tools\build_nri.ps1` (network, once), then `cmake -B build -A x64` and `cmake --build build --config Release`. Run time needs no compiler.
 
@@ -297,7 +304,7 @@ the release candidate. Older entries are history.
 
 Inputs: `parity`'s synthetic scenes (pan and moving square, made in the test), recordings of the sample (`NFRUX_DUMP`, `NFRUX_DUMP_FRAMES`, `--replay`), and
 the held-out Blender clips (`C:\dev\modelgym\data\nfru6x\test_new`, `test_bal`, 180 fps truth) as `quality_reference.py` exports them. Encodings RGBA8, BGRA8,
-RGB10A2, RGBA16F; normal and inverted depth; odd sizes.
+RGB10A2; normal and inverted depth; odd sizes.
 
 | # | Test (`tests/`) | Pass |
 |---|---|---|
@@ -310,7 +317,7 @@ RGB10A2, RGBA16F; normal and inverted depth; odd sizes.
 | A6 | Route a (release 0.9.5, ini lines recorded) with the sample, D3D12 and Vulkan; route b on Vulkan | a: DLL loaded, >= 1000 evaluates, 2x presented, per API; b: more than 2x presented |
 | A7 | Detection log; each rung forced; negative: nvapi / nvcuda absent, feature off, bad self-check, stale marker | `ngx_harness` passes on each; falls to the expected rung |
 | A8 | Idle GPU, `parity --bench` (16 frames a submission, recording time off, median of 30): each rung, API, 1080p / 1440p / 4K, 2x / 4x / 6x; VRAM | recorded; default rung at 1080p 2x <= 2.5 ms on RTX 4070 or the miss explained |
-| A9 | `ngx_harness` scenes: each D8 rule with expected pixels, SDR (UNORM and sRGB images), RGB10A2, scRGB, reset + HUD-less, distortion at 5x, subrects, both APIs | all |
+| A9 | `ngx_harness` scenes: each D8 rule with expected pixels, SDR (UNORM and sRGB images), RGB10A2 (PQ UI and quality), float back buffer shown, reset + HUD-less, distortion at 5x, subrects, both APIs | all |
 | A10 | `ngx_harness`: loads the DLL like `Nvngx_DllProxy`; protocol cases of section 4 (missing, repeated (a new batch between identical frames: outputs equal the frame within A2), out of order, n changing, n > 5), release/recreate, resize, format and HDR switches, D3D12 and Vulkan together, two features on one device with a concurrent Release, a minimal Vulkan 1.2 host (only shaderStorageImageExtendedFormats) under validation, 2000 frames | outputs as specified; no leak (VRAM and handles flat) |
 | A11 | Import table and API call check: the DLL opens no shared handles and loads no other graphics API's DLL at run time (both are delay-loaded) (nvapi, nvcuda exempt on their rungs) in each mode | pass |
 | A12 | Optical flow hardware vs block match: true-frame PSNR on `test_bal`, `test_new` and cost, offline | recorded; delivered only within 0.05 dB (it is not) |

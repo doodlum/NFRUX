@@ -39,3 +39,5 @@ run; sizes to 8K.
 | 6 | readiness and tests | DISAGREE, then AGREE | 4 (R5, OptiScaler routes, strict / shipped criteria, evidence rule), fixed |
 
 Revision 6 is the agreed design (2026-11-25). A1 was narrowed to what the conformance programs run.
+
+Revision 7: one DLL (role by file name, static runtime, no files on disk); scRGB / float back buffers out; CUDA from sm_75 with one mma form, per-GPU link by the driver; fp16 / bf16 cooperative matrices where int8 is missing, Intel subgroup rule; WARP and lavapipe tested; file names; low-frame-rate test.

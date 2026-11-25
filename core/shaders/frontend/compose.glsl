@@ -10,7 +10,6 @@ layout(set = 0, binding = 0, std140) uniform Compose
     ivec2 outSize, origin, size, baseOrigin, uiOrigin, noWarpOrigin, fieldBase, fieldSize;
     vec2  scale, bias;  // field value to UV offset
     int   distort, uiKind, noWarp, swapRB;  // uiKind: -1 none, then the postprocess pass's
-    int   scrgb, pad0, pad1, pad2;
 } u;
 layout(set = 0, binding = 1) uniform texture2D interp;
 layout(set = 0, binding = 2) uniform texture2D field;
@@ -21,7 +20,6 @@ layout(set = 0, binding = 6) uniform texture2D noWarpImage;
 layout(set = 0, binding = 7, OUTPUT_IMG_FORMAT) uniform writeonly image2D dst;
 #include "bilinear.h"
 #define UI_BLOCK 2
-vec3 Level(vec3 c) { return u.scrgb != 0 ? max(c, vec3(0.0)) / (1.0 + max(c, vec3(0.0))) : c; }
 float Opacity(ivec2 p) { const vec4 v = texelFetch(uiImage, u.uiOrigin + p, 0); return u.uiKind == 3 || u.uiKind == 5 ? v.a : v.r; }
 void main()
 {
@@ -63,7 +61,7 @@ void main()
                     isUi = isUi || Opacity(q) > 0.4;
                 else
                 {
-                    const vec3 d = abs(Level(texelFetch(frameImage, u.origin + q, 0).rgb) - Level(texelFetch(baseImage, u.baseOrigin + q, 0).rgb));
+                    const vec3 d = abs(texelFetch(frameImage, u.origin + q, 0).rgb - texelFetch(baseImage, u.baseOrigin + q, 0).rgb);
                     isUi = isUi || max(d.r, max(d.g, d.b)) > 0.07;
                 }
             }
