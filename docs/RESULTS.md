@@ -324,6 +324,6 @@ vectors for every method; network outputs rounded to 8 bits (the blend is not).
 | 5x | 144 | 34.13 | 34.11 | 33.53 | 33.71 | 25.85 |
 | 6x | 180 | 34.13 | 34.10 | 33.33 | 33.56 | 25.57 |
 
-A3: within 0.04 dB at every multiplier (limit 0.2); the worst single frame against PyTorch is -0.50 / -1.93 / -0.32 / -0.29 / -0.50 dB (2x-6x), the 3x one among
-near-static frames above 45 dB (the pairs under 45 dB average +0.02 there). A14: above Arm's, both ways, at every multiplier. The Vulkan repeat of this run
+A3: within 0.04 dB at every multiplier (limit 0.2); the worst single frame against PyTorch is -0.50 / -1.93 / -0.32 / -0.29 / -0.50 dB (2x-6x), which frame the
+3x one is was not looked at (frames under 45 dB in PyTorch average +0.02 there). A14: above Arm's, both ways, at every multiplier. The Vulkan repeat of this run
 was still going when this was written.
