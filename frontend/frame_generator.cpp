@@ -241,7 +241,7 @@ bool FrameGenerator::Checked()
             {
                 if (!m_checkPass) m_checkPass = m_dev.CreatePass(shaders::kCheck);
                 m_checkNet = m_dev.CreateNetwork(S, S, &error);
-                if (!m_checkNet && m_dev.DropRung()) m_checkNet = m_dev.CreateNetwork(S, S, &error);
+                while (!m_checkNet && m_dev.DropRung()) m_checkNet = m_dev.CreateNetwork(S, S, &error);
                 if (!m_checkNet || !m_checkPass) return Log("network not possible: %s", error.c_str()), false;
                 if (!m_checkWant[0].empty()) return true;
                 std::vector<int8_t> x(S * S * kInputChannels);

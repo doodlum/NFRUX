@@ -99,7 +99,7 @@ Current build (after the fixes), 900 frames each: D3D12 2x 384 fps, 6x 623; Vulk
 A loader regression was caught by these (the loader patched its own imports: stack overflow at start), fixed.
 ## M0b CUDA: go (2026-11-25)
 
-`tests/cuda_spike.cpp`: PTX linked by nvcuda.dll (no toolkit), launched by NVAPI in a D3D12 compute list; chained kernels with UAV barriers 0 of 4096
+`experiments/cuda_launch.cpp`: PTX linked by nvcuda.dll (no toolkit), launched by NVAPI in a D3D12 compute list; chained kernels with UAV barriers 0 of 4096
 wrong, `mma.sync` m16n8k16 s8 product 0 of 128 wrong. `core/ml/cuda_network.cpp`: the whole network, one generated kernel per layer, exact against
 the CPU reference (64x64: 23 cases, 744x464 and 960x544: 5 each, 0 bytes). sm_80 and newer (RTX 30+); older NVIDIA GPUs fall to dot4. Creation
 about 0.7 s the first time at a size, under 0.05 s from the cubin cache (LOCALAPPDATA\NFRUX) - still inside Evaluate (worker thread owed).
@@ -212,7 +212,7 @@ on Vulkan without NFRUX having been loaded. No newer OptiScaler release exists.
 
 Every shared header and shader was diffed against `ngsdk-steamdeck` `nfru-mfg` (38cfb23). Found and fixed:
 
-| Divergence (from DeckyUpscaler) | Effect |
+| Divergence | Effect |
 |---|---|
 | The composite lacked the timestep prior the network is trained with | up to 1.4 dB lost at t = 1/6 and 5/6 |
 | Above 1080 rows the flow ran at full size (pass 01 missing) | 4K 4x: 3.2 -> 2.65 ms on D3D12 |
@@ -222,7 +222,7 @@ Every shared header and shader was diffed against `ngsdk-steamdeck` `nfru-mfg` (
 
 Earlier parity results in this file (D3D12 against Vulkan) were unaffected by these: both APIs ran the same wrong composite. That is what A3 is for.
 
-## A3, A14: quality against true frames (final code, D3D12, shipped build; `tests/reference.py`, 2026-11-25)
+## A3, A14: quality against true frames (final code, D3D12, shipped build; `tests/quality_reference.py`, 2026-11-25)
 
 Held-out sets test_new + test_bal (35 sequences, 4 pairs each where they exist), PSNR in dB, mean over generated frames; 8-bit colour and
 half-float vectors for every method, outputs rounded to 8 bits.
@@ -312,7 +312,7 @@ Harness at eedcb52 (strict and shipped): 124 checks, 0 failed; strict 55 of 55 i
 
 ## A3, A14 final
 
-Shipped build, D3D12, `tests/reference.py` run on the binary of 293ca58 (later commits change no shader this path runs: 720p from 540p uses no reduction
+Shipped build, D3D12, `tests/quality_reference.py` run on the binary of 293ca58 (later commits change no shader this path runs: 720p from 540p uses no reduction
 pass, and no pass, constant or kernel else was edited). 35 sequences of test_new + test_bal, up to 4 pairs each, PSNR dB, 8-bit colour and half-float
 vectors for every method; network outputs rounded to 8 bits (the blend is not).
 

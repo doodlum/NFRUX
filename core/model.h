@@ -1,6 +1,6 @@
 // The embedded network and its description for a size. SPDX-License-Identifier: MIT
 #pragma once
-#include "ml/ffx_vk_ml_runtime.h"
+#include "ml/vulkan_network.h"
 namespace nfrux
 {
 constexpr uint32_t kInputChannels = 20;

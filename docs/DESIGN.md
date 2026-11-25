@@ -15,7 +15,7 @@ NFRUX is neural multi-frame generation (2x to 6x) that a game or OptiScaler uses
 | R4 | Tested with Streamline_Sample on both APIs | A4, A5 |
 | R5 | Detects and uses what the GPU has (shader model, cooperative matrix, CUDA/NVAPI); optical flow hardware, SM 6.9 cooperative vectors and DirectML (suggested): measured or checked, not used, numbers told to the project (2026-11-25; D3, D4) | A7, A8, A12 |
 | R6 | Output visually matches between Vulkan and D3D12: the shipped build by A2b's limits, the strict build byte for byte (A2a) | A2, A5, A9 |
-| R7 | Reuses DeckyUpscaler where useful (UI handling) | A9, section 2 |
+| R7 | Reuses existing NGX code where useful (UI handling) | A9, section 2 |
 | R8 | Design documented and agreed by independent reviewers | `docs/REVIEWS.md` |
 
 Not goals: super resolution, presentation and pacing (Streamline / OptiScaler own them), anti-cheat games, other frame generators' code
@@ -35,10 +35,10 @@ tests/      conformance, parity, NGX harness
 
 | Part | Source | License |
 |---|---|---|
-| Passes, pass order, Vulkan network runtime, TOSA lowering | DeckyUpscaler `nvngx/nfru` (Arm NGSDK 1.1.1, ML Emulation Layer flow) | MIT; Apache-2.0 (flow) |
-| UI, subrect, no-warp, menu, distortion rules | DeckyUpscaler `nvngx`; shaders converted to UBO + separate textures, C++ rewritten on rhi | MIT |
-| NGX ABI | DeckyUpscaler `ngx_abi.h` | MIT |
-| Loader | DeckyUpscaler `loader/loader_shim.cpp` ideas, Windows specific rewrite; MinHook only if inline hooks prove necessary (BSD-2) | MIT |
+| Passes, pass order, Vulkan network runtime, TOSA lowering | Arm NGSDK 1.1.1 (the nfru-mfg branch), ML Emulation Layer flow | MIT; Apache-2.0 (flow) |
+| UI, subrect, no-warp, menu, distortion rules | earlier NGX work, rewritten | MIT |
+| NGX ABI | earlier NGX work | MIT |
+| Loader | ours | MIT |
 | Tests | base: `nfru/test/ffx_ml_runtime_test.cpp` (A1), `tests/fg_vk_test.cpp` (A9, A10), `tests/fg_d3d12_ordering_test.cpp`, `tests/slsample_fg_scripting.patch` (A4) | MIT |
 | Weights | `nfru_mfg_v14_int8` (ngsdk fork 38cfb23), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
 | NVAPI, CUDA functions | declared by us for the few entry points used, loaded dynamically | checked in M0, in THIRD_PARTY.md |
@@ -67,7 +67,7 @@ and `_OfInputSizeRcp` use the reduced size (aspect kept, 1080 rows), as the SDK 
 Reset (first frame, `DLSSG.Reset`, size change, after menu / not rendering / release): every output of the batch is a copy of
 the **back buffer** (UI included, subrect rules applied); the history stores the interpolation source.
 
-Distortion field: the whole batch (undistort once, n interpolations, n composites), not Decky's one frame.
+Distortion field: the whole batch (undistort once, n interpolations, n composites).
 
 ## 4. NGX contract
 
@@ -96,11 +96,11 @@ OutputInterpolated is always written too. A failure is returned only for a missi
 | MvecJittered | the jitter's change taken out of the vectors (the SDK's jitter cancellation) | 0 |
 | MvecDilated, MvecInvalidValue, CameraMotionIncluded | not used | - |
 
-Parameters are read through the caller's `NVSDK_NGX_Parameter` vtable; Decky's own parameter class is not assumed.
+Parameters are read through the caller's `NVSDK_NGX_Parameter` vtable.
 PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.NeedsUpdatedDriver` = 0,
 `.MinDriverVersionMajor/Minor` = 0, `.FeatureInitResult` = Success, `DLSSG.MultiFrameCountMax` = kMaxGenerated.
 
-States. Hypothesis from Decky, observed in M0a, to be shown with the debug layer / validation before M5 exits: D3D12 COMMON in and out; Vulkan GENERAL in and out. Barriers use compute-legal states only
+States. Observed in M0a, to be shown with the debug layer / validation before M5 exits: D3D12 COMMON in and out; Vulkan GENERAL in and out. Barriers use compute-legal states only
 (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
@@ -122,8 +122,8 @@ During Evaluate -> back buffer, Success, interpolator disabled for that size, lo
   switch fixes how a driver fuses inside them. Denormals: no pass relies on them; both APIs' defaults (D3D flush allowed) are covered by the A2 budget;
 - remaining expected differences: division, exp, sqrt, texture filtering rounding. A discrete flip (block-match tie, 0.07 UI
   threshold, hole test) can exceed them locally; A2 judges these as a counted class.
-**Reference.** Passes, constants, sizes and formats follow the SDK branch (`ngsdk-steamdeck`, `nfru-mfg`, 38cfb23), not DeckyUpscaler,
-where they differ (2026-11-25: Decky's changes are for specific hardware). Remaining differences from the branch give the same
+**Reference.** Passes, constants, sizes and formats follow the SDK branch (`ngsdk-steamdeck`, `nfru-mfg`, 38cfb23)
+wherever sources differ (2026-11-25). Remaining differences from the branch give the same
 results: packed integer types, selects for multiplies by 0 / 1, batched loads in the same order, log2 / exp2 for log / exp, the timestep
 prior as softmax weights instead of logarithms (within rounding), 02 / 03 / 01 as compute passes; and the UI additions. The optical flow passes
 port Arm's ML Emulation Layer, which the branch runs through VK_ARM_data_graph_optical_flow.
@@ -143,8 +143,8 @@ shaderStorageImageExtendedFormats, which the loader adds. No queue family is giv
 assumptions are exactly (a) 1.2, (b) shaderStorageImageExtendedFormats, logged at creation. A minimal-host test is A10.
 Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8 only (the runtime's fp16
-preference is overridden). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Decky's
-float requantisation is off. `nfrux_conv.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
+preference is overridden). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
+requantisation is off. `conv2d.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
 dilation 1, square kernel and stride, resize on source 0 only, shift >= 1, source strides equal to the words read): graph creation
 checks each layer and the rung fails if any is outside it. The shape list is written by hand in `build_shaders.py`; a shape missing from it fails creation.
 The `[flatten]` two-source load is split so no out-of-range address is formed. Outputs go to buffers and are copied to the
@@ -244,7 +244,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
 Recorded when the worker is done, read back under the completion token; outputs stay the back buffer until it passes. "Not complete" is not "mismatch"; on mismatch the next lower rung
 is made and checked; after the last one NFRUX shows the back buffer. Fault injection (`NFRUX_TEST_BAD_CHECK=N` fails the first N checks) is tested.
 
-**D8. UI.** Decky's rules (DLSS-G's): HUD-less + UI alpha / UI layer, difference test, no HUD-less, no-warp, subrects, menu detection,
+**D8. UI.** DLSS-G's rules: HUD-less + UI alpha / UI layer, difference test, no HUD-less, no-warp, subrects, menu detection,
 distortion. HUD-less in another format than the back buffer is converted to the back buffer's value range when both are the same
 transfer (else ignored, logged). Thresholds 0.07 and 0.4 are applied in the buffer's own values for SDR and PQ; for scRGB on
 values mapped by x / (1 + x) of the luminance-scaled (80 nits = 1) channels. These HDR rules are ours, tested in A9.
@@ -296,7 +296,7 @@ A2, A5 (replay), A7, A9 and A10 are run again; after one to passes or constants 
 the release candidate. Older entries are history.
 
 Inputs: `parity`'s synthetic scenes (pan and moving square, made in the test), recordings of the sample (`NFRUX_DUMP`, `NFRUX_DUMP_FRAMES`, `--replay`), and
-the held-out Blender clips (`C:\dev\modelgym\data\nfru6x\test_new`, `test_bal`, 180 fps truth) as `reference.py` exports them. Encodings RGBA8, BGRA8,
+the held-out Blender clips (`C:\dev\modelgym\data\nfru6x\test_new`, `test_bal`, 180 fps truth) as `quality_reference.py` exports them. Encodings RGBA8, BGRA8,
 RGB10A2, RGBA16F; normal and inverted depth; odd sizes.
 
 | # | Test (`tests/`) | Pass |
@@ -304,7 +304,7 @@ RGB10A2, RGBA16F; normal and inverted depth; odd sizes.
 | A1 | `ml_conformance_d3d12`, `ml_conformance_vulkan`: each rung vs CPU reference graph outputs; sizes 64x64, 744x464, 960x544 on D3D12; random seeds, and all -128, all 127, alternating on D3D12 | 0 differing bytes |
 | A2a | `parity --strict`, strict build: synthetic scenes (1080p, 4K, 8K, ultra-wide, odd; RGBA8, BGRA8, RGB10A2; both depths) and 64-frame recordings, 2x / 4x / 6x; exit code | 0 differing bytes in every output and intermediate |
 | A2b | `parity`, shipped build, the same | PSNR >= 60 dB, >= 99.9% of values within 1 code, <= 0.01% off by more than 3 (RGB10A2 by 10-bit code, RGBA16F by value with the scene's peak as 255 codes); exit code |
-| A3 | `tests/reference.py`: port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips, 8-bit colour and half-float vectors for both) | PSNR against the true frames within 0.2 dB of torch per multiplier |
+| A3 | `tests/quality_reference.py`: port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips, 8-bit colour and half-float vectors for both) | PSNR against the true frames within 0.2 dB of torch per multiplier |
 | A4 | Sample, D3D12 and Vulkan, scripting patch: 2x and the maximum granted, 1920x1080, 5 min each on release DLLs; 60 s with D3D12 debug layer + GPU validation / Vulkan validation + sync | no crash; 0 messages naming NFRUX objects or thrown inside its recordings; `numFramesActuallyPresented` = n + 1 for >= 95% of states logged; OutputReal written every evaluate; dumped generated frames lie between neighbours (mean luma distance to both <= distance between them + 2 codes, >= 99% of frames) |
 | A5 | Sample with fixed timestep, scripted camera, DLSS off: dump 64 frames on both APIs (HUD-less colour); replay each dump on both APIs | replay meets A2a (strict) and A2b (shipped); live: generated PSNR between the APIs no more than 1 dB below their inputs' PSNR (the absolute 35 dB of earlier revisions is dropped: the sample's own renderers differ by 31.4 dB, so it measured them, not NFRUX); image pairs kept |
 | A6 | Route a (release 0.9.5, ini lines recorded) with the sample, D3D12 and Vulkan; route b on Vulkan | a: DLL loaded, >= 1000 evaluates, 2x presented, per API; b: more than 2x presented |

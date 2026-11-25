@@ -2,7 +2,7 @@
 #include "frame_generator.h"
 
 #include "../core/log.h"
-#include "../core/ml/ffx_vk_ml_runtime.h"
+#include "../core/ml/vulkan_network.h"
 #include "../loader/ngx.h"
 #include "rhi_nri.h"
 
@@ -266,4 +266,16 @@ extern "C" __declspec(dllexport) void __cdecl NFRUX_DropVulkanDevice(VkDevice d)
 }
 extern "C" __declspec(dllexport) uint32_t __cdecl NFRUX_MaxFrames() { return MaxFrames(); }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
+// One file, its role by its name: nvngx_dlssg.dll and dlssg_to_fsr3_amd_is_better.dll (OptiScaler) are loaded as the feature; as dbghelp.dll,
+// version.dll or winmm.dll in a game's folder it also routes the game's own NGX calls here (loader/loader.cpp).
+void LoaderAttach(HINSTANCE self);
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID)
+{
+    if (reason != DLL_PROCESS_ATTACH) return TRUE;
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(self, path, MAX_PATH);
+    const char* name = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+    for (const char* n : {"dbghelp.dll", "version.dll", "winmm.dll"})
+        if (!_stricmp(name, n)) { LoaderAttach(self); break; }
+    return TRUE;
+}

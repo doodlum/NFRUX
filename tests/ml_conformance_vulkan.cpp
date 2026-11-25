@@ -8,7 +8,7 @@
 //
 //   ffx_ml_runtime_test [--gpu N] [--width W] [--height H] [--iterations N]
 
-#include "ffx_vk_ml_runtime.h"
+#include "vulkan_network.h"
 
 #include <nfru_mfg_v14_int8.h>
 

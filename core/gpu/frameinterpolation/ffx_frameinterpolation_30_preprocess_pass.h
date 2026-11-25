@@ -155,7 +155,7 @@ FFX_MIN16_F2 LoadMotionAndHoleEdgeDetect(int32_t2 pixel, out FFX_MIN16_F hole_ed
 // reprojection uses the representative surface.
 float LoadDilatedDepthTm1(int32_t2 pos, int32_t2 depth_size, FFX_MIN16_F mask, out int32_t2 selected_pos)
 {
-    // DeckyUpscaler: the 8 neighbours' loads issued together (coordinates clamped), then Arm's ordered strict selection
+    // the 8 neighbours' loads issued together (coordinates clamped), then Arm's ordered strict selection
     // over the on-screen ones: Arm's result, without a dependent load and wait per tap (22 full waits -> 8).
     const int32_t2 offsets[8] = {int32_t2(+1, +0), int32_t2(+0, +1), int32_t2(+0, -1), int32_t2(-1, +0),
                                  int32_t2(-1, +1), int32_t2(+1, +1), int32_t2(-1, -1), int32_t2(+1, -1)};
@@ -195,7 +195,7 @@ float LoadDilatedDepthTm1(int32_t2 pos, int32_t2 depth_size, FFX_MIN16_F mask, o
 
 float LoadDilatedDepthTp1(int32_t2 pos, int32_t2 depth_size, FFX_MIN16_F mask, out int32_t2 selected_pos)
 {
-    // DeckyUpscaler: the 8 neighbours' loads issued together (coordinates clamped), then Arm's ordered strict selection
+    // the 8 neighbours' loads issued together (coordinates clamped), then Arm's ordered strict selection
     // over the on-screen ones: Arm's result, without a dependent load and wait per tap (22 full waits -> 8).
     const int32_t2 offsets[8] = {int32_t2(+1, +0), int32_t2(+0, +1), int32_t2(+0, -1), int32_t2(-1, +0),
                                  int32_t2(-1, +1), int32_t2(+1, +1), int32_t2(-1, -1), int32_t2(+1, -1)};
@@ -335,7 +335,7 @@ void preprocess(int32_t2 input_pixel)
     if (!uv_p1_mv_oob)
         rgb_p1_warp_t_mv = LoadColourPreprocessCur(uv_p1_mv);
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_PREPROCESS_BYTES_M1)
-    // DeckyUpscaler: the lane's colour 8-bit unorm (_Options 0x800): the flow warps' colours only feed the network, whose
+    // the lane's colour 8-bit unorm (_Options 0x800): the flow warps' colours only feed the network, whose
     // quantisation (scale 255, zero point -128) takes a channel n / 255 to n - 128 exactly: their bytes, top bits flipped.
     const bool colourBytes = true;  // kFiPreprocess8, the rgba8 lane's (used with _Options 0x800)
 #else

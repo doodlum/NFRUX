@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 // SPDX-License-Identifier: Apache-2.0
-// DeckyUpscaler: ffx_opticalflow_arm_match.glsl with the block match restructured for the workgroup, the same
+// Arm's block match restructured for the workgroup, the same
 // integer costs and the same spiral order (so the same result): TM1's and the search's texels loaded once a
 // workgroup into shared memory, and per offset each block's sum of absolute differences as a separable 5 x 5 box
 // sum of the texels' differences (rows, then columns) instead of 25 per texel.

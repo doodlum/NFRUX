@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "ffx_vk_ml_runtime.h"
+#include "vulkan_network.h"
 
 #include <array>
 #include <cstdint>

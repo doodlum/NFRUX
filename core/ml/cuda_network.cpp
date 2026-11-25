@@ -76,37 +76,64 @@ std::vector<uint8_t> Link(const std::string& ptx, LUID luid, std::string* error)
     void* ctx = nullptr;
     if (dev < 0 || create(&ctx, 0, dev)) return fail("no CUDA device for this adapter");
     std::vector<char> log(8192, 0);
-    int   opts[] = {5, 6};  // the error log's buffer and size
-    void* vals[] = {log.data(), reinterpret_cast<void*>(size_t(log.size()))};
+    // The error log's buffer and size. The target is the context's device: the driver compiles for the GPU it is (tests: CU_JIT_TARGET).
+    const char* target = Env("NFRUX_TEST_CUDA_TARGET");
+    int   opts[] = {5, 6, 9};
+    void* vals[] = {log.data(), reinterpret_cast<void*>(size_t(log.size())), reinterpret_cast<void*>(size_t(target ? atoi(target) : 0))};
     void *state = nullptr, *bin = nullptr;
     size_t size = 0;
-    CUresult r = linkCreate(2, opts, vals, &state);
+    CUresult r = linkCreate(target ? 3 : 2, opts, vals, &state);
     if (!r) r = linkAdd(state, 1, const_cast<char*>(ptx.c_str()), ptx.size() + 1, "nfrux", 0, nullptr, nullptr);
     if (!r) r = linkComplete(state, &bin, &size);
     if (!r) out.assign(static_cast<uint8_t*>(bin), static_cast<uint8_t*>(bin) + size);
     if (state && linkDestroy) linkDestroy(state);
     destroy(ctx);
+    if (target && error) *error = "linked " + std::to_string(out.size()) + " bytes for sm_" + target;
     if (r && error) *error = "PTX link " + std::to_string(r) + ": " + std::string(log.data()).substr(0, 300);
     return out;
 }
 
-// A cubin by the PTX's hash, device and driver, in LOCALAPPDATA\NFRUX.
-std::string CachePath(const std::string& ptx, LUID luid)
+// The adapter's compute capability (75, 80, 89 ...); 0 without int8 tensor cores. GTX 16 reports 75 as RTX 20 does, and has none.
+int ComputeCapability(LUID luid, std::string* error)
 {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&](const void* p, size_t n) { for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 1099511628211ull; };
-    mix(ptx.data(), ptx.size()), mix(&luid, 8);
-    if (auto v = reinterpret_cast<CUresult (*)(int*)>(GetProcAddress(Nv().cuda, "cuDriverGetVersion"))) { int d = 0; v(&d), mix(&d, 4); }
-    char path[MAX_PATH];
-    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", path, MAX_PATH);
-    if (!n || n > MAX_PATH - 60) return {};
-    strcat_s(path, "\\NFRUX");
-    CreateDirectoryA(path, nullptr);
-    char name[32];
-    snprintf(name, sizeof(name), "\\%016llx.cubin", static_cast<unsigned long long>(h));
-    return std::string(path) + name;
+    if (const char* t = Env("NFRUX_TEST_CUDA_SM")) return atoi(t);
+    HMODULE m = Nv().cuda;
+    auto f = [&](const char* n) { return GetProcAddress(m, n); };
+    auto init = reinterpret_cast<CUresult (*)(unsigned)>(f("cuInit"));
+    auto count = reinterpret_cast<CUresult (*)(int*)>(f("cuDeviceGetCount"));
+    auto get = reinterpret_cast<CUresult (*)(int*, int)>(f("cuDeviceGet"));
+    auto getLuid = reinterpret_cast<CUresult (*)(char*, unsigned*, int)>(f("cuDeviceGetLuid"));
+    auto attribute = reinterpret_cast<CUresult (*)(int*, int, int)>(f("cuDeviceGetAttribute"));
+    auto getName = reinterpret_cast<CUresult (*)(char*, int, int)>(f("cuDeviceGetName"));
+    int n = 0;
+    if (!init || !count || !get || !getLuid || !attribute || !getName || init(0) || count(&n)) { if (error) *error = "CUDA not usable"; return 0; }
+    for (int i = 0; i < n; ++i)
+    {
+        int d, major = 0, minor = 0;
+        char l[8], name[128] = "";
+        unsigned mask;
+        if (get(&d, i) || getLuid(l, &mask, d) || memcmp(l, &luid, 8)) continue;
+        attribute(&major, 75, d), attribute(&minor, 76, d), getName(name, sizeof(name), d);  // COMPUTE_CAPABILITY_MAJOR, _MINOR
+        const int sm = major * 10 + minor;
+        if (sm >= 80 || (sm == 75 && (strstr(name, "RTX") || strstr(name, "T4")))) return sm;
+        if (error) *error = std::string(name) + " (sm_" + std::to_string(sm) + ") has no int8 tensor cores";
+        return 0;
+    }
+    if (error) *error = "no CUDA device for this adapter";
+    return 0;
 }
-
+// Linked once a process and kernel text (a batch's networks are the same size); nothing on disk.
+std::vector<uint8_t> Cubin(const std::string& ptx, LUID luid, std::string* error)
+{
+    static std::mutex mutex;
+    static std::map<std::pair<uint64_t, std::string>, std::vector<uint8_t>> made;
+    uint64_t adapter;
+    memcpy(&adapter, &luid, 8);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& c = made[{adapter, ptx}];
+    if (c.empty()) c = Link(ptx, luid, error);
+    return c;
+}
 struct Writer
 {
     std::string s;
@@ -207,8 +234,10 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
                 {
                     const uint32_t off = uint32_t(((n * k * k + ky * k + kx) * chunks + ch) * 128);
                     w("ld.global.u32 %%f2, [%%a9 + %u];", off);
-                    w("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d, %%acc%d, %%acc%d}, {%%f0, %%f1}, {%%f2}, {%%acc%d, %%acc%d, %%acc%d, %%acc%d};",
-                      n * 4, n * 4 + 1, n * 4 + 2, n * 4 + 3, n * 4, n * 4 + 1, n * 4 + 2, n * 4 + 3);
+                    // Two 8 x 8 x 16 products (tensor cores from sm_75, RTX 20): as fast here as sm_80's 16 x 8 x 16.
+                    for (int half = 0; half < 2; ++half)
+                        w("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d}, {%%f%d}, {%%f2}, {%%acc%d, %%acc%d};", n * 4 + half * 2, n * 4 + half * 2 + 1, half,
+                          n * 4 + half * 2, n * 4 + half * 2 + 1);
                 }
             }
         }
@@ -277,7 +306,9 @@ std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml:
         const auto it = std::find(parsed.outputBindings.begin(), parsed.outputBindings.end(), t.binding);
         slot[i] = std::find(parsed.inputBindings.begin(), parsed.inputBindings.end(), t.binding) != parsed.inputBindings.end() ? -1 : -2 - int32_t(it - parsed.outputBindings.begin());
     }
-    std::string          ptx = ".version 7.1\n.target sm_80\n.address_size 64\n";
+    // Without tensor cores (GTX) dot4 uses the same hardware as CUDA would.
+    if (!ComputeCapability(device->GetAdapterLuid(), error)) return nullptr;
+    std::string          ptx = ".version 7.1\n.target sm_75\n.address_size 64\n";
     std::vector<uint8_t> constants;
     for (size_t li = 0; li < g.convs.size(); ++li)
     {
@@ -322,22 +353,9 @@ std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml:
         l.grid[0] = uint32_t(fc.outW + 63) / 64, l.grid[1] = uint32_t(fc.outH);
         out->m_layers.push_back(l);
     }
-    const LUID        luid = device->GetAdapterLuid();
-    const std::string cache = CachePath(ptx, luid);
-    std::vector<uint8_t> cubin;
-    if (FILE* f = cache.empty() ? nullptr : fopen(cache.c_str(), "rb"))
-    {
-        fseek(f, 0, SEEK_END), cubin.resize(size_t(ftell(f))), fseek(f, 0, SEEK_SET);
-        if (fread(cubin.data(), 1, cubin.size(), f) != cubin.size()) cubin.clear();
-        fclose(f);
-    }
-    if (cubin.empty() || Nv().createModule(device, cubin.data(), uint32_t(cubin.size()), &out->m_module))
-    {
-        cubin = Link(ptx, luid, error);
-        if (cubin.empty()) return nullptr;
-        if (FILE* f = cache.empty() ? nullptr : fopen(cache.c_str(), "wb")) fwrite(cubin.data(), 1, cubin.size(), f), fclose(f);
-        if (Nv().createModule(device, cubin.data(), uint32_t(cubin.size()), &out->m_module)) return fail("CreateCuModule");
-    }
+    const std::vector<uint8_t> cubin = Cubin(ptx, device->GetAdapterLuid(), error);
+    if (cubin.empty()) return nullptr;
+    if (Nv().createModule(device, cubin.data(), uint32_t(cubin.size()), &out->m_module)) return fail(error && error->rfind("linked", 0) == 0 ? *error + ", CreateCuModule" : std::string("CreateCuModule"));
     for (size_t i = 0; i < out->m_layers.size(); ++i)
         if (Nv().createFunction(device, out->m_module, ("layer" + std::to_string(i)).c_str(), &out->m_layers[i].fn)) return fail("CreateCuFunction");
     out->m_constants = buffer(constants.size(), D3D12_HEAP_TYPE_DEFAULT), out->m_upload = buffer(constants.size(), D3D12_HEAP_TYPE_UPLOAD);

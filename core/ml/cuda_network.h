@@ -1,7 +1,7 @@
 // The network on D3D12 through CUDA kernels (NVAPI), int8 tensor-core products (mma.sync), exact integer results. No CUDA toolkit: the
 // PTX is written here for the network's size and the driver's nvcuda.dll links it to a cubin. SPDX-License-Identifier: MIT
 #pragma once
-#include "ffx_vk_ml_graph.h"
+#include "tosa_graph.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>

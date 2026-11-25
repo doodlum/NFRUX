@@ -384,10 +384,21 @@ public:
         {
             const ffx_ml::DeviceContext dc = {vk.instance, vk.physicalDevice, vk.device, vk.gipa, vk.gdpa, vk.mlFeatures};
             ffx_ml::Path path = ffx_ml::Path::Auto;
-            if (ml && strcmp(ml, "coopmat") && strcmp(ml, "dot4") && strcmp(ml, "scalar")) { if (error) *error = "NFRUX_ML: unknown path"; return nullptr; }
-            if (ml) path = !strcmp(ml, "coopmat") ? ffx_ml::Path::CoopMat : !strcmp(ml, "dot4") ? ffx_ml::Path::Dot4 : ffx_ml::Path::Scalar;
-            ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, path == ffx_ml::Path::CoopMat ? ffx_ml::MatType::Int8 : ffx_ml::MatType::None);
-            if (sel.path == ffx_ml::Path::CoopMat && sel.matType != ffx_ml::MatType::Int8) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::CoopMat, ffx_ml::MatType::Int8);
+            // Cooperative matrices: int8 where the driver has them (NVIDIA, Intel XMX, AMD WMMA), else fp16 or bf16, whose sums are the same
+            // integers (tested; and the self-check compares).
+            ffx_ml::MatType type = ffx_ml::MatType::None;
+            if (ml)
+            {
+                const std::string m = ml;
+                if (m == "coopmat") path = ffx_ml::Path::CoopMat;
+                else if (m == "coopmat_int8") path = ffx_ml::Path::CoopMat, type = ffx_ml::MatType::Int8;
+                else if (m == "coopmat_fp16") path = ffx_ml::Path::CoopMat, type = ffx_ml::MatType::Fp16;
+                else if (m == "coopmat_bf16") path = ffx_ml::Path::CoopMat, type = ffx_ml::MatType::Bf16;
+                else if (m == "dot4") path = ffx_ml::Path::Dot4;
+                else if (m == "scalar") path = ffx_ml::Path::Scalar;
+                else { if (error) *error = "NFRUX_ML: unknown path"; return nullptr; }
+            }
+            ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, type);
             if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
             rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;

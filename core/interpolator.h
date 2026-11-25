@@ -1,4 +1,4 @@
-// Frame interpolation, ported from Arm's Neural Graphics SDK 1.1.1 (NFRU v2) through DeckyUpscaler, on NFRUX's rhi with the
+// Frame interpolation, ported from Arm's Neural Graphics SDK 1.1.1 (NFRU v2), on NFRUX's rhi with the
 // 20-channel multi-frame network. SPDX-License-Identifier: MIT
 #pragma once
 #include "rhi.h"

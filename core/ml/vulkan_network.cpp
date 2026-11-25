@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Neural Graphics SDK universal contributors
 // SPDX-License-Identifier: MIT
 
-#include "ffx_vk_ml_runtime.h"
-#include "ffx_vk_ml_graph.h"
+#include "vulkan_network.h"
+#include "tosa_graph.h"
 
 #include <algorithm>
 #include <climits>
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
-// Kernels, compiled from shaders/ffx_ml_conv2d.comp at build time.
+// Kernels, compiled from shaders/conv2d.comp at build time.
 #include "ffx_ml_conv2d_scalar_spv.h"
 #include "ffx_ml_conv2d_dot4_spv.h"
 #include "ffx_ml_conv2d_dot4_tiled_spv.h"
@@ -230,7 +230,7 @@ namespace ffx_ml
                 return {4, 32, 16, 128, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
-                // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
+                // AMD RDNA2 APUs. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
                 // Workgroups 8 x 8: wider ones (32 x 2) were 2.5% faster for NFRU v2's network alone (nfru_ml_test) but 6% slower
                 // in the proxy (x4, Balanced's sizes between the other passes).
                 return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 32, 40, 8, 8, 4096, 4};
@@ -561,6 +561,9 @@ namespace ffx_ml
                     sel.subgroupSize        = tuning.preferredSubgroup;
                     sel.requireSubgroupSize = true;
                 }
+                // Intel's XMX runs in subgroups as wide as its matrices (8 on Alchemist, 16 on Battlemage).
+                if (sel.vendor == Vendor::Intel && (features & FEATURE_SUBGROUP_SIZE_CONTROL) && best->NSize >= sizeControl.minSubgroupSize && best->NSize <= sizeControl.maxSubgroupSize)
+                    sel.subgroupSize = best->NSize, sel.requireSubgroupSize = true;
                 sel.workgroupSize = sel.numSubgroups * sel.subgroupSize;
                 return sel;
             }

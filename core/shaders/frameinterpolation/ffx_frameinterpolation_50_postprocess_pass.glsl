@@ -30,7 +30,7 @@
 //-----------------------------------------------------------------------------
 // Input: UAV bindings
 //-----------------------------------------------------------------------------
-// DeckyUpscaler: the frame with its UI, the UI's opacity and the no-warp mask (see the v1 composite).
+// the frame with its UI, the UI's opacity and the no-warp mask (see the v1 composite).
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE                       12
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA                        13
 #define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK                    14

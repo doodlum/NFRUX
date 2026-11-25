@@ -2,7 +2,7 @@
 // pixels, on each API and between them.
 //   ngx_harness DLL [--minimal] [--soak N] [d3d12|vulkan]     NFRUX_VK_VALIDATION=1, NFRUX_D3D12_DEBUG=1
 // SPDX-License-Identifier: MIT
-#include "../core/ml/ffx_vk_ml_runtime.h"
+#include "../core/ml/vulkan_network.h"
 #include "../loader/ngx.h"
 
 #include <d3d12.h>
@@ -149,6 +149,13 @@ struct Api12 : Api
             if (FAILED(hr)) return printf("  no D3D12 debug layer: %08lx\n", hr), false;
             dbg->EnableDebugLayer(), dbg->SetEnableGPUBasedValidation(atoi(getenv("NFRUX_D3D12_DEBUG")) > 1);
             if (FAILED(hr = factory->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  debug device: %08lx\n", hr), false;
+        }
+        if (getenv("NFRUX_WARP"))  // the software adapter: no vendor, no CUDA
+        {
+            ComPtr<IDXGIFactory4> wf;
+            ComPtr<IDXGIAdapter> wa;
+            CreateDXGIFactory1(IID_PPV_ARGS(&wf)), wf->EnumWarpAdapter(IID_PPV_ARGS(&wa));
+            if (FAILED(D3D12CreateDevice(wa.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  no WARP\n"), false;
         }
         if (!d && FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return false;
         if (SUCCEEDED(d.As(&info)))
@@ -920,7 +927,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) return puts("ngx_harness DLL [--minimal] [--soak N] [d3d12|vulkan]"), 2;
-    if (!getenv("NFRUX_ASYNC_TEST")) _putenv_s("NFRUX_SYNC_CREATE", "1");  // every frame counted on; else the worker thread's path
+    if (!getenv("NFRUX_ASYNC_TEST")) SetEnvironmentVariableA("NFRUX_SYNC_CREATE", "1");  // every frame counted on; else the worker thread's path
     HMODULE dll = LoadLibraryExA(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) return printf("cannot load %s\n", argv[1]), 2;
     bool minimal = false;

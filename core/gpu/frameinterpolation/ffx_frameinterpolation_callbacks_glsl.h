@@ -90,7 +90,7 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxFloat32x2 _OfInputSizeRcp;
     FfxFloat32   _DepthClipScale;
     FfxFloat32   _DepthClipPower;
-    FfxUInt32    _Options;  // DeckyUpscaler: UI kind (bits 0-7), no-warp mask (0x100), orthographic camera (0x200), the
+    FfxUInt32    _Options;  // UI kind (bits 0-7), no-warp mask (0x100), orthographic camera (0x200), the
                             // warp's timestep-free outputs already written by the batch's first frame (0x400)
 }
 cbFI;
@@ -260,7 +260,7 @@ FfxBoolean IsOrthographic()
     return (cbFI._Options & 0x200u) != 0u;
 }
 
-// DeckyUpscaler: a batch's frames after the first skip the warp's stores of the next depth and the TP1 mask (the first
+// a batch's frames after the first skip the warp's stores of the next depth and the TP1 mask (the first
 // writes them; the same values for every timestep).
 FfxBoolean WarpSharedOutputsWritten()
 {
@@ -447,7 +447,7 @@ FFX_MIN16_F3 SamplePreviousBackbuffer(FFX_PARAMETER_IN FfxFloat32x2 fUv)
 #endif
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
-// DeckyUpscaler: the current frame with its UI, when the interpolation sources are the frames without it (HUD-less):
+// the current frame with its UI, when the interpolation sources are the frames without it (HUD-less):
 // the postprocess takes its pixels where the UI is drawn. The current interpolation source itself when there is none.
 layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE) uniform mediump texture2D r_ui_source;
 

@@ -48,7 +48,7 @@ float2 CroppedNetworkParamsUV(float2 uv)
     return (params_pixel + 0.5f) * ParamsLaneSizeRcp();
 }
 
-// DeckyUpscaler: DLSS-G's UI tests decide per block of this
+// DLSS-G's UI tests decide per block of this
 // many pixels square (it has 2 and 4): a pixel is UI when any pixel of its block is.
 #ifndef FFX_FRAMEINTERPOLATION_UI_BLOCK
 #define FFX_FRAMEINTERPOLATION_UI_BLOCK 2
@@ -152,7 +152,7 @@ void postprocess(int32_t2 output_pixel)
         rgb_t                = ffxLerp(rgb_t, inpaint.rgb, inpaint.a * gate);
     }
 
-    // DeckyUpscaler: the game's no-warp mask and its UI over the interpolated frame (as the v1 composite).
+    // the game's no-warp mask and its UI over the interpolated frame (as the v1 composite).
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_NO_WARP_MASK
     // Pixels the game marks not to warp (DLSS-G's no-warp mask): the current frame's, any UI composited over them.
     if (HasNoWarpMask() && LoadNoWarp(output_pixel))

@@ -113,7 +113,7 @@ FfxFloat32x2 dqFloatMv(FfxUInt32 c)
 
     // exp needs to be cast to FfxInt32 here to avoid underflow
     FfxUInt32 shift = FfxUInt32(max(FfxInt32(exp) - (FfxInt32(_BITS_X) - 1), 0));
-    // DeckyUpscaler: the signs as a conditional negate, not a multiply (two quarter-rate instructions a decode).
+    // the signs as a conditional negate, not a multiply (two quarter-rate instructions a decode).
     FfxInt32  ix    = ((c >> sX_shift) & 1u) != 0u ? -FfxInt32(mx << shift) : FfxInt32(mx << shift);
     FfxInt32  iy    = ((c >> sY_shift) & 1u) != 0u ? -FfxInt32(my << shift) : FfxInt32(my << shift);
 

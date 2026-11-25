@@ -92,7 +92,7 @@ namespace ffx_ml
         uint32_t subgroupSize = 0;   // subgroup size the kernel is built for
         bool     requireSubgroupSize = false;
         uint32_t workgroupSize = 0;  // threads per workgroup (dot4 / scalar)
-        bool     dot4Tiled     = false;  // dot4 path: register-tiled kernel (see VendorTuning in ffx_vk_ml_runtime.cpp)
+        bool     dot4Tiled     = false;  // dot4 path: register-tiled kernel (see VendorTuning in vulkan_network.cpp)
         bool     rescaleFloat  = false;  // tiled dot4: fp32 requantisation, NOT BIT EXACT (FFX_ML_RESCALE_FLOAT=1 everywhere)
         std::string deviceName;
 

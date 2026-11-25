@@ -146,7 +146,7 @@ float LoadDilatedDepthAndMotion3x3(int32_t2          pos,
 #else
         int32_t use_tap = int32_t(1.0f - step(best_depth, sample_depth));
 #endif
-        best_sample_pos   = use_tap != 0 ? sample_positions[iSampleIndex] : best_sample_pos;  // DeckyUpscaler: a select (use_tap is 0 or 1), not 16 multiplies
+        best_sample_pos   = use_tap != 0 ? sample_positions[iSampleIndex] : best_sample_pos;  // a select (use_tap is 0 or 1), not 16 multiplies
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH
         best_depth = max(best_depth, sample_depth);
 #else
@@ -178,7 +178,7 @@ float dynamic_mask(float2 a, float2 b, float abs_eps, float q_margin, float rel_
 void WriteDynamicMask(int32_t2 output_pixel, uint32_t value)
 {
     float mask = value > uint32_t(0) ? 1.0f : 0.0f;
-    if (!WarpSharedOutputsWritten())  // DeckyUpscaler
+    if (!WarpSharedOutputsWritten())
         StoreDynamicMaskTp1(output_pixel, mask);
 }
 
@@ -245,7 +245,7 @@ void warp_flow(int32_t2 output_pixel)
     );
     // Write downsampled depth to depth_tm1_next BEFORE normalising (raw device depth)
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_MANAGE_PREVIOUS_DEPTH
-    if (!WarpSharedOutputsWritten())  // DeckyUpscaler
+    if (!WarpSharedOutputsWritten())
         StoreDepthTm1Next(output_pixel, FfxFloat32(depth_p1));
 #endif
 

@@ -221,7 +221,7 @@ bool Interpolator::Impl::Create(std::string* error)
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
-    NFRUX_PASS(match, kOfArmMatchShared) NFRUX_PASS(median, kOfArmMedian) NFRUX_PASS(bilateral, kOfArmBilateralShared)
+    NFRUX_PASS(match, kOfArmMatch) NFRUX_PASS(median, kOfArmMedian) NFRUX_PASS(bilateral, kOfArmBilateral)
     level[0] = ofInput;
     int32_t rows = 0;
     for (uint32_t l = 1; l < 6; ++l)

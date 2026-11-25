@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// DeckyUpscaler: Arm's 02 downsample (ffx_frameinterpolation_02_downsample_all_input_pass_fs.glsl) as a compute pass:
+// Arm's 02 downsample (ffx_frameinterpolation_02_downsample_all_input_pass_fs.glsl) as a compute pass:
 // the colour, depth and motion at the preprocess lane (depth/motion at 540 rows or more), stored as UAVs.
 #version 460
 #extension GL_EXT_shader_8bit_storage : require

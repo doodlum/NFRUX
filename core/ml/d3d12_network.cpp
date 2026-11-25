@@ -99,7 +99,7 @@ std::unique_ptr<D3D12Graph> D3D12Graph::Create(ID3D12Device* device, const ffx_m
         const bool two = fc.sources.size() == 2;
         const std::string at = " (layer " + std::to_string(li) + ")";
         const int  ic0 = t0.channelStride / 4, ic1 = two ? g.tensors[fc.sources[1].tensor].channelStride / 4 : 0;
-        // What nfrux_conv.hlsl implements; anything else is refused, not run inexactly.
+        // What conv2d.hlsl implements; anything else is refused, not run inexactly.
         bool ok = fc.sources.size() <= 2 && c.kernelH == c.kernelW && c.stride[0] == c.stride[1] && c.dilation[0] == 1 && c.dilation[1] == 1 &&
                   c.weightZp == 0 && r.scale32 && !r.doubleRound && r.rescaleInZp == 0 && t0.c % 4 == 0 && t0.c == t0.channelStride &&
                   dst.channelStride % 4 == 0 && (!two || (!fc.sources[1].resize && g.tensors[fc.sources[1].tensor].c % 4 == 0 &&

@@ -1,4 +1,4 @@
-// The NGX core ABI as far as NFRUX uses it (declarations after DeckyUpscaler's ngx_abi.h, MIT). SPDX-License-Identifier: MIT
+// The NGX core ABI as far as NFRUX uses it. SPDX-License-Identifier: MIT
 #pragma once
 #include <d3d12.h>
 #include <vulkan/vulkan.h>

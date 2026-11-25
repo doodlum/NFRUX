@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// DeckyUpscaler: Arm's 03 downsample (ffx_frameinterpolation_03_downsample_colour_pass_fs.glsl) as a compute pass: the
+// Arm's 03 downsample (ffx_frameinterpolation_03_downsample_colour_pass_fs.glsl) as a compute pass: the
 // colour at the preprocess lane (the render size below 540 rows), at each output pixel's nearest depth.
 #version 460
 #extension GL_EXT_shader_8bit_storage : require

@@ -1,6 +1,6 @@
 // An interpolated frame put back where the game's frame is: distorted again (out(d) = interpolated(d + RG(d))), the no-warp
 // mask and the UI over it, inside the generated region; the frame as it is around it. The UI rules are the postprocess pass's.
-// After DeckyUpscaler's distortion_compose.comp. SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : enable

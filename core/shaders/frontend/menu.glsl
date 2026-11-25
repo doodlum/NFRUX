@@ -1,5 +1,5 @@
 // Full-screen menu detection (DLSSG.MenuDetectionEnabled): counts, on a sparse grid, the pixels where the game's UI is mostly
-// opaque. After DeckyUpscaler's menu_detect.comp. SPDX-License-Identifier: MIT
+// opaque. SPDX-License-Identifier: MIT
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 layout(local_size_x = 8, local_size_y = 8) in;

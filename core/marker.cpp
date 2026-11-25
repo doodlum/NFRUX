@@ -48,6 +48,6 @@ bool MarkerBegin(const std::string& rung)
 }
 void MarkerOk(const std::string& rung)
 {
-    if (const std::string p = Path(rung); !p.empty()) DeleteFileA(p.c_str());
+    if (const std::string p = Path(rung); !p.empty()) DeleteFileA(p.c_str()), RemoveDirectoryA(p.substr(0, p.rfind('\\')).c_str());  // (only when empty)
 }
 }  // namespace nfrux

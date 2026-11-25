@@ -1,6 +1,6 @@
-// The network on D3D12 compute (nfrux_conv.hlsl), exact integer results. SPDX-License-Identifier: MIT
+// The network on D3D12 compute (conv2d.hlsl), exact integer results. SPDX-License-Identifier: MIT
 #pragma once
-#include "ffx_vk_ml_graph.h"
+#include "tosa_graph.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>

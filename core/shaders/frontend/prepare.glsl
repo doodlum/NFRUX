@@ -1,6 +1,6 @@
 // The frame to interpolate out of a host image: its region, and with a distortion field (DLSSG.BidirectionalDistortionField)
 // taken to the undistorted space depth and motion vectors are in: at an undistorted position u the field's BA is the offset to
-// the distorted one. After DeckyUpscaler's distortion_undistort.comp. SPDX-License-Identifier: MIT
+// the distorted one. SPDX-License-Identifier: MIT
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : enable

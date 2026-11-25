@@ -2,7 +2,7 @@
 //   parity [--size WxH] [--render WxH] [--frames N] [--gen N] [--dump DIR] [backend ...]   backends: d3d12 vulkan
 // SPDX-License-Identifier: MIT
 #include "../core/interpolator.h"
-#include "../core/ml/ffx_vk_ml_runtime.h"
+#include "../core/ml/vulkan_network.h"
 #include "rhi_nri.h"
 
 #include <d3d12.h>

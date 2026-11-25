@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Neural Graphics SDK universal contributors
 // SPDX-License-Identifier: MIT
 
-#include "ffx_vk_ml_graph.h"
+#include "tosa_graph.h"
 
 #include <algorithm>
 #include <functional>

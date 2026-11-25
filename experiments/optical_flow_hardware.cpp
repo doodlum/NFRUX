@@ -1,5 +1,5 @@
 // A12 spike: NVIDIA's optical flow hardware (VK_NV_optical_flow) on pairs of luma images, offline.
-//   nvof_spike W H COUNT DIR     DIR\a<i>.bin, DIR\b<i>.bin (R8) -> DIR\f<i>.bin (int16 x 2, 1/32 pixel, 4x4 grid, a to b)
+//   optical_flow_hardware W H COUNT DIR     DIR\a<i>.bin, DIR\b<i>.bin (R8) -> DIR\f<i>.bin (int16 x 2, 1/32 pixel, 4x4 grid, a to b)
 // SPDX-License-Identifier: MIT
 #include <vulkan/vulkan.h>
 #include <algorithm>

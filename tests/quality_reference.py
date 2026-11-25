@@ -60,6 +60,7 @@ def ours(w, h, n):
 
 
 acc, nets = {}, {}
+where = []
 def add(who, n, seq, v): acc.setdefault(who, {}).setdefault(f"{n}x", []).append(v)
 first = True
 for info in cfg.infos:
@@ -81,6 +82,7 @@ for info in cfg.infos:
                     SIGN = sg; export(info, p1)
                     best.append((np.mean([psnr(f[None, :, y0:y0 + ch, x0:x0 + cw], g) for f, g in zip(ours(w, h, n), gt)]), sg))
                 print("motion vector sign", best, flush=True); SIGN = max(best)[1]; export(info, p1); first = False
+            where += [(n, info.path.stem, p1, k) for k in range(n - 1)]
             for f, g in zip(ours(w, h, n), gt): add("nfrux", n, info, psnr(f[None, :, y0:y0 + ch, x0:x0 + cw], g))
             with torch.no_grad():
                 st = build_state(d, fe, dev)
@@ -95,6 +97,9 @@ for info in cfg.infos:
 for k in sorted(acc["nfrux"]):  # the gap to torch by which generated frame
     n = int(k[0]); a, b = np.array(acc["nfrux"][k]).reshape(-1, n - 1), np.array(acc["torch"][k]).reshape(-1, n - 1)
     print("worst frame gap", k, round(float((a - b).min()), 2)); print("gap by frame", k, np.round((a - b).mean(0), 2), "median", np.round(np.median(a - b, 0), 2))
+for k in sorted(acc["nfrux"]):
+    at = [x for x in where if f"{x[0]}x" == k]; g = np.array(acc["nfrux"][k]) - np.array(acc["torch"][k])
+    for i in np.argsort(g)[:3]: print("worst", k, at[i], "gap", round(float(g[i]), 2), "torch", round(acc["torch"][k][i], 2), "nfrux", round(acc["nfrux"][k][i], 2))
 hard = {}
 for k in acc["nfrux"]:
     m = np.array(acc["torch"][k]) < 45

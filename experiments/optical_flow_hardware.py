@@ -23,7 +23,7 @@ for i, (info, p1, n) in enumerate(items):
     for k, key in (("a", "rgb_m1"), ("b", "rgb_p1")):
         ((d[key].clamp(0, 1) * lum).sum(0) * 255 + 0.5).clamp(0, 255).byte().numpy().tofile(D / f"{k}{i}.bin")
 for lv in ("1", "2"):
-    print(subprocess.run([r"C:\dev\NFRUX\build\Release\nvof_spike.exe", "1280", "720", str(len(items)), str(D)], capture_output=True, text=True, env=dict(os.environ, NVOF_LEVEL=lv)).stdout)
+    print(subprocess.run([r"C:\dev\NFRUX\build\Release\optical_flow_hardware.exe", "1280", "720", str(len(items)), str(D)], capture_output=True, text=True, env=dict(os.environ, NVOF_LEVEL=lv)).stdout)
     acc = {}
     for i, (info, p1, n) in enumerate(items):
         d = load_sample(info, p1, [k * info.step // n for k in range(1, n)], random.Random(0), cfg)

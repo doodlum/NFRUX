@@ -30,12 +30,11 @@ HIST, NOHIST = [f"-D{P}MANAGE_PREVIOUS_COLOR=1"], [f"-D{P}MANAGE_PREVIOUS_COLOR=
 fmt = lambda f: [f"-DOUTPUT_IMG_FORMAT={f}"]
 of_ = "shaders/opticalflow/ffx_opticalflow"
 fi_ = "shaders/frameinterpolation/ffx_frameinterpolation"
-dk_ = "shaders/deck/ffx_"
 # name, source, defines, inversion define, D3D12 shader model
 passes = []
 for n, s in [("kOfMvHints", of_ + "_mv_hints"), ("kOfArmPyramid", of_ + "_arm_pyramid"), ("kOfArmWarp", of_ + "_arm_warp"),
-             ("kOfArmMatchShared", dk_ + "opticalflow_arm_match_shared"), ("kOfArmMedian", of_ + "_arm_median"),
-             ("kOfArmBilateralShared", dk_ + "opticalflow_arm_bilateral_shared")]:
+             ("kOfArmMatch", of_ + "_arm_match"), ("kOfArmMedian", of_ + "_arm_median"),
+             ("kOfArmBilateral", of_ + "_arm_bilateral")]:
     passes.append((n, s, OF, "DEPTH_INVERTED", 60))
 INV = P + "INVERTED_DEPTH"
 D = FI + HIST
@@ -54,7 +53,7 @@ for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
     passes.append((n, s, d, INV, 60))
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:  # lanes in the colour's format
     for n, s in [("kFiDownsampleOf", "01_downsample_of_colour"), ("kFiDownsampleAll", "02_downsample_all_input"), ("kFiDownsampleColour", "03_downsample_colour")]:
-        passes.append((n + suffix, dk_ + f"frameinterpolation_{s}_pass", D + fmt(f), INV, 60))
+        passes.append((n + suffix, fi_ + f"_{s}_pass", D + fmt(f), INV, 60))
 for n, f in [("kCropR32f", "r32f"), ("kCropRg16f", "rg16f")]:
     passes.append((n, "shaders/frontend/crop", fmt(f), "NFRUX_UNUSED", 60))
 passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("kMenu", "shaders/frontend/menu", [], "NFRUX_UNUSED", 60),
@@ -159,7 +158,7 @@ def conv(job):
     d = dict(K=k, STRIDE=s, IC0=i0, IC1=i1, OC=oc, OCB=ocb, RESIZE=rs, PERCH=pc, TABLE=tb, IMAGE=im, DOT4=dot4, PX=px, GX=8, GY=8)
     b = os.path.join(out, n + ".dxil")
     run([DXC, "-nologo", "-T", "cs_6_4" if dot4 else "cs_6_0", "-E", "main", "-O3", *[f"-D{a}={v}" for a, v in d.items()],
-         os.path.join("ml", "nfrux_conv.hlsl"), "-Fo", b])
+         os.path.join("ml", "conv2d.hlsl"), "-Fo", b])
     return l, dot4, px, ocb, n, open(b, "rb").read()
 
 
@@ -191,5 +190,5 @@ KERNELS = {"scalar": ["-DML_PATH_SCALAR=1"], "dot4": ["-DML_PATH_DOT4=1"], "dot4
            "coopmat_bf16": ["-DML_PATH_COOPMAT=1", "-DML_MAT_BF16=1"]}
 for n, d in KERNELS.items():
     run([GLSLANG, "-V", "--target-env", "vulkan1.2", "-S", "comp", *d, "--vn", "ffx_ml_conv2d_" + n,
-         "-o", os.path.join(out, f"ffx_ml_conv2d_{n}_spv.h"), os.path.join("ml", "ffx_ml_conv2d.comp")])
+         "-o", os.path.join(out, f"ffx_ml_conv2d_{n}_spv.h"), os.path.join("ml", "conv2d.comp")])
 print(f"{len(built)} shaders, {os.path.getsize(os.path.join(out, 'nfrux_shaders.h')) >> 10} KB")

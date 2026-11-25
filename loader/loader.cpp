@@ -1,7 +1,7 @@
-// NFRUX's process-local loader, a dbghelp.dll proxy: Streamline's calls to the NGX core for feature 11 (frame generation) go to NFRUX, the
+// The loader role of NFRUX's one DLL, when its file is named as a Windows DLL the game loads (dbghelp.dll, version.dll, winmm.dll): Streamline's calls to the NGX core for feature 11 (frame generation) go to NFRUX, the
 // rest to the core untouched. Nothing outside this process changes. SPDX-License-Identifier: MIT
 #include "ngx.h"
-#include "dbghelp_exports.h"
+#include "proxy_exports.h"
 #include <windows.h>
 #include <winternl.h>
 #include <atomic>
@@ -16,7 +16,7 @@
 
 static FILE* g_log;
 static std::mutex g_m;
-static void L(const char* f, ...) { std::lock_guard<std::mutex> k(g_m); if (!g_log) g_log = fopen("nfrux_loader.log", "w"); va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
+static void L(const char* f, ...) { static const bool on = getenv("NFRUX_LOG") && strcmp(getenv("NFRUX_LOG"), "0"); if (!on) return; std::lock_guard<std::mutex> k(g_m); if (!g_log && !(g_log = fopen("nfrux_loader.log", "w"))) return; va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
 
 static std::map<std::string, void*> g_real;
 static std::set<void*> g_handles;
@@ -24,27 +24,18 @@ static bool g_usedNfrux;
 
 template <class F> static F Real(const char* n) { return reinterpret_cast<F>(g_real[n]); }
 
-// NFRUX's DLL, from NFRUX\nvngx_dlssg.dll beside this one (NFRUX_DLL: another path).
+// NFRUX is this DLL (NFRUX_DLL: another one, for tests).
 static HMODULE Nfrux()
 {
     static HMODULE m = [] {
-        char path[MAX_PATH] = {};
-        if (const char* e = getenv("NFRUX_DLL")) strcpy_s(path, e);
-        else
-        {
-            HMODULE self = nullptr;
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&L, &self);
-            GetModuleFileNameA(self, path, MAX_PATH);
-            if (char* s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "NFRUX\\nvngx_dlssg.dll");
-        }
-        HMODULE x = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        g_usedNfrux = x != nullptr;
-        L("%s -> %p (%lu)", path, x, x ? 0 : GetLastError());
-        return x;
+        HMODULE self = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&L, &self);
+        if (const char* e = getenv("NFRUX_DLL")) self = LoadLibraryExA(e, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        g_usedNfrux = self != nullptr;
+        return self;
     }();
     return m;
-}
-template <class F> static F Ours(const char* n) { return Nfrux() ? reinterpret_cast<F>(GetProcAddress(Nfrux(), n)) : nullptr; }
+}template <class F> static F Ours(const char* n) { return Nfrux() ? reinterpret_cast<F>(GetProcAddress(Nfrux(), n)) : nullptr; }
 static std::mutex g_hm;
 static bool IsOurs(const NgxHandle* h) { std::lock_guard<std::mutex> k(g_hm); return g_handles.count((void*)h) != 0; }
 template <class T> static NgxResult Keep(NgxResult r, T** h) { if (r == kNgxSuccess) { std::lock_guard<std::mutex> k(g_hm); g_handles.insert(*h); } L("feature 11: %x", r); return r; }
@@ -103,7 +94,7 @@ static NgxResult __cdecl Shut12D(ID3D12Device* d) { L("D3D12 Shutdown1"); if (au
 static NgxResult __cdecl ShutVk() { L("Vulkan Shutdown"); if (auto o = Ours<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")) o(); return Real<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")(); }
 static NgxResult __cdecl ShutVkD(VkDevice d) { L("Vulkan Shutdown1"); if (auto o = Ours<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")) o(d); return Real<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")(d); }
 // --- vkCreateDevice: what the game enables, plus what NFRUX's fast paths want (DESIGN D3).
-#include "../core/ml/ffx_vk_ml_runtime.h"
+#include "../core/ml/vulkan_network.h"
 static PFN_vkCreateDevice g_createDevice;
 static uint32_t           g_ml;
 static bool               g_atomic64;
@@ -115,7 +106,8 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     auto getF = (PFN_vkGetPhysicalDeviceFeatures2)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkGetPhysicalDeviceFeatures2");
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmS = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features s13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &cmS};
-    VkPhysicalDeviceVulkan12Features s12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &s13};
+    VkPhysicalDeviceVulkan11Features s11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &s13};
+    VkPhysicalDeviceVulkan12Features s12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &s11};
     VkPhysicalDeviceFeatures2 s2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &s12};
     if (getF) getF(pd, &s2);
     // The chain as it is, with copies of the structures changed: found by type, relinked in order.
@@ -188,6 +180,10 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     VkPhysicalDevice8BitStorageFeatures st8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
     VkPhysicalDeviceShaderAtomicInt64Features at = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
     VkPhysicalDeviceShaderIntegerDotProductFeatures dot = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES};
+    VkPhysicalDevice16BitStorageFeatures st16 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+    int  has11 = 0;
+    bool float16 = false;
+    for (auto* s = (const VkBaseInStructure*)ci->pNext; s; s = s->pNext) has11 += s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES || s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (f12)
     {
@@ -207,6 +203,10 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (!has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) ext.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
         if (!fcm) chain(fcm = &cm);
         fcm->cooperativeMatrix = VK_TRUE;
+        // Where matrices are fp16 only. The 16-bit storage structure goes in when neither it nor the 1.1 aggregate is there.
+        if (f12) f12->shaderFloat16 |= s12.shaderFloat16; else f8->shaderFloat16 |= s12.shaderFloat16;
+        float16 = s12.shaderFloat16 && has11 == 0 && s11.storageBuffer16BitAccess;
+        if (float16) st16.storageBuffer16BitAccess = VK_TRUE, chain(&st16);
     }
     c.enabledExtensionCount = uint32_t(ext.size()), c.ppEnabledExtensionNames = ext.data();
     VkResult r = g_createDevice(pd, &c, a, out);
@@ -223,6 +223,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (s12.vulkanMemoryModel) ml |= FEATURE_VULKAN_MEMORY_MODEL;
         if (f13 && s13.subgroupSizeControl && s13.computeFullSubgroups) ml |= FEATURE_SUBGROUP_SIZE_CONTROL;
         if (cmS.cooperativeMatrix) ml |= FEATURE_COOPERATIVE_MATRIX;
+        if (float16) ml |= FEATURE_SHADER_FLOAT16 | FEATURE_STORAGE_BUFFER_16BIT;
     }
     g_ml = ml, g_atomic64 = false;  // not used any more
     if (r == VK_SUCCESS) g_featureDevice = *out;
@@ -311,9 +312,9 @@ struct NOTIFY { ULONG Flags; const UNICODE_STRING *Full, *Base; PVOID DllBase; U
 static wchar_t g_win[MAX_PATH]; static size_t g_winLen;
 static bool IsWindows(const UNICODE_STRING* n) { return g_winLen && n->Buffer && n->Length / 2 > g_winLen && !_wcsnicmp(n->Buffer, g_win, g_winLen); }
 static VOID CALLBACK OnDll(ULONG reason, const NOTIFY* d, PVOID) { if (reason == 1 && !IsWindows(d->Full)) { Patch((HMODULE)d->DllBase); } }
-BOOL WINAPI DllMain(HINSTANCE self, DWORD r, LPVOID)
+// From DllMain.
+void LoaderAttach(HINSTANCE self)
 {
-    if (r == DLL_PROCESS_ATTACH)
     {
         auto reg = (NTSTATUS(NTAPI*)(ULONG, void*, void*, void**))GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrRegisterDllNotification");
         void* cookie; if (reg) reg(0, (void*)OnDll, nullptr, &cookie);
@@ -326,5 +327,4 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD r, LPVOID)
             if (m->DllBase && m->DllBase != (void*)self && !IsWindows(&m->FullDllName))  Patch((HMODULE)m->DllBase);
         }
     }
-    return TRUE;
 }

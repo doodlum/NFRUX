@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 // SPDX-License-Identifier: Apache-2.0
-// DeckyUpscaler: ffx_opticalflow_arm_bilateral.glsl with its neighbourhoods read from shared memory, the same values
+// Arm's joint bilateral filter with its neighbourhoods read from shared memory, the same values
 // in the same order (so the same result): the workgroup's 12 x 12 tile of TM1's texels and the median flow, and at the
 // last level the hint-warped TP1, each loaded or computed once into shared memory, where each texel's 5x5 filter and
 // hint SAD read them 25 times (the hint's warp a bilinear sample and a hint fetch each).

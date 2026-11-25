@@ -4,7 +4,7 @@
 // Straightforward CPU evaluation of the parsed TOSA graph, operator by operator, following the TOSA 1.0 reference
 // semantics. It deliberately does not reuse the GPU lowering so it can validate the fusion as well as the kernels.
 
-#include "ffx_vk_ml_graph.h"
+#include "tosa_graph.h"
 
 #include <algorithm>
 

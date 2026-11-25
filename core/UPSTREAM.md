@@ -4,15 +4,15 @@ Frame interpolation and model: Arm Neural Graphics SDK for Game Engines v1.1.1, 
   shaders/frameinterpolation/   sdk/src/backends/vk/shaders/frameinterpolation (compute entry points)
   model/nfru_v2_int8*.h         sdk/src/backends/vk/data_graphs/nfru/nfru_v2_0_0_int8.vgf through the SDK's Model_Parser
                                 (the same file as huggingface.co/Arm/neural-frame-rate-upscaling v2/nfru_v2_int8.vgf)
-  DeckyUpscaler's changes:
+  NFRUX's changes:
     callbacks: _Options and _TensorLaneSize after the constants (UI kind, no-warp mask, orthographic; the network's lane),
                the UI source / UI alpha / no-warp mask loaders, orthographic view depth.
     30_preprocess / 50_postprocess: the tensor lane may have fewer rows than the motion lane (the network's size per
                generated frame); the postprocess's UI composite and no-warp mask after the inpainting, quads of lanes
                as 2x2 blocks.
-    shaders/deck/02, 03: the downsample passes (fragment only upstream) as compute passes.
+    shaders/frameinterpolation/01, 02, 03: the downsample passes (fragment only upstream) as compute passes.
 
 Optical flow, core headers and network runtime: Arm Neural Graphics SDK (ngsdk) at
-b0810e580ec376d866c61ae20646daeb6df01a86 (v1.1.0 with DeckyUpscaler's commits: the Arm optical flow engine's flow
+b0810e580ec376d866c61ae20646daeb6df01a86 (v1.1.0 with additional commits: the Arm optical flow engine's flow
 emulated in compute), MIT:
   gpu/ (ffx_core*, opticalflow), shaders/opticalflow, ml/
