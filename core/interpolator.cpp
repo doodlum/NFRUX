@@ -67,16 +67,6 @@ struct MvHintsConstants
     int32_t mv_depth_dims[2];  // SDK 1.1.1: the motion lane, whose pixels the warp (pass 10) represents each hint by
     float   inv_mv_depth_dims[2];
 };
-struct ScatterConstants
-{
-    float   motion_vector_scale[2];
-    int32_t output_dims[2];
-    int32_t motion_vector_dims[2];
-    int32_t depth_dims[2];
-    int32_t depth_inverted;
-    int32_t pad;
-    int32_t display_dims[2];
-};
 struct ImageConstants
 {
     int32_t  level_dims[2];
@@ -164,16 +154,15 @@ struct Interpolator::Impl
 {
     Device&  dev;
     Settings s;
-    Dims     display, render, of, mvLane, flowLane, graph;
+    Dims     display, render, ofInput, of, mvLane, flowLane, graph;
     bool     allInput = false, colourDown = false, bytes = false;
     FiConstants c = {};
     float    lastVP[16] = {};
-    PassPtr  initWarp, downAll, downColour, warp, warpTm1, fillTm1, preprocess, preprocess8, inpaintSeed, inpaintMip, inpaint, post;
-    PassPtr  mvHints, scatter64, scatterDepth, scatterFlow, resolve, pyramidP, flowWarp, match, median, bilateral;
-    Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion;
+    PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post;
+    PassPtr  mvHints, pyramidP, flowWarp, match, median, bilateral;
+    Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion, ofColour;
     Tex      computedMv, flow, flowHint, pyramid[2], fWarp, fMatch, fSub, fMed, fFlow;
-    std::unique_ptr<Buffer> keys;
-    bool     keysFilled = false, pyramidValid = false;
+    bool     pyramidValid = false;
     uint32_t dynCur = 0, depthCur = 0, prepCur = 0, pyrCur = 0;
     uint64_t frame = 0;
     Dims     level[6];
@@ -198,21 +187,30 @@ bool Interpolator::Impl::Create(std::string* error)
     render  = {s.renderWidth, s.renderHeight};
     if (!display.width || !display.height || !render.width || !render.height || display.width > 3840 || display.height > 2160)
         return fail("unsupported size");
-    of = {(display.width + 3) / 4, (display.height + 3) / 4};
     const double aspect = double(display.width) / double(display.height);
+    ofInput = display.height > 1080 ? Dims{RoundPositive(1080 * aspect), 1080} : display;  // the SDK's resolution plan
+    of      = {(ofInput.width + 3) / 4, (ofInput.height + 3) / 4};
     const bool   fixed  = render.height >= kMvDepthLaneMaxHeight;
     mvLane              = fixed ? Dims{RoundPositive(kMvDepthLaneMaxHeight * aspect), kMvDepthLaneMaxHeight} : render;
     const float depthPerLane = float(render.height) / float(kMvDepthLaneMaxHeight), colourScale = float(display.height) / float(mvLane.height);
     allInput   = fixed && depthPerLane >= 1.5f;
     colourDown = depthPerLane < 1.5f && colourScale >= 1.5f;
-    const uint32_t flowRows = std::max(std::min(display.height, 1080u) / 4u, 1u);
+    const uint32_t flowRows = std::max(ofInput.height / 4u, 1u);
     flowLane = {RoundPositive(double(flowRows) * aspect), flowRows};
     graph    = {(mvLane.width + 7) / 8 * 8, (mvLane.height + 7) / 8 * 8};
     bytes    = s.outputFormat == Format::RGBA8Unorm || s.outputFormat == Format::BGRA8Unorm || s.outputFormat == Format::RGB10A2Unorm;
 
     NFRUX_PASS(initWarp, kFiInitWarp)
-    if (bytes) { NFRUX_PASS(downAll, kFiDownsampleAll8) NFRUX_PASS(downColour, kFiDownsampleColour8) }
-    else { NFRUX_PASS(downAll, kFiDownsampleAll) NFRUX_PASS(downColour, kFiDownsampleColour) }
+    Format lane = s.outputFormat == Format::BGRA8Unorm ? Format::RGBA8Unorm : s.outputFormat;
+#define NFRUX_LANE(suffix) { NFRUX_PASS(downOf, kFiDownsampleOf##suffix) NFRUX_PASS(downAll, kFiDownsampleAll##suffix) NFRUX_PASS(downColour, kFiDownsampleColour##suffix) }
+    switch (lane)
+    {
+    case Format::RGBA8Unorm: NFRUX_LANE(Rgba8) break;
+    case Format::RGB10A2Unorm: NFRUX_LANE(Rgb10a2) break;
+    case Format::RGBA16Float: NFRUX_LANE(Rgba16f) break;
+    case Format::RG11B10Float: NFRUX_LANE(R11) break;
+    default: return fail("unsupported output format");
+    }
     NFRUX_PASS(warp, kFiWarpFlow) NFRUX_PASS(warpTm1, kFiWarpFlowTm1) NFRUX_PASS(fillTm1, kFiFillHolesTm1) NFRUX_PASS(preprocess, kFiPreprocess)
     NFRUX_PASS(inpaintSeed, kFiInpaintSeed) NFRUX_PASS(inpaintMip, kFiInpaintMip) NFRUX_PASS(inpaint, kFiInpaint)
     switch (s.outputFormat)
@@ -223,14 +221,9 @@ bool Interpolator::Impl::Create(std::string* error)
     case Format::RG11B10Float: NFRUX_PASS(post, kFiPostprocessNoHistoryR11) break;
     default: return fail("unsupported output format");
     }
-    NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(resolve, kOfScatterResolve) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
+    NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
     NFRUX_PASS(match, kOfArmMatchShared) NFRUX_PASS(median, kOfArmMedian) NFRUX_PASS(bilateral, kOfArmBilateralShared)
-    const char* scatter = Env("NFRUX_SCATTER");
-    if (dev.caps().atomic64 && !(scatter && !strcmp(scatter, "32")))
-        MakePass(scatter64, shaders::kOfScatter64, shaders::kOfScatter64Inv);
-    if (!scatter64) { NFRUX_PASS(scatterDepth, kOfScatterDepth) NFRUX_PASS(scatterFlow, kOfScatterFlow) }
-
-    level[0] = display;
+    level[0] = ofInput;
     int32_t rows = 0;
     for (uint32_t l = 1; l < 6; ++l)
     {
@@ -244,14 +237,14 @@ bool Interpolator::Impl::Create(std::string* error)
     for (auto& t : depthTm1) tex(t, Format::R32Float, mvLane);
     for (auto& t : colorTm1) ok = ok && (t = dev.CreateTextureLike(s.colorLike, display.width, display.height));
     if (allInput || colourDown)
-        for (auto& t : prep) tex(t, bytes ? Format::RGBA8Unorm : Format::RGBA16Float, mvLane);
+        for (auto& t : prep) tex(t, lane, mvLane);
+    if (display.height > 1080) tex(ofColour, lane, ofInput);
     if (allInput) tex(reducedMotion, Format::RG16Float, mvLane);
     tex(computedMv, Format::RG16Float, of), tex(flow, Format::RG16Float, of), tex(flowHint, Format::RG16Float, of);
     for (auto& t : pyramid) tex(t, Format::R8Unorm, {level[1].width, uint32_t(rows)});
     tex(fWarp, Format::R8Unorm, level[2]), tex(fMatch, Format::R32Uint, level[2]);
     tex(fSub, Format::RG16Float, level[2]), tex(fMed, Format::RG16Float, level[2]), tex(fFlow, Format::RG16Float, level[2]);
-    keys = dev.CreateBuffer(uint64_t(of.width) * of.height * 8);
-    if (!ok || !keys)
+    if (!ok)
         return fail("out of memory");
 
     FiConstants& k = c;
@@ -262,7 +255,7 @@ bool Interpolator::Impl::Create(std::string* error)
     k._MvDepthLaneSizeRcp[0] = 1.0f / mvLane.width, k._MvDepthLaneSizeRcp[1] = 1.0f / mvLane.height;
     k._FlowLaneSize[0] = int32_t(flowLane.width), k._FlowLaneSize[1] = int32_t(flowLane.height);
     k._FlowLaneSizeRcp[0] = 1.0f / flowLane.width, k._FlowLaneSizeRcp[1] = 1.0f / flowLane.height;
-    k._OfInputSizeRcp[0] = 1.0f / display.width, k._OfInputSizeRcp[1] = 1.0f / display.height;
+    k._OfInputSizeRcp[0] = 1.0f / ofInput.width, k._OfInputSizeRcp[1] = 1.0f / ofInput.height;
     k._InputTensorSize[0] = int32_t(graph.width), k._InputTensorSize[1] = int32_t(graph.height);
     k._ParamsLaneSizeRcp[0] = 2.0f / graph.width, k._ParamsLaneSizeRcp[1] = 2.0f / graph.height;
     // The model's quantisation (nfru_mfg_v14_int8_metadata.json).
@@ -306,7 +299,7 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
     h.output_dims[0] = int32_t(of.width), h.output_dims[1] = int32_t(of.height);
     h.depth_size[0] = int32_t(depthPrev.width), h.depth_size[1] = int32_t(depthPrev.height);
     h.depth_size_rcp[0] = 1.0f / depthPrev.width, h.depth_size_rcp[1] = 1.0f / depthPrev.height;
-    h.color_size[0] = int32_t(display.width), h.color_size[1] = int32_t(display.height);
+    h.color_size[0] = int32_t(ofInput.width), h.color_size[1] = int32_t(ofInput.height);
     h.mv_depth_dims[0] = int32_t(mvLane.width), h.mv_depth_dims[1] = int32_t(mvLane.height);
     h.inv_mv_depth_dims[0] = 1.0f / mvLane.width, h.inv_mv_depth_dims[1] = 1.0f / mvLane.height;
     float invPrev[16];
@@ -317,27 +310,9 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
         if (!mvHints->Dispatch(b, 3, Groups(of.width, 16), Groups(of.height, 16))) return false;
     }
     dev.CopyTexture(*computedMv, *flow);
-    if (!reset)
-    {
-        if (!keysFilled)
-            dev.Fill(*keys, 0xffffffffu), keysFilled = true;
-        ScatterConstants k = {};
-        k.motion_vector_scale[0] = in.mvScale[0], k.motion_vector_scale[1] = in.mvScale[1];
-        k.output_dims[0] = int32_t(of.width), k.output_dims[1] = int32_t(of.height);
-        k.motion_vector_dims[0] = int32_t(mv.width), k.motion_vector_dims[1] = int32_t(mv.height);
-        k.depth_dims[0] = int32_t(depth.width), k.depth_dims[1] = int32_t(depth.height);
-        k.depth_inverted = s.depthInverted ? 1 : 0;
-        k.display_dims[0] = int32_t(display.width), k.display_dims[1] = int32_t(display.height);
-        const Bind sb[] = {Bind::Data(0, &k, sizeof(k)), Bind::Tex(1, mv), Bind::Tex(2, depth), Bind::Buf(3, *keys)};
-        const uint32_t gx = Groups(mv.width, 32), gy = Groups(mv.height, 32);
-        if (scatter64 ? !scatter64->Dispatch(sb, 4, gx, gy) : (!scatterDepth->Dispatch(sb, 4, gx, gy) || !scatterFlow->Dispatch(sb, 4, gx, gy)))
-            return false;
-        const Bind rb[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *keys), Bind::Tex(2, *flow)};
-        if (!resolve->Dispatch(rb, 3, Groups(of.width), Groups(of.height))) return false;
-    }
     const Texture &p1 = *pyramid[pyrCur], &m1 = *pyramid[pyrCur ^ 1];
     ImageConstants ic = {};
-    ic.src_dims[0] = int32_t(display.width), ic.src_dims[1] = int32_t(display.height);
+    ic.src_dims[0] = int32_t(ofInput.width), ic.src_dims[1] = int32_t(ofInput.height);
     ic.hint_dims[0] = int32_t(of.width), ic.hint_dims[1] = int32_t(of.height);
     ic.unorm8 = s.outputFormat == Format::RGBA8Unorm || s.outputFormat == Format::BGRA8Unorm;
     for (int32_t l = 1; l < 6; ++l)
@@ -410,12 +385,19 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         k._DepthClipPower = 1.0f + 2.0f * std::min(diagonal / reference, 1.0f);
     }
     k._Reset = reset ? 1 : 0;
-    const bool down = allInput || colourDown, byteLane = false;
-    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) |
-                             (byteLane ? 0x800u : 0u) | (s.swapRB ? 0x1000u : 0u) |
+    const bool down = allInput || colourDown;
+    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u) |
                              (in.scrgb ? 0x2000u : 0u);
 
-    if (!Flow(in, color, depth, mv, reset))
+    if (ofColour)
+    {
+        FiConstants o = k;  // its own: RenderSize is the output's there
+        o._RenderSize[0] = int32_t(ofInput.width), o._RenderSize[1] = int32_t(ofInput.height);
+        const Bind b[] = {Bind::Tex(0, color), Bind::Tex(1, *ofColour), Bind::Data(2, &o, sizeof(o))};
+        if (!downOf->Dispatch(b, 3, Groups(ofInput.width, kFiGroup), Groups(ofInput.height, kFiGroup))) return false;
+    }
+    const Texture& flowColour = ofColour ? *ofColour : color;
+    if (!Flow(in, flowColour, depth, mv, reset))
         return false;
     memcpy(lastVP, in.viewProjection, sizeof(lastVP));
 
@@ -427,7 +409,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     if (reset)
         count = 1, total = 1;
     auto set = [&](uint32_t i) { k._Timestep = float(i + 1) / float(total + 1), k._Options = options | (i ? 0x400u : 0u); };
-    const Bind downB[] = {Bind::Tex(0, color), Bind::Tex(1, depth), Bind::Tex(2, mv), Bind::Tex(3, down ? prepP1 : color), Bind::Tex(4, dNext),
+    const Bind downB[] = {Bind::Tex(0, flowColour), Bind::Tex(1, depth), Bind::Tex(2, mv), Bind::Tex(3, down ? prepP1 : color), Bind::Tex(4, dNext),
                           Bind::Tex(5, allInput ? *reducedMotion : dNext), Bind::Data(6, &k, sizeof(k))};
     auto warpRun = [&](uint32_t i) {
         const Out& o = outs[i];
@@ -471,9 +453,8 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         set(i);
         const Out& o = outs[i];
         const Bind b[] = {Bind::Tex(0, *o.qMotionTp1), Bind::Tex(1, *o.filledFlowTm1), Bind::Tex(2, prepM1), Bind::Tex(3, prepP1), Bind::Tex(4, dNext), Bind::Tex(5, dTm1),
-                          Bind::Buf(8, *o.net->input), Bind::Tex(10, *o.seed), Bind::Data(9, &k, sizeof(k)),
-                          byteLane ? Bind::Uint(6, prepM1) : Bind::Tex(6, *o.qMotionTp1), byteLane ? Bind::Uint(7, prepP1) : Bind::Tex(7, *o.qMotionTp1)};
-        if (!(byteLane ? *preprocess8 : *preprocess).Dispatch(b, 11, Groups(graph.width, 32), Groups(graph.height, 16))) return false;
+                          Bind::Buf(8, *o.net->input), Bind::Tex(10, *o.seed), Bind::Data(9, &k, sizeof(k))};
+        if (!preprocess->Dispatch(b, 9, Groups(graph.width, 32), Groups(graph.height, 16))) return false;
     }
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -523,8 +504,8 @@ std::unique_ptr<Interpolator> Interpolator::Create(Device& device, const Setting
     if (!it->m->Create(error))
         return nullptr;
     const Impl& m = *it->m;
-    Log("interpolator %ux%u, render %ux%u, motion lane %ux%u, network %ux%u, scatter %s", m.display.width, m.display.height, m.render.width, m.render.height,
-        m.mvLane.width, m.mvLane.height, m.graph.width, m.graph.height, m.scatter64 ? "64-bit" : "32-bit");
+    Log("interpolator %ux%u, render %ux%u, motion lane %ux%u, network %ux%u", m.display.width, m.display.height, m.render.width, m.render.height,
+        m.mvLane.width, m.mvLane.height, m.graph.width, m.graph.height);
     return it;
 }
 Interpolator::~Interpolator() = default;

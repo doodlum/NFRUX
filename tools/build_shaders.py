@@ -33,14 +33,10 @@ fi_ = "shaders/frameinterpolation/ffx_frameinterpolation"
 dk_ = "shaders/deck/ffx_"
 # name, source, defines, inversion define, D3D12 shader model
 passes = []
-for n, s, sm in [("kOfMvHints", of_ + "_mv_hints", 60), ("kOfScatter64", of_ + "_scatter", 66), ("kOfScatterDepth", of_ + "_scatter", 60),
-                 ("kOfScatterFlow", of_ + "_scatter", 60), ("kOfScatterResolve", of_ + "_scatter_resolve", 60),
-                 ("kOfArmPyramid", of_ + "_arm_pyramid", 60), ("kOfArmWarp", of_ + "_arm_warp", 60), ("kOfArmMatch", of_ + "_arm_match", 60),
-                 ("kOfArmMatchShared", dk_ + "opticalflow_arm_match_shared", 60),
-                 ("kOfArmMedian", of_ + "_arm_median", 60), ("kOfArmBilateral", of_ + "_arm_bilateral", 60),
-                 ("kOfArmBilateralShared", dk_ + "opticalflow_arm_bilateral_shared", 60)]:
-    stage = {"kOfScatterDepth": ["-DSCATTER_STAGE=1"], "kOfScatterFlow": ["-DSCATTER_STAGE=2"]}.get(n, [])
-    passes.append((n, s, OF + stage, "DEPTH_INVERTED", sm))
+for n, s in [("kOfMvHints", of_ + "_mv_hints"), ("kOfArmPyramid", of_ + "_arm_pyramid"), ("kOfArmWarp", of_ + "_arm_warp"),
+             ("kOfArmMatchShared", dk_ + "opticalflow_arm_match_shared"), ("kOfArmMedian", of_ + "_arm_median"),
+             ("kOfArmBilateralShared", dk_ + "opticalflow_arm_bilateral_shared")]:
+    passes.append((n, s, OF, "DEPTH_INVERTED", 60))
 INV = P + "INVERTED_DEPTH"
 D = FI + HIST
 # Full precision in the source, for both APIs: the 16-bit float types are 32-bit (and no pass may declare 8- or 16-bit types).
@@ -48,21 +44,17 @@ F32 = ["-Dfloat16_t=float", "-Df16vec2=vec2", "-Df16vec3=vec3", "-Df16vec4=vec4"
 BANNED = {9: "Float16", 22: "Int16", 39: "Int8", **{c: "a group operation" for c in (18, *range(61, 69), 4423, 4431)},
           **{c: "8/16-bit storage" for c in (4433, 4434, 4435, 4436, 4448, 4449, 4450)}}
 for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
-                ("kFiDownsampleAll", dk_ + "frameinterpolation_02_downsample_all_input_pass", D + fmt("rgba16f")),
-                ("kFiDownsampleColour", dk_ + "frameinterpolation_03_downsample_colour_pass", D + fmt("rgba16f")),
-                ("kFiDownsampleAll8", dk_ + "frameinterpolation_02_downsample_all_input_pass", D + fmt("rgba8")),
-                ("kFiDownsampleColour8", dk_ + "frameinterpolation_03_downsample_colour_pass", D + fmt("rgba8")),
-                ("kFiDownsampleColourPyramid", dk_ + "frameinterpolation_03_downsample_colour_pyramid_pass", D + fmt("rgba16f")),
-                ("kFiDownsampleColourPyramid8", dk_ + "frameinterpolation_03_downsample_colour_pyramid_pass", D + fmt("rgba8")),
                 ("kFiWarpFlow", fi_ + "_10_warp_flow_pass", D + fmt("rgba16f")),
                 ("kFiWarpFlowTm1", fi_ + "_11_warp_flow_tm1_pass", D + fmt("rgba16f")),
                 ("kFiFillHolesTm1", fi_ + "_21_fill_holes_tm1_pass", D + fmt("rgba16f")),
                 ("kFiPreprocess", fi_ + "_30_preprocess_pass", D + fmt("rgba16f")),
-                ("kFiPreprocess8", fi_ + "_30_preprocess_pass", D + fmt("rgba16f") + [f"-D{P}PREPROCESS_BYTES=1"]),
                 ("kFiInpaintSeed", fi_ + "_31_downsample_inpaint_seed_pass", D + fmt("rgba16f")),
                 ("kFiInpaintMip", fi_ + "_31_downsample_inpaint_mip_pass", D + fmt("rgba16f")),
                 ("kFiInpaint", fi_ + "_50_inpaint_pass", D + fmt("rgba16f"))]:
     passes.append((n, s, d, INV, 60))
+for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:  # lanes in the colour's format
+    for n, s in [("kFiDownsampleOf", "01_downsample_of_colour"), ("kFiDownsampleAll", "02_downsample_all_input"), ("kFiDownsampleColour", "03_downsample_colour")]:
+        passes.append((n + suffix, dk_ + f"frameinterpolation_{s}_pass", D + fmt(f), INV, 60))
 for n, f in [("kCropR32f", "r32f"), ("kCropRg16f", "rg16f")]:
     passes.append((n, "shaders/frontend/crop", fmt(f), "NFRUX_UNUSED", 60))
 passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("kMenu", "shaders/frontend/menu", [], "NFRUX_UNUSED", 60),
@@ -70,7 +62,6 @@ passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("k
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kCompose{suffix}", "shaders/frontend/compose", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
-    passes.append((f"kFiPostprocess{suffix}", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f), INV, 60))
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
 
 
