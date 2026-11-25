@@ -227,7 +227,7 @@ Earlier parity results in this file (D3D12 against Vulkan) were unaffected by th
 Held-out sets test_new + test_bal (35 sequences, 4 pairs each where they exist), PSNR in dB, mean over generated frames; 8-bit colour and
 half-float vectors for every method, outputs rounded to 8 bits.
 
-| | frames | NFRUX | PyTorch, same network | Arm NFRU v2 (with the prior off, as released) | linear blend |
+| | frames | NFRUX | PyTorch, same network | Arm NFRU v2 weights in the PyTorch pipeline, with the same timestep prior | linear blend |
 |---|---|---|---|---|---|
 | 2x | 68 | 35.72 | 35.71 | 35.24 | 26.46 |
 | 3x | 144 | 37.35 | 37.39 | 36.92 | 30.40 |
@@ -235,7 +235,7 @@ half-float vectors for every method, outputs rounded to 8 bits.
 | 5x | 144 | 34.13 | 34.11 | 33.71 | 25.85 |
 | 6x | 180 | 34.13 | 34.10 | 33.56 | 25.57 |
 
-A3 met (within 0.04 dB; limit 0.2). A14 met (above Arm's at every multiplier). Before the prior fix NFRUX was 33.61 at 6x.
+A3 met (within 0.04 dB; limit 0.2). A14 met (above Arm's v2 weights, given the same prior, at every multiplier). Before the prior fix NFRUX was 33.61 at 6x.
 
 ## A12: optical flow hardware (offline, VK_NV_optical_flow, RTX 4070)
 
