@@ -41,3 +41,11 @@ run; sizes to 8K.
 Revision 6 is the agreed design (2026-11-25). A1 was narrowed to what the conformance programs run.
 
 Revision 7: one DLL (role by file name, static runtime, no files on disk); scRGB / float back buffers out; CUDA from sm_75 with one mma form, per-GPU link by the driver; fp16 / bf16 cooperative matrices where int8 is missing, Intel subgroup rule; WARP and lavapipe tested; file names; low-frame-rate test.
+
+| 7 | architecture | DISAGREE | CUDA name test; R9 / A15 and the package's license texts; winmm role |
+| 7 | code accuracy | DISAGREE | fp16 / bf16 exactness not shown; bf16 not reachable through the loader |
+| 7 | readiness and tests | DISAGREE | the same, and worst-case inputs on Vulkan |
+
+Revision 8: those fixed (name test by whole words with a table test; 2^24 bound computed and enforced, extreme inputs; D3 says where bf16 is reached; R9, A15, all
+license texts in the package; winmm dropped, version.dll run); DLSS-G guide gaps (host states, output subrects, UpdateOnlyInsideExtents, disable word, frame ids, axes,
+camera motion, dynamic resolution, VRAM callback, `_C` evaluates); fp16 first on NVIDIA Vulkan; 64-bit atomics removed; the DLL pins itself.

@@ -16,7 +16,7 @@ DXIL. Float literals rewritten from `HF`: values listed and checked against the 
 
 `ml_conformance_vulkan --iterations 30`, 744x464: cooperative matrix int8 (default), fp16, bf16, dot4, scalar: all 0 of 690432 bytes differ on
 its random input. Times, GPU shared with training: coopmat int8 0.37 ms, fp16 0.30, dot4 0.70, scalar 1.6 (D3D12 dot4 0.98, int32 1.76).
-Worst-case inputs not yet run on Vulkan; fp16 stays off by default until the sum |w| bound of D2 is checked.
+Worst-case inputs and the 2^24 bound: see "Revision 8".
 
 ## M0a loader probe (2026-11-25, Streamline 2.14.16, driver 610.88, Streamline_Sample built from source + scripting patch)
 
@@ -335,10 +335,10 @@ sequence, same binary; not comparable with the table's sets):
 6x {'nfrux': 37.07, 'torch': 37.03, 'arm+prior': 36.39, 'arm': 36.02, 'blend': 29.2} n 15
 ```
 
-# After revision 6 (commit after fe45ffa; 2026-11-25)
+# After revision 6 (ba87aca; 2026-11-25)
 
 - One DLL, 4.1 MB; links KERNEL32 and USER32 (d3d12 and dxgi delay-loaded). Streamline_Sample with only `dbghelp.dll` added: D3D12 4x and Vulkan 4x presented. OptiScaler 0.9.5 slot:
-  D3D12 and Vulkan 2x. `version.dll` / `winmm.dll`: not shown yet (the sample run for them had a wrong copy path).
+  D3D12 and Vulkan 2x. `version.dll`: "Revision 8"; `winmm.dll`: the sample did not start, so it is not a role any more.
 - CUDA m8n8k16 (sm_75): exact at all three sizes; 0.153 ms at 744x464 and 0.196 at 960x544 (m16n8k16 0.156-0.172, 0.208-0.212). The same PTX links for sm_75, 80, 86, 89, 90, 100, 120 (the driver's linker); it
   was run on the RTX 4070 only.
 - Cooperative matrices int8, fp16, bf16 forced: harness 61 of 61 each, self-check passed.
@@ -347,3 +347,24 @@ sequence, same binary; not comparable with the table's sets):
   for it was removed by decision.
 - The 3x frame 1.93 dB below PyTorch: race_spaceship_002, a near-static clip; the three worst 3x frames are its, at 54.4-54.8 dB against 56.0-56.7 (under half an 8-bit code). Medians are 0.
 - Harness now: 124 checks (61 an API, 2 between), 53 outputs; strict 53 of 53 identical; shipped 0 failed.
+
+# Revision 8 (5a2b8c8; RTX 4070, driver 610.88, 2026-11-25; shipped = `build-ship`, strict = `build-strict`)
+
+Every row below was run on this commit unless said.
+
+| Row | Result |
+|---|---|
+| A1 Vulkan | 744x464, five inputs (random, all -128, all 127, alternating, signs of the first layer's weights) x int8, fp16, bf16, dot4 (two forms), scalar: 0 of 690,432 bytes differ in each. Largest partial sum any channel can reach: 7,021,312 (limit 16,777,216) |
+| A1 D3D12 | int32, dot4, CUDA exact at 64x64 (23 cases), 744x464 and 960x544 (5 each). Tensor cores by name: 15 names right (T4 and RTX yes; GTX 16, T400, T400 4GB, T600, T1000, T1200, MX450 no) |
+| Network times, 744x464, back to back | Vulkan fp16 0.26 ms, bf16 0.28, int8 0.33, dot4 0.68, scalar 1.4; D3D12 CUDA 0.22, dot4 0.67, int32 1.25 (this run's clocks). fp16 is first on NVIDIA since |
+| A2a, A2b | 5 sizes / formats x 2x, 4x, 6x: strict 0 bytes; shipped worst 86.3 dB |
+| A5 | 64 recorded frames an API, 2x and 6x: strict 0 bytes; shipped 75.5 dB or better, at most 0.0002% over 1 code |
+| A9, A10 | 144 checks (71 an API, 2 between), 0 failed, shipped and strict. Strict 59 of 59 outputs identical; shipped worst 96.3 dB, none over 1 code. Inputs in NON_PIXEL_SHADER_RESOURCE and outputs in UNORDERED_ACCESS on D3D12; on Vulkan GENERAL, and read-only inputs in SHADER_READ_ONLY_OPTIMAL (minimal host). New scenes: output subrects, two viewports on one back buffer (58.1 dB), the disable word, frame ids, inverted axes, camera motion excluded (57.4 dB), dynamic resolution (57.6 dB), an internal size (57.5 dB) |
+| Validation | Khronos + synchronisation, 1.3 host and minimal 1.2 host: 0 messages |
+| A7 | coopmat_int8 forced 71 of 71; WARP (dot4) 71 of 71. Soak 400 evaluates an API: flat |
+| A15 | Package: the DLL (4.0 MB), INSTALL.txt, THIRD_PARTY.md, licenses/ (Apache-2.0, Arm model license, D3D12MA, VMA, NRI, Neural Graphics SDK, NFRUX). Search of the repository for the source project's name: none. Sample at 1920x1080 with only dbghelp.dll, then only version.dll: 4x on D3D12 (519-536, 550-558 fps) and Vulkan (442-458, 474-480 fps); removing the file removes it |
+| A6 a | OptiScaler 0.9.5, 1500 rendered frames: 2x on D3D12 (360 fps) and Vulkan (300 fps, scalar: features unknown there) |
+
+Parity's fuller list of sizes (4K BGRA8, 8K, odd) was last run on 80c9418; no pass that runs there changed since (only `crop.glsl`, which the parity test does not run).
+
+Guide gaps that remain, on purpose: MvecInvalidValue, ClipToLensClip, 4x4 UI blocks, float back buffers.
