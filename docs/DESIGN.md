@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 3, agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
+Status: revision 4 (M0d added; M0a findings), to be re-reviewed with the M0b/M0d/M0e results. Revision 3 was agreed (docs/REVIEWS.md). Review history in `docs/REVIEWS.md`. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -18,8 +18,7 @@ NFRUX is neural multi-frame generation (2x to 6x) that a game or OptiScaler uses
 | R7 | Reuses DeckyUpscaler where useful (UI handling) | A9, section 2 |
 | R8 | Design documented and agreed by independent reviewers | `docs/REVIEWS.md` |
 
-Not goals: super resolution, presentation and pacing (Streamline / OptiScaler own them), anti-cheat games, SM 6.9 cooperative
-vectors (needs an Agility SDK the game picks), DirectML and metacommands (inexact requantisation, so no R6), other frame generators' code
+Not goals: super resolution, presentation and pacing (Streamline / OptiScaler own them), anti-cheat games, other frame generators' code
 (its repository has no license).
 
 ## 2. Structure
@@ -242,6 +241,8 @@ through a swizzling convert pass into a render-legal copy source of that family 
 |---|---|---|
 | M0a | Loader probe (D6) and state probe (section 4) in the sample, both APIs | D6 pass condition; states recorded |
 | M0b | CUDA spike: one 3x3 layer in a compute list, bytes against the reference | exact -> rung stays; else dropped and R5 text amended, reported |
+| M0d | (requested) SM 6.9 cooperative vectors, when the host exposes them or through NVAPI, and DirectML / metacommand integer convolution (exact int32 sums, our rescale after): one 3x3 layer each, exactness and time against dot4 and CUDA | each becomes a rung if exact and faster on some device class, else dropped with numbers |
+| M0e | Vulkan optical flow re-examined: Evaluate does get a queue and pool (M0a) | D4 rewritten either way |
 | M0c | THIRD_PARTY.md, notices | written |
 | M1 | rhi_vulkan, network, completion token, build system | A1 Vulkan |
 | M2 | core on Vulkan, capture/replay | A3, A14 |
