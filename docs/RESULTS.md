@@ -350,7 +350,7 @@ sequence, same binary; not comparable with the table's sets):
 
 # Revision 8 (5a2b8c8; RTX 4070, driver 610.88, 2026-11-25; shipped = `build-ship`, strict = `build-strict`)
 
-Every row below was run on this commit unless said.
+First table: 5a2b8c8. The second, on 2ac5a8e, replaces its A1, A2, A7, A9 and A10 rows.
 
 | Row | Result |
 |---|---|
@@ -365,6 +365,12 @@ Every row below was run on this commit unless said.
 | A15 | Package: the DLL (4.0 MB), INSTALL.txt, THIRD_PARTY.md, licenses/ (Apache-2.0, Arm model license, D3D12MA, VMA, NRI, Neural Graphics SDK, NFRUX). Search of the repository for the source project's name: none. Sample at 1920x1080 with only dbghelp.dll, then only version.dll: 4x on D3D12 (519-536, 550-558 fps) and Vulkan (442-458, 474-480 fps); removing the file removes it |
 | A6 a | OptiScaler 0.9.5, 1500 rendered frames: 2x on D3D12 (360 fps) and Vulkan (300 fps, scalar: features unknown there) |
 
-Parity's fuller list of sizes (4K BGRA8, 8K, odd) was last run on 80c9418; no pass that runs there changed since (only `crop.glsl`, which the parity test does not run).
+| 2ac5a8e | Result |
+|---|---|
+| A1 | Vulkan 64x64 and 744x464, all rungs and inputs exact; D3D12 exact |
+| A2a, A2b | 9 sizes / formats (720p to 8K, ultra-wide, odd, BGRA8, RGB10A2, inverted depth) x 2x, 4x, 6x, 4 frames, both builds: 54 runs, strict 0 bytes, shipped worst 86.3 dB |
+| A9, A10 | 154 checks (76 an API, 2 between), 0 failed; strict 61 of 61 identical. Dynamic resolution with jittered vectors: exact (70.5 dB before the fix, the control). Soak 2000 an API flat. Khronos + synchronisation validation: 0 messages, both hosts |
+| A7 | Forced: CUDA, dot4, scalar (D3D12), int8, fp16, bf16, dot4, scalar (Vulkan), WARP: 76 of 76 each. Injected self-check failures: N = 1 all pass on the next rung; N = 2, 3 fall rung by rung as logged (fp16, int8, dot4, scalar; CUDA, dot4, scalar, none). The harness then reports failures (15 checks listed for N = 3 on Vulkan): its 4-frame scenes end while the copies are still shown, so the reference scene is copies; inferred from which checks fail, not separately shown. Not run: nvapi / nvcuda absent; the stale marker at this commit |
 
+A3, A14, A8 were not re-run: the default path's passes, constants and shaders are unchanged (A2 compares the two APIs only); on Vulkan the network kernel is now fp16, exact by A1.
 Guide gaps that remain, on purpose: MvecInvalidValue, ClipToLensClip, 4x4 UI blocks, float back buffers.
