@@ -147,12 +147,17 @@ struct Api12 : Api
             ComPtr<ID3D12SDKConfiguration1> sdk;
             ComPtr<ID3D12DeviceFactory> factory;
             ComPtr<ID3D12Debug1> dbg;
-            HRESULT hr = D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdk));
-            if (SUCCEEDED(hr)) hr = sdk->CreateDeviceFactory(NFRUX_AGILITY, ".\\D3D12\\", IID_PPV_ARGS(&factory));
-            if (SUCCEEDED(hr)) hr = factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&dbg));
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))))  // Windows' own, with Graphics Tools
+            {
+                dbg->EnableDebugLayer(), dbg->SetEnableGPUBasedValidation(atoi(getenv("NFRUX_D3D12_DEBUG")) > 1);
+                if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  debug device failed\n"), false;
+            }
+            HRESULT hr = d ? S_OK : D3D12GetInterface(CLSID_D3D12SDKConfiguration, IID_PPV_ARGS(&sdk));
+            if (!d && SUCCEEDED(hr)) hr = sdk->CreateDeviceFactory(NFRUX_AGILITY, ".\\D3D12\\", IID_PPV_ARGS(&factory));
+            if (!d && SUCCEEDED(hr)) hr = factory->GetConfigurationInterface(CLSID_D3D12Debug, IID_PPV_ARGS(&dbg));
             if (FAILED(hr)) return printf("  no D3D12 debug layer: %08lx\n", hr), false;
-            dbg->EnableDebugLayer(), dbg->SetEnableGPUBasedValidation(atoi(getenv("NFRUX_D3D12_DEBUG")) > 1);
-            if (FAILED(hr = factory->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  debug device: %08lx\n", hr), false;
+            if (!d) dbg->EnableDebugLayer(), dbg->SetEnableGPUBasedValidation(atoi(getenv("NFRUX_D3D12_DEBUG")) > 1);
+            if (!d && FAILED(hr = factory->CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return printf("  debug device: %08lx\n", hr), false;
         }
         if (getenv("NFRUX_WARP"))  // the software adapter: no vendor, no CUDA
         {
