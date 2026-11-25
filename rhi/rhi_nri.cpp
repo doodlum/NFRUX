@@ -163,7 +163,7 @@ public:
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear(), scratch.clear();
         if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : Rung());
-        if (!vk.marker.empty()) MarkerOk(vk.marker);
+        if (vkMarked && !vk.marker.empty()) MarkerOk(vk.marker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
@@ -402,6 +402,7 @@ public:
     }
 
     std::mutex making;
+    bool        vkMarked = false;  // the assumed features' marker is begun
     bool        vkCuda = false;  // Vulkan: the last network made runs CUDA kernels
     std::string cudaMarker;
     bool lastFloat = false, noFloats = false;  // float cooperative matrices: the last made, refused
@@ -478,6 +479,11 @@ public:
             }
             else
             {
+                if (!vk.marker.empty() && !vkMarked && sel.path != ffx_ml::Path::Scalar)
+                {
+                    vkMarked = MarkerBegin(vk.marker);
+                    if (!vkMarked) vk.marker.clear(), topRung = 2, rung = 2, sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None), sel.rescaleFloat = false;
+                }
                 net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
                 if (!net->vk) return nullptr;
                 what = sel.Describe();
@@ -554,7 +560,7 @@ public:
     std::atomic<int> cudaState = 0;  // 0 not tried, 1 in use, -1 not
     uint32_t    finished = 0;
     bool        marked = false, ran = false;
-    uint32_t    firstRun = 0;  // finished when the network first ran
+    uint32_t    firstRun = 0;  // finished when the network first ran at its real size
     std::string Rung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
     bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
@@ -581,7 +587,7 @@ public:
         Poll();
         // Recordings from well after the network first ran have completed (those before it say nothing).
         if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : Rung());
-        if (!vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
+        if (vkMarked && !vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
         nativeCmd = commands, t_recording = true;
         if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));
         if (isVk)

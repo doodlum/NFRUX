@@ -60,8 +60,7 @@ std::unique_ptr<Device> DeviceForVk()
     {
         char m[48];
         snprintf(m, sizeof(m), "vulkan_%04x_%04x", p.vendorID, p.deviceID);
-        if (!MarkerBegin(m)) return CreateNriVulkanDevice(h);
-        h.marker = m;
+        h.marker = m;  // begun when a network that uses these features is made (CUDA has its own)
         std::vector<const char*> ext;
         h.mlFeatures = ffx_ml::QueryDeviceFeatures(h.instance, h.physicalDevice, h.gipa, &ext);
         if (CudaVulkanGraph::Supported(h.device, h.gdpa)) h.mlFeatures |= kFeatureCudaLaunch;  // Streamline enables the extension; buffer addresses are assumed with it

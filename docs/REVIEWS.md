@@ -63,3 +63,11 @@ Revision 9 (the D3D12 debug layer's findings: input states, tags, disable word, 
 | 9 | readiness and tests | DISAGREE, then AGREE | 5 (DLL provenance, commit and A4, Vulkan attribution, UI column, ceiling), fixed |
 
 Revision 9 is the agreed design (2026-11-25). After it: the reviewers' small points on stale state entries and UI alpha.
+
+Revision 10 (CUDA kernels on Vulkan; batches interleaved on both APIs; the NVIDIA default under OptiScaler).
+
+| 10 | architecture | DISAGREE (markers cleared before the real network ran), then AGREE (dc854ef) | 1, fixed |
+| 10 | code accuracy | AGREE (cd6be72) | 0 |
+| 10 | readiness and tests | DISAGREE (interleaved exactness; DESIGN contradictions; RESULTS commits and limits), then AGREE (dc854ef) | 3, fixed |
+
+Revision 10 is the agreed design (2026-11-25). After it: the assumed features' marker begins only with a network that uses them.

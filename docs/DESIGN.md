@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md); since then one change by decision (fast Vulkan network by default on NVIDIA under OptiScaler, D3) and CUDA kernels on Vulkan with batches interleaved (D3), not reviewed. Nothing under "Acceptance" counts as done until its
+Status: revision 10, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -199,7 +199,7 @@ else is optional and needs to be *enabled*. Source of truth:
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the
   app's own process and device are affected; additions are logged.
-- OptiScaler route: the enabled set is unknown. The two assumptions of D1b (Vulkan 1.2, shaderStorageImageExtendedFormats) are made and logged. On NVIDIA the GPU's optional features are used as well (project,
+- OptiScaler route: the enabled set is unknown. The assumptions of D1b (Vulkan 1.2, shaderStorageImageExtendedFormats) are made and logged. On NVIDIA the GPU's optional features are used as well (project,
   2026-11-25: outside strict validity when the game has not enabled them; its driver takes them, RTX 4070 tested), behind the crash marker of CUDA's kind and the self-check; elsewhere the floor.
   `NFRUX_VK_ASSUME_FEATURES=0 / 1` decides on any GPU. Markers (both rungs) are cleared when 40 recordings have completed since the network first ran, or on an orderly end.
 The loader hands the DLL the recorded set per VkDevice (export `NFRUX_SetVulkanFeatures`); no record means the OptiScaler behaviour.
@@ -223,7 +223,7 @@ the size can be required, else the driver's own. Untested on such GPUs (none her
 them (no cooperative vectors in the retail runtime; AMD's and Intel's are device-creation or vendor-driver extensions), so dot4.
 Crash safety, for what depends on vendor-specific launches (CUDA on both APIs) or on features the game may not have enabled (the NVIDIA default on the OptiScaler route): before the first use in a process an "attempts" file, named by
 device and driver file time, is counted up; it is removed when 40 recordings have completed since the network first ran at its real size (the 64-wide self-check does not count), or on an orderly end, and kept after a failed
-self-check or a device removal. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder: not used. Both markers can be pending at once; a game closed twice in its
+self-check or a device removal. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder: not used. The assumed features' marker is begun only when a network that is not CUDA's uses them. A game closed twice in its
 first seconds has the same effect. Tested with a process that ends at the first real run. A device loss in the game's process cannot be recovered and is not claimed to be. A network made in place of one that could not be created at
 the real size has not been self-checked itself (the rung was: 64 wide). Where the features are known enabled, the cooperative-matrix and dot4 rungs are plain API use and have only the self-check.
 **D4. Optical flow.** The compute block match the network was trained with, everywhere. NVIDIA's optical flow hardware was measured (A12,
@@ -326,6 +326,7 @@ M1-M3 do not depend on M0a.
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
 | Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
+| CUDA on Vulkan and the NVIDIA default under OptiScaler have not run in a real host | headless evidence only; A4 and A6 on Vulkan before a package is handed out |
 | OptiScaler route (R2), D3D12: tagged inputs in another state than the guide's are read without a transition. On NVIDIA no fault was seen (2x, sample); others not tested | known; only a host that gives the states can fix it |
 
 ## 8. Acceptance
