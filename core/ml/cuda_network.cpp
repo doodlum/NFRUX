@@ -33,8 +33,10 @@ const Api& Nv()
 {
     static const Api api = [] {
         Api a;
-        HMODULE nvapi = LoadLibraryExA("nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        a.cuda        = LoadLibraryExA("nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const char* absent = getenv("NFRUX_TEST_ABSENT");  // "nvapi64.dll" or "nvcuda.dll": as if it were not installed
+    auto load = [&](const char* n) { return absent && !strcmp(absent, n) ? nullptr : LoadLibraryExA(n, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32); };
+    HMODULE nvapi = load("nvapi64.dll");
+        a.cuda        = load("nvcuda.dll");
         auto query    = nvapi ? reinterpret_cast<void* (*)(uint32_t)>(GetProcAddress(nvapi, "nvapi_QueryInterface")) : nullptr;
         auto init     = query ? reinterpret_cast<int (*)()>(query(0x0150e828)) : nullptr;
         if (!a.cuda || !init || init() != 0) return a;

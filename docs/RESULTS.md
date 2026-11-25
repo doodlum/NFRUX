@@ -1,4 +1,4 @@
-﻿# Results
+# Results
 
 ## A1, D3D12 (2026-11-25, RTX 4070, driver 610.88)
 
@@ -383,11 +383,22 @@ Guide gaps that remain, on purpose: MvecInvalidValue, ClipToLensClip, 4x4 UI blo
 | Vulkan | 2x | 5a2b8c8 | 397 of 397 | 44,983 of 45,000 |
 | Vulkan | 6x | 5a2b8c8 | 208 of 208 | 122,920 of 123,000 |
 
-Exit code 0 each. Runs with interruptions, same day: Vulkan on 2ac5a8e 2x 331 of 362 and 6x 200 of 207, the rest at 1x, Streamline's log saying "window not focused" in both; D3D12 on 5a2b8c8
-2x 367 of 400 and 6x 118 of 321, cause not shown (the log was overwritten). Further long runs were skipped (2026-11-25). Not met of A4: the D3D12 debug layer;
-the between-neighbours check.
+The two D3D12 runs were on dot4, not CUDA: the failure-injection test before them had left the crash marker set (by design), found afterwards. CUDA in the sample: the short runs below and the older CUDA
+long runs (293ca58). Exit code 0 each. Runs with interruptions, same day: Vulkan on 2ac5a8e 2x 331 of 362 and 6x 200 of 207, the rest at 1x, Streamline's log saying "window not focused" in both; D3D12 on 5a2b8c8
+2x 367 of 400 and 6x 118 of 321, cause not shown (the log was overwritten). Further long runs were skipped (2026-11-25). Not met of A4: the D3D12 debug layer.
 
 ## db5dc31 (after the last review's two points)
 
 Harness 158 checks (78 an API, 2 between), strict and shipped 0 failed, strict 63 of 63 identical; Khronos + synchronisation validation, both hosts: 0 messages, the moved output region
 without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The long runs above predate it; it changes the int8 retry after a failed float kernel and the moved output region.
+
+## Remaining rows (DLL: db5dc31 plus NFRUX_TEST_ABSENT, marker cleared, CUDA on D3D12)
+
+- A7: `NFRUX_TEST_ABSENT=nvapi64.dll` and `=nvcuda.dll` (the load is refused): dot4 chosen, 78 of 78 each. Without it: CUDA, 78 of 78. After a forced self-check failure CUDA stays off until the marker is
+  deleted or the driver changes; seen in practice here.
+- A4 between neighbours (`tests/between_neighbours.py`, 64-frame 4x dumps of the sample): D3D12 183 of 183, Vulkan 165 of 165; the worst frame's larger distance is 1.6 codes below the neighbours' own distance
+  (mean 10.6 to 10.8); limit +2.
+- A5 replay of those dumps (60 frames D3D12, 55 Vulkan): 4x, final-d3d12 build-strict exit 0   177 generated frames: worst PSNR 138.13 dB, off by more than 1: 0.00000%, by more than 3: 0.00000%; final-d3d12 build-ship exit 0   177 generated frames: worst PSNR 76.04 dB, off by more than 1: 0.00009%, by more than 3: 0.00000%; final-vk build-strict exit 0   162 generated frames: worst PSNR 138.13 dB, off by more than 1: 0.00000%, by more than 3: 0.00000%; final-vk build-ship exit 0   162 generated frames: worst PSNR 75.05 dB, off by more than 1: 0.00011%, by more than 3: 0.00000%.
+- A8 video memory, MB (display; depth half-size), the same at 2x, 4x and 6x: D3D12 CUDA 340 / 417 / 598, D3D12 dot4 291 / 368 / 549, Vulkan 258 / 312 / 432 (1080p / 1440p / 4K). It is the process's growth.
+- Sample, 1200 frames at 1920x1080, D3D12 CUDA: 2x 315 fps, 4x 558, 6x 694. OptiScaler 0.9.5 with this DLL: Vulkan 2x (288 fps); D3D12 CUDA 2x in 4 of 5 starts (378-403 fps); one start presented 1x for its whole
+  length with the feature created; the cause is not shown (no focus line in the log). An earlier start in dot4 was 2x.

@@ -1126,6 +1126,24 @@ static void Soak(Api& a, uint32_t n)
     a.Release(h);
 }
 
+static void Vram(Api& a)
+{
+    for (auto [w, h] : {std::pair<uint32_t, uint32_t>{1920, 1080}, std::pair<uint32_t, uint32_t>{2560, 1440}, std::pair<uint32_t, uint32_t>{3840, 2160}})
+        for (uint32_t n : {1u, 3u, 5u})
+        {
+            a.Recreate();
+            const uint64_t v0 = a.VideoMemory();
+            Params p;
+            NgxHandle* f = a.CreateFeature(p);
+            Scene s;
+            s.w = w, s.h = h, s.dw = w / 2, s.dh = h / 2, s.gen = n, s.frames = 3;
+            s.backI = [w = w, h = h](int) { return Image(w, h, 0.5f); };
+            const bool ok = Run(a, s, f).ok;
+            printf("  %ux%u %ux: %.0f MB%s\n", w, h, n + 1, (double(a.VideoMemory()) - double(v0)) / 1048576, ok ? "" : " FAILED");
+            a.Release(f);
+        }
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1140,6 +1158,7 @@ int main(int argc, char** argv)
     {
         const std::string s = argv[i];
         if (s == "--minimal") minimal = true;
+        else if (s == "--vram") soak = ~0u;
         else if (s == "--soak") soak = uint32_t(atoi(argv[++i]));
         else which.push_back(s);
     }
@@ -1154,7 +1173,8 @@ int main(int argc, char** argv)
         else { auto a = std::make_unique<Api12>(); a->dll = dll, ok = a->Init(), apis.push_back(std::move(a)); }
         if (!ok) return puts("  device failed"), 2;
         results.emplace_back();
-        if (soak) Soak(*apis.back(), soak);
+        if (soak == ~0u) Vram(*apis.back());
+        else if (soak) Soak(*apis.back(), soak);
         else Scenes(*apis.back(), results.back());
     }
     if (results.size() == 2 && !soak)
