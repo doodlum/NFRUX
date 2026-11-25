@@ -1,9 +1,8 @@
 // A2 (offline): the same synthetic frames through every backend, every intermediate and output compared.
-//   parity [--size WxH] [--render WxH] [--frames N] [--gen N] [--dump DIR] [backend ...]   backends: d3d12 nri12 nrivk
+//   parity [--size WxH] [--render WxH] [--frames N] [--gen N] [--dump DIR] [backend ...]   backends: d3d12 vulkan
 // SPDX-License-Identifier: MIT
 #include "../core/interpolator.h"
 #include "../core/ml/ffx_vk_ml_runtime.h"
-#include "rhi_d3d12.h"
 #include "rhi_nri.h"
 
 #include <d3d12.h>
@@ -76,8 +75,24 @@ static Frame Make(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, float t)
 }
 
 using Results = std::map<std::string, std::vector<uint8_t>>;
-struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; } g;
+struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; int format = 0; bool inverted = false; } g;  // format: 0 rgba8, 1 bgra8, 2 rgb10a2, 3 rgba16f (scRGB)
+static uint32_t ColorBytes() { return g.format == 3 ? 8 : 4; }
+static void Encode(Frame& f)
+{
+    if (g.inverted) for (float& d : f.depth) d = 1.0f - d;
+    const size_t n = f.color.size() / 4;
+    std::vector<uint8_t> o(n * ColorBytes());
+    for (size_t i = 0; i < n; ++i)
+    {
+        const uint8_t* p = &f.color[i * 4];
+        if (g.format == 1) { o[i * 4] = p[2], o[i * 4 + 1] = p[1], o[i * 4 + 2] = p[0], o[i * 4 + 3] = p[3]; }
+        else if (g.format == 2) { const uint32_t v = (p[0] * 4u) | (p[1] * 4u) << 10 | (p[2] * 4u) << 20 | 3u << 30; memcpy(&o[i * 4], &v, 4); }
+        else if (g.format == 3) { uint16_t h[4]; for (int k = 0; k < 3; ++k) h[k] = Half(powf(p[k] / 255.0f, 2.2f) * 6.0f); h[3] = Half(1.0f); memcpy(&o[i * 8], h, 8); }
+    }
+    if (g.format) f.color = o;
+}
 
+static bool g_vulkan;
 static FrameInputs Inputs(const ExternalImage* im, bool first)
 {
     FrameInputs in;
@@ -91,6 +106,9 @@ static FrameInputs Inputs(const ExternalImage* im, bool first)
 static Settings MakeSettings(const ExternalImage& color)
 {
     Settings s;
+    s.depthInverted = g.inverted;
+    s.outputFormat = g.format == 3 ? Format::RGBA16Float : g.format == 2 ? Format::RGB10A2Unorm : g.format == 1 ? Format::BGRA8Unorm : Format::RGBA8Unorm;
+    if (g.format == 1 && g_vulkan) s.outputFormat = Format::RGBA8Unorm, s.swapRB = true;
     s.displayWidth = g.w, s.displayHeight = g.h, s.renderWidth = g.rw, s.renderHeight = g.rh, s.colorLike = color;
     for (int i = 0; i < 4; ++i) s.initialViewProjection[i * 5] = 1.0f;
     return s;
@@ -104,7 +122,9 @@ static bool Run(Device& dev, const ExternalImage* im, const std::function<void(c
     bool ok = true;
     for (uint32_t i = 0; i < g.frames; ++i)
     {
-        upload(Make(g.w, g.h, g.rw, g.rh, float(i)));
+        Frame src = Make(g.w, g.h, g.rw, g.rh, float(i));
+        Encode(src);
+        upload(src);
         std::vector<std::pair<std::string, std::shared_ptr<std::vector<uint8_t>>>> got;
         submit([&](void* cmd) {
             if (!dev.BeginFrame(cmd)) return ok = false;
@@ -127,7 +147,7 @@ static bool Run(Device& dev, const ExternalImage* im, const std::function<void(c
 }
 
 // --- D3D12
-static bool RunD3D12(bool nri, Results& out)
+static bool RunD3D12(Results& out)
 {
     ComPtr<ID3D12Device> d;
     if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&d)))) return false;
@@ -147,7 +167,9 @@ static bool RunD3D12(bool nri, Results& out)
         ID3D12CommandList* l = cl.Get();
         q->ExecuteCommandLists(1, &l), q->Signal(fence.Get(), ++fv), fence->SetEventOnCompletion(fv, nullptr);
     };
-    const DXGI_FORMAT fm[3] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
+    g_vulkan = false;
+    const DXGI_FORMAT cf[4] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT};
+    const DXGI_FORMAT fm[3] = {cf[g.format], DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT};
     ComPtr<ID3D12Resource> tex[3];
     ExternalImage im[3];
     for (int i = 0; i < 3; ++i)
@@ -164,7 +186,7 @@ static bool RunD3D12(bool nri, Results& out)
         const void* src[3] = {f.color.data(), f.depth.data(), f.motion.data()};
         for (int i = 0; i < 3; ++i)
         {
-            const uint32_t row = im[i].width * 4, pitch = (row + 255) & ~255u;
+            const uint32_t row = im[i].width * (i ? 4 : ColorBytes()), pitch = (row + 255) & ~255u;
             D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_UPLOAD};
             D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, uint64_t(pitch) * im[i].height, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE};
             d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up[i]));
@@ -182,7 +204,7 @@ static bool RunD3D12(bool nri, Results& out)
         execute();
     };
     auto submit = [&](const std::function<bool(void*)>& record) { al->Reset(), cl->Reset(al.Get(), nullptr), record(cl.Get()), execute(); };
-    auto dev = nri ? CreateNriD3D12Device(d.Get()) : CreateD3D12Device(d.Get());
+    auto dev = CreateNriD3D12Device(d.Get());
     return dev ? Run(*dev, im, upload, submit, out) : (printf("  device failed\n"), false);
 }
 
@@ -246,7 +268,9 @@ static bool RunVulkan(Results& out)
         si.commandBufferCount = 1, si.pCommandBuffers = &cb;
         vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE), vkQueueWaitIdle(queue);
     };
-    const VkFormat fm[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT};
+    g_vulkan = true;
+    const VkFormat cf[4] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT};
+    const VkFormat fm[3] = {cf[g.format], VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT};
     VkImage img[3];
     ExternalImage im[3];
     for (int i = 0; i < 3; ++i)
@@ -262,7 +286,7 @@ static bool RunVulkan(Results& out)
         im[i].handle = reinterpret_cast<void*>(img[i]);
     }
     VkBufferCreateInfo bc = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bc.size = uint64_t(g.w) * g.h * 4 + uint64_t(g.rw) * g.rh * 8, bc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bc.size = uint64_t(g.w) * g.h * 8 + uint64_t(g.rw) * g.rh * 8, bc.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     VkBuffer up;
     VKC(vkCreateBuffer(dv, &bc, nullptr, &up));
     VkMemoryRequirements ur;
@@ -296,8 +320,29 @@ static bool RunVulkan(Results& out)
     return dev ? Run(*dev, im, upload, submit, out) : (printf("  device failed\n"), false);
 }
 
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+static LONG WINAPI OnCrash(EXCEPTION_POINTERS* e)
+{
+    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    HANDLE p = GetCurrentProcess();
+    SymInitialize(p, nullptr, TRUE);
+    void* st[24];
+    const int n = RtlCaptureStackBackTrace(0, 24, st, nullptr);
+    for (int i = 0; i < n; ++i)
+    {
+        alignas(SYMBOL_INFO) char b[sizeof(SYMBOL_INFO) + 256];
+        auto* s = reinterpret_cast<SYMBOL_INFO*>(b);
+        s->SizeOfStruct = sizeof(SYMBOL_INFO), s->MaxNameLen = 255;
+        DWORD64 off = 0; DWORD d = 0; IMAGEHLP_LINE64 l = {sizeof(l)};
+        const bool ok = SymFromAddr(p, DWORD64(st[i]), &off, s), ln = SymGetLineFromAddr64(p, DWORD64(st[i]), &d, &l);
+        fprintf(stderr, "  %s %s:%lu\n", ok ? s->Name : "?", ln ? l.FileName : "", ln ? l.LineNumber : 0);
+    }
+    fflush(stderr), ExitProcess(3);
+}
 int main(int argc, char** argv)
 {
+    AddVectoredExceptionHandler(1, OnCrash);
     std::vector<std::string> which;
     for (int i = 1; i < argc; ++i)
     {
@@ -306,17 +351,19 @@ int main(int argc, char** argv)
         else if (a == "--render") sscanf(argv[++i], "%ux%u", &g.rw, &g.rh);
         else if (a == "--frames") g.frames = atoi(argv[++i]);
         else if (a == "--gen") g.gen = atoi(argv[++i]);
+        else if (a == "--format") g.format = atoi(argv[++i]);
+        else if (a == "--inverted") g.inverted = true;
         else if (a == "--dump") g.dump = argv[++i];
         else which.push_back(a);
     }
-    if (which.empty()) which = {"d3d12", "nri12", "nrivk"};
+    if (which.empty()) which = {"d3d12", "vulkan"};
     std::vector<Results> all;
     int bad = 0;
     for (auto& w : which)
     {
         printf("%s %ux%u render %ux%u gen %u\n", w.c_str(), g.w, g.h, g.rw, g.rh, g.gen);
         Results r;
-        const bool ok = w == "nrivk" ? RunVulkan(r) : RunD3D12(w == "nri12", r);
+        const bool ok = w == "vulkan" ? RunVulkan(r) : RunD3D12(r);
         if (!ok) printf("  FAILED\n"), ++bad;
         // Against the truth: what the frame between two rendered ones really is.
         double sum = 0;
@@ -326,7 +373,7 @@ int main(int argc, char** argv)
             {
                 const auto& o = r["frame" + std::to_string(i) + "_gen" + std::to_string(k)];
                 const Frame t = Make(g.w, g.h, 16, 16, float(i - 1) + float(k + 1) / float(g.gen + 1));
-                if (o.size() != t.color.size()) continue;
+                if (g.format || o.size() != t.color.size()) continue;
                 double e = 0;
                 for (size_t p = 0; p < o.size(); ++p) if ((p & 3) != 3) e += (double(o[p]) - t.color[p]) * (double(o[p]) - t.color[p]);
                 sum += 10 * log10(255.0 * 255.0 / std::max(1e-9, e / (o.size() * 0.75))), ++cnt;

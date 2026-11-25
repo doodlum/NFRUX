@@ -72,3 +72,8 @@ Same script on both APIs, frames paired by the rendered image (`tests/compare_sa
 APIs match at 31.4 dB (the sample's renderers differ: ray-traced shadows, foliage, reflections), the generated frames outside the UI at
 34.6-34.8 dB, so the interpolation adds no difference of its own; visually matching. A5's bar of 35 dB is missed by 0.2-0.4 dB, with the
 "no more than 1 dB below the inputs" part met. The cross-replay part of A5 is not done.
+## A2 formats and 4K (2026-11-25, after the NRI teardown fix)
+
+NRI built without Agility SDK, NVAPI, AGS, NVTX (its wrapped-device teardown crashed with them on). D3D12 (NRI) against Vulkan (NRI), 4x, 5 frames: RGB10A2, BGRA8, inverted depth, 4K from 1440p, 4K from 1080p RGB10A2: 0 bytes differ. RGBA16F scRGB (+ inverted, 1080p from 720p): PSNR >= 116 dB over the raw bytes, no byte off by more than 1.
+The native D3D12 backend was bit-identical to NRI's and no faster in the sample (564 against 572 fps at 4x): removed, NRI is the only backend.
+4K flow still runs at display size (the 01 reduction pass of the design is not in).

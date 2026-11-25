@@ -129,6 +129,7 @@ public:
 
     ~DevN() override
     {
+        for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear();
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);

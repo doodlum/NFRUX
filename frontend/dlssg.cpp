@@ -4,7 +4,6 @@
 #include "../core/log.h"
 #include "../core/ml/ffx_vk_ml_runtime.h"
 #include "../loader/ngx.h"
-#include "rhi_d3d12.h"
 #include "rhi_nri.h"
 
 #include <windows.h>
@@ -37,7 +36,7 @@ uint32_t MaxFrames()
 std::shared_ptr<Device> DeviceFor12(ID3D12Device* d)
 {
     auto& s = g_devices[d];
-    if (!s) s = EnvFlag("NFRUX_NRI12", false) ? CreateNriD3D12Device(d) : CreateD3D12Device(d);
+    if (!s) s = CreateNriD3D12Device(d);
     if (!s) g_devices.erase(d);
     return s;
 }
