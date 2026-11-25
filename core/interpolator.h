@@ -12,6 +12,7 @@ struct FrameInputs
     ExternalImage color;     // the frame interpolated (HUD-less when the game has one)
     ExternalImage uiSource;  // the frame with its UI, or none
     ExternalImage uiAlpha, noWarp, depth, motion;
+    const Texture *depthTexture = nullptr, *motionTexture = nullptr;  // instead of depth / motion: already cut to the rendered region
     uint32_t      uiKind = 0;  // 0 difference test, 2/3 UI alpha red / alpha over HUD-less, 4/5 without HUD-less
     bool          reset  = false;
     float         jitter[2] = {}, mvScale[2] = {1, 1};  // mvScale: to display pixels

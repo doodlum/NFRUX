@@ -2,6 +2,7 @@
 #include "frame_generator.h"
 
 #include "../core/log.h"
+#include "nfrux_shaders.h"
 
 #include <windows.h>
 #include <dxgiformat.h>
@@ -138,6 +139,26 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
     return m_entries[0].get();
 }
 
+const Texture* FrameGenerator::Crop(const ExternalImage& image, const Rect& r, bool depth)
+{
+    Cut& c = m_cut[depth ? 0 : 1];
+    if (r.x + r.w > image.width || r.y + r.h > image.height)
+        return nullptr;
+    if (!c.pass) c.pass = m_dev.CreatePass(depth ? shaders::kCropR32f : shaders::kCropRg16f);
+    if (!c.tex || c.tex->width != r.w || c.tex->height != r.h)
+    {
+        if (c.tex) m_oldCuts.push_back({std::move(c.tex), m_evaluations});
+        c.tex = m_dev.CreateTexture(depth ? Format::R32Float : Format::RG16Float, r.w, r.h);
+        Log("%s cut to the rendered region %ux%u of %ux%u", depth ? "depth" : "motion vectors", r.w, r.h, image.width, image.height);
+    }
+    const Texture* src = m_dev.Wrap(image, false);
+    if (!c.pass || !c.tex || !src)
+        return nullptr;
+    const int32_t k[4] = {int32_t(r.x), int32_t(r.y), int32_t(r.w), int32_t(r.h)};
+    const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Tex(1, *src), Bind::Tex(2, *c.tex)};
+    return c.pass->Dispatch(b, 3, (r.w + 7) / 8, (r.h + 7) / 8) ? c.tex.get() : nullptr;
+}
+
 bool FrameGenerator::Generate(const EvalInputs& in)
 {
     // The frame interpolated: HUD-less when it is the back buffer's size and format.
@@ -147,8 +168,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
         return false;
     ExternalImage depth = in.depth, motion = in.motion;
     const uint32_t rw = in.depthRect.w ? in.depthRect.w : depth.width, rh = in.depthRect.h ? in.depthRect.h : depth.height;
-    if (!Whole(in.depthRect, depth) || !Whole(in.motionRect, motion))
-        return false;  // the cut-out pass comes with the UI milestone
+    const bool cutDepth = !Whole(in.depthRect, depth), cutMotion = !Whole(in.motionRect, motion);
+    const uint32_t mw = cutMotion ? in.motionRect.w : motion.width, mh = cutMotion ? in.motionRect.h : motion.height;
     Entry* e = Get(color, in, in.back.width, in.back.height, rw, rh);
     m_current = e;
     if (e->failed)
@@ -156,6 +177,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
 
     FrameInputs f;
     f.color = color, f.depth = depth, f.motion = motion;
+    if (cutDepth && !(f.depthTexture = Crop(depth, in.depthRect, true))) return false;
+    if (cutMotion && !(f.motionTexture = Crop(motion, in.motionRect, false))) return false;
     const bool uiAlpha = SameSize(in.uiAlpha, in.back) && Whole(in.uiAlphaRect, in.uiAlpha);
     const bool uiLayer = !uiAlpha && SameSize(in.ui, in.back) && Whole(in.uiRect, in.ui);
     if (hudless || uiAlpha || uiLayer)
@@ -167,8 +190,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     if (SameSize(in.noWarp, in.back) && Whole(in.noWarpRect, in.noWarp)) f.noWarp = in.noWarp;
     f.reset = in.reset || m_restart;
     f.jitter[0] = in.jitter[0], f.jitter[1] = in.jitter[1];
-    f.mvScale[0] = in.mvScale[0] * float(in.back.width) / float(std::max(1u, motion.width));
-    f.mvScale[1] = in.mvScale[1] * float(in.back.height) / float(std::max(1u, motion.height));
+    f.mvScale[0] = in.mvScale[0] * float(in.back.width) / float(std::max(1u, mw));
+    f.mvScale[1] = in.mvScale[1] * float(in.back.height) / float(std::max(1u, mh));
     f.cameraNear = in.cameraNear, f.cameraFar = in.cameraFar, f.fovY = in.fovY, f.orthographic = in.ortho;
     float inv[16];
     if (!in.hasClipToPrevClip || !m_haveVp)
@@ -218,6 +241,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
             if (FILE* f = fopen((std::string(Env("NFRUX_DUMP_DIR") ? Env("NFRUX_DUMP_DIR") : ".") + "\\" + n).c_str(), "wb")) fwrite(v->data(), 1, v->size(), f), fclose(f);
         dumps.clear();
     }    m_retired.erase(std::remove_if(m_retired.begin(), m_retired.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_retired.end());
+    m_oldCuts.erase(std::remove_if(m_oldCuts.begin(), m_oldCuts.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_oldCuts.end());
     if (!m_dev.BeginFrame(commands))
         return false;
     if (in.index <= 1)

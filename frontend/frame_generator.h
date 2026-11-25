@@ -42,8 +42,10 @@ private:
     };
     Entry* Get(const ExternalImage& color, const EvalInputs& in, uint32_t w, uint32_t h, uint32_t rw, uint32_t rh);
     bool   Generate(const EvalInputs& in);
-    ExternalImage Crop(const ExternalImage& image, const Rect& r, std::unique_ptr<Texture>& cache);
+    const Texture* Crop(const ExternalImage& image, const Rect& r, bool depth);
 
+    struct Cut { std::unique_ptr<Pass> pass; std::unique_ptr<Texture> tex; } m_cut[2];  // depth, motion
+    std::vector<std::pair<std::unique_ptr<Texture>, uint64_t>> m_oldCuts;
     std::unique_ptr<Device> m_device;  // its own: recording state is never shared between features
     Device&    m_dev;
     bool       m_vulkan;

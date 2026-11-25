@@ -378,7 +378,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     if (!MakeOuts(count, nullptr))
         return false;
     const bool needsAlpha = in.uiKind >= 2 && in.uiKind <= 5;
-    const Texture *pc = dev.Wrap(in.color, false), *pd = dev.Wrap(in.depth, false), *pm = dev.Wrap(in.motion, false);
+    const Texture *pc = dev.Wrap(in.color, false), *pd = in.depthTexture ? in.depthTexture : dev.Wrap(in.depth, false), *pm = in.motionTexture ? in.motionTexture : dev.Wrap(in.motion, false);
     const Texture *ps = in.uiSource ? dev.Wrap(in.uiSource, false) : pc, *pa = needsAlpha && in.uiAlpha ? dev.Wrap(in.uiAlpha, false) : ps;
     const Texture *pn = in.noWarp ? dev.Wrap(in.noWarp, false) : ps;
     if (!pc || !pd || !pm || !ps || !pa || !pn)

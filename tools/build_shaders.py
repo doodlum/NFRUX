@@ -63,6 +63,8 @@ for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
                 ("kFiInpaintMip", fi_ + "_31_downsample_inpaint_mip_pass", D + fmt("rgba16f")),
                 ("kFiInpaint", fi_ + "_50_inpaint_pass", D + fmt("rgba16f"))]:
     passes.append((n, s, d, INV, 60))
+for n, f in [("kCropR32f", "r32f"), ("kCropRg16f", "rg16f")]:
+    passes.append((n, "shaders/frontend/crop", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kFiPostprocess{suffix}", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f), INV, 60))
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
