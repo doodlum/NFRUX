@@ -325,5 +325,12 @@ vectors for every method; network outputs rounded to 8 bits (the blend is not).
 | 6x | 180 | 34.13 | 34.10 | 33.33 | 33.56 | 25.57 |
 
 A3: within 0.04 dB at every multiplier (limit 0.2); the worst single frame against PyTorch is -0.50 / -1.93 / -0.32 / -0.29 / -0.50 dB (2x-6x), which frame the
-3x one is was not looked at (frames under 45 dB in PyTorch average +0.02 there). A14: above Arm's, both ways, at every multiplier. The Vulkan repeat of this run
-was still going when this was written.
+3x one is was not looked at (frames under 45 dB in PyTorch average +0.02 there). A14: above Arm's, both ways, at every multiplier. The Vulkan repeat (test_new only, one pair a
+sequence, same binary; not comparable with the table's sets):
+
+```n2x {'nfrux': 38.41, 'torch': 38.45, 'arm+prior': 37.78, 'arm': 37.78, 'blend': 27.13} n 6
+3x {'nfrux': 37.3, 'torch': 37.51, 'arm+prior': 36.97, 'arm': 36.78, 'blend': 30.52} n 12
+4x {'nfrux': 41.06, 'torch': 41.14, 'arm+prior': 40.75, 'arm': 40.67, 'blend': 27.84} n 9
+5x {'nfrux': 32.01, 'torch': 32.0, 'arm+prior': 32.41, 'arm': 32.06, 'blend': 21.31} n 12
+6x {'nfrux': 37.07, 'torch': 37.03, 'arm+prior': 36.39, 'arm': 36.02, 'blend': 29.2} n 15
+```
