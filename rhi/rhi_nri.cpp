@@ -351,15 +351,31 @@ public:
     }
 
     // --- recording
-    bool Done(uint32_t s, uint32_t v) const { return tokens[s] == v || slotValue[s] != v; }
+    bool Done(uint32_t s, uint32_t v) const { return tokens[s] == v || (slotValue[s] != v); }  // a slot is only taken again once its recording finished
     void Poll()
     {
         for (auto it = retired.begin(); it != retired.end();)
             if (Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
     }
-    void WaitSlot(uint32_t s)
+    bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
+    // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
+    bool TakeSlot()
     {
-        for (int i = 0; i < 2000 && slotValue[s] && tokens[s] != slotValue[s]; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (int ms = 0; ms < 2000 && !Lost(); ++ms)
+        {
+            for (uint32_t i = 0; i < kSlots; ++i)
+            {
+                const uint32_t s = (next + i) % kSlots;
+                if (slotValue[s] && tokens[s] != slotValue[s]) continue;
+                slot = s;
+                slotValue[s] = tokenUpMap[s] = ++next;
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        static bool logged = false;
+        if (!logged) Log("no recording finished in 2 s: frame not generated"), logged = true;
+        return false;
     }
     bool BeginFrame(void* commands) override
     {
@@ -377,10 +393,7 @@ public:
             d.d3d12CommandList = static_cast<ID3D12GraphicsCommandList*>(commands);
             if (!NRI_OK(nd3.CreateCommandBufferD3D12(*dev, d, cmd))) return false;
         }
-        slot = next++ % kSlots;
-        WaitSlot(slot);
-        slotValue[slot]  = next;
-        tokenUpMap[slot] = next;
+        if (!TakeSlot()) { n.DestroyCommandBuffer(cmd), cmd = nullptr; return false; }
         usedConstants    = 0;
         n.ResetDescriptorPool(*pools[slot]);
         n.CmdSetDescriptorPool(*cmd, *pools[slot]);
@@ -559,7 +572,14 @@ public:
     void Mark(const char*) override {}
     void WaitIdle() override
     {
-        for (uint32_t s = 0; s < kSlots; ++s) WaitSlot(s);
+        bool busy = true;
+        for (int ms = 0; ms < 2000 && busy && !Lost(); ++ms)
+        {
+            busy = false;
+            for (uint32_t s = 0; s < kSlots; ++s) busy = busy || (slotValue[s] && tokens[s] != slotValue[s]);
+            if (busy) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (busy) Log("work still in flight after 2 s%s", Lost() ? " (device removed)" : "");
         for (auto& r : reads)
         {
             if (auto* p = static_cast<uint8_t*>(n.MapBuffer(*r.buf, 0, nri::WHOLE_SIZE)))

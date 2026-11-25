@@ -23,9 +23,9 @@ std::mutex g_mutex;
 struct Vk { VkInstance i = VK_NULL_HANDLE; VkPhysicalDevice pd = VK_NULL_HANDLE; VkDevice d = VK_NULL_HANDLE; PFN_vkGetInstanceProcAddr gi = nullptr; PFN_vkGetDeviceProcAddr gd = nullptr; } g_vk;
 uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
 bool     g_vkAtomic64 = false, g_vkKnown = false;
-std::map<void*, std::shared_ptr<Device>> g_devices;  // by ID3D12Device* / VkDevice: kept until shutdown
-struct Feature { NgxHandle handle; std::shared_ptr<Device> dev; std::unique_ptr<FrameGenerator> fg; bool vulkan; };
+struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
 std::map<const NgxHandle*, std::unique_ptr<Feature>> g_features;
+std::map<void*, std::shared_ptr<FrameGenerator>> g_warm;  // released features' generators, by host device, for the next create
 unsigned g_next = 0x4e460001;
 
 uint32_t MaxFrames()
@@ -33,18 +33,9 @@ uint32_t MaxFrames()
     const char* v = Env("NFRUX_MAX_FRAMES");
     return v ? std::clamp(atoi(v), 1, int(kMaxGenerated)) : kMaxGenerated;
 }
-std::shared_ptr<Device> DeviceFor12(ID3D12Device* d)
-{
-    auto& s = g_devices[d];
-    if (!s) s = CreateNriD3D12Device(d);
-    if (!s) g_devices.erase(d);
-    return s;
-}
-std::shared_ptr<Device> DeviceForVk()
+std::unique_ptr<Device> DeviceForVk()
 {
     if (!g_vk.d) return nullptr;
-    auto it = g_devices.find(g_vk.d);
-    if (it != g_devices.end()) return it->second;
     VulkanHost h;
     h.instance = g_vk.i, h.physicalDevice = g_vk.pd, h.device = g_vk.d, h.gipa = g_vk.gi, h.gdpa = g_vk.gd;
     if (HMODULE m = GetModuleHandleA("vulkan-1.dll"); m && (!h.gipa || !h.gdpa))
@@ -61,16 +52,17 @@ std::shared_ptr<Device> DeviceForVk()
         h.mlFeatures = ffx_ml::QueryDeviceFeatures(h.instance, h.physicalDevice, h.gipa, &ext);
         Log("NFRUX_VK_ASSUME_FEATURES: using device features whether or not the game enabled them");
     }
-    auto s = std::shared_ptr<Device>(CreateNriVulkanDevice(h));
-    if (s) g_devices[g_vk.d] = s;
-    return s;
+    return CreateNriVulkanDevice(h);
 }
-NgxResult Add(std::shared_ptr<Device> dev, bool vulkan, NgxHandle** out)
+NgxResult Add(void* host, bool vulkan, NgxHandle** out)
 {
-    if (!dev) return kNgxPlatformError;
     auto f    = std::make_unique<Feature>();
-    f->handle = {g_next++}, f->dev = dev, f->vulkan = vulkan;
-    f->fg     = std::make_unique<FrameGenerator>(*dev, vulkan);
+    f->handle = {g_next++}, f->vulkan = vulkan, f->host = host;
+    if (auto w = g_warm.find(host); w != g_warm.end())
+        f->fg = w->second, f->fg->Restart(), g_warm.erase(w);
+    else if (auto dev = vulkan ? DeviceForVk() : CreateNriD3D12Device(static_cast<ID3D12Device*>(host)))
+        f->fg = std::make_shared<FrameGenerator>(std::move(dev), vulkan);
+    else return kNgxPlatformError;
     *out      = &f->handle;
     Log("feature %x created (%s)", f->handle.Id, vulkan ? "Vulkan" : "D3D12");
     g_features[&f->handle] = std::move(f);
@@ -143,20 +135,22 @@ EvalInputs Read(NgxParameter* p, bool vk)
 }
 NgxResult Eval(void* cmd, const NgxHandle* h, NgxParameter* p)
 {
-    FrameGenerator* fg;
+    std::shared_ptr<FrameGenerator> fg;  // alive through this call even if released meanwhile
     bool            vk;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         Feature* f = Find(h);
         if (!f || !p || !cmd) return f ? kNgxInvalidParameter : kNgxFeatureNotFound;
-        fg = f->fg.get(), vk = f->vulkan;
+        fg = f->fg, vk = f->vulkan;
     }
     return fg->Evaluate(cmd, Read(p, vk)) ? kNgxSuccess : kNgxInvalidParameter;
 }
 NgxResult Release(NgxHandle* h)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!Find(h)) return kNgxFeatureNotFound;
+    Feature* f = Find(h);
+    if (!f) return kNgxFeatureNotFound;
+    g_warm[f->host] = f->fg;
     g_features.erase(h);
     Log("feature released");
     return kNgxSuccess;
@@ -182,19 +176,23 @@ void SetVk(VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcA
     std::lock_guard<std::mutex> lock(g_mutex);
     g_vk = {i, pd, d, gi, gd};
 }
-void DropAll()
+// Of one API (and device, when given): the other API's features stay.
+void Drop(bool vulkan, void* host)
 {
+    std::vector<std::shared_ptr<FrameGenerator>> dead;  // destroyed after the lock
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_features.clear();
-    g_devices.clear();
+    for (auto it = g_features.begin(); it != g_features.end();)
+        if (it->second->vulkan == vulkan && (!host || it->second->host == host)) { dead.push_back(it->second->fg), it = g_features.erase(it); } else ++it;
+    for (auto it = g_warm.begin(); it != g_warm.end();)
+        if (it->second->vulkan() == vulkan && (!host || it->first == host)) { dead.push_back(it->second), it = g_warm.erase(it); } else ++it;
 }
 }  // namespace
 
 // --- D3D12
 NFRUX_EXPORT NVSDK_NGX_D3D12_Init(unsigned long long, const wchar_t*, ID3D12Device*, const void*, int) { return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_D3D12_Init_Ext(unsigned long long, const wchar_t*, ID3D12Device*, int, const void*) { return kNgxSuccess; }
-NFRUX_EXPORT NVSDK_NGX_D3D12_Shutdown() { DropAll(); return kNgxSuccess; }
-NFRUX_EXPORT NVSDK_NGX_D3D12_Shutdown1(ID3D12Device*) { DropAll(); return kNgxSuccess; }
+NFRUX_EXPORT NVSDK_NGX_D3D12_Shutdown() { Drop(false, nullptr); return kNgxSuccess; }
+NFRUX_EXPORT NVSDK_NGX_D3D12_Shutdown1(ID3D12Device* d) { Drop(false, d); return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_D3D12_GetScratchBufferSize(int, const NgxParameter*, size_t* size) { if (size) *size = 0; return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList* list, int feature, NgxParameter*, NgxHandle** out)
 {
@@ -203,7 +201,7 @@ NFRUX_EXPORT NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsCommandList* list, int 
     ID3D12Device* d = nullptr;
     if (FAILED(list->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d)))) return kNgxPlatformError;
     std::lock_guard<std::mutex> lock(g_mutex);
-    const NgxResult r = Add(DeviceFor12(d), false, out);
+    const NgxResult r = Add(d, false, out);
     d->Release();
     return r;
 }
@@ -216,8 +214,8 @@ NFRUX_EXPORT NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl(ID3D12Device*, NgxPar
 NFRUX_EXPORT NVSDK_NGX_VULKAN_Init(unsigned long long, const wchar_t*, VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd, const void*, int) { SetVk(i, pd, d, gi, gd); return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_Init_Ext(unsigned long long, const wchar_t*, VkInstance i, VkPhysicalDevice pd, VkDevice d, int, const void*) { SetVk(i, pd, d, nullptr, nullptr); return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_Init_Ext2(unsigned long long, const wchar_t*, VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd, int, const void*) { SetVk(i, pd, d, gi, gd); return kNgxSuccess; }
-NFRUX_EXPORT NVSDK_NGX_VULKAN_Shutdown() { DropAll(); return kNgxSuccess; }
-NFRUX_EXPORT NVSDK_NGX_VULKAN_Shutdown1(VkDevice) { DropAll(); return kNgxSuccess; }
+NFRUX_EXPORT NVSDK_NGX_VULKAN_Shutdown() { Drop(true, nullptr); return kNgxSuccess; }
+NFRUX_EXPORT NVSDK_NGX_VULKAN_Shutdown1(VkDevice d) { Drop(true, d); return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_GetScratchBufferSize(int, const NgxParameter*, size_t* size) { if (size) *size = 0; return kNgxSuccess; }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_CreateFeature1(VkDevice d, VkCommandBuffer, int feature, NgxParameter*, NgxHandle** out)
 {
@@ -225,7 +223,7 @@ NFRUX_EXPORT NVSDK_NGX_VULKAN_CreateFeature1(VkDevice d, VkCommandBuffer, int fe
     if (!out) return kNgxInvalidParameter;
     std::lock_guard<std::mutex> lock(g_mutex);
     if (d) g_vk.d = d;
-    return Add(DeviceForVk(), true, out);
+    return Add(g_vk.d, true, out);
 }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_CreateFeature(VkCommandBuffer c, int feature, NgxParameter* p, NgxHandle** out) { return NVSDK_NGX_VULKAN_CreateFeature1(VK_NULL_HANDLE, c, feature, p, out); }
 NFRUX_EXPORT NVSDK_NGX_VULKAN_EvaluateFeature(VkCommandBuffer c, const NgxHandle* h, NgxParameter* p, void*) { return Eval(c, h, p); }

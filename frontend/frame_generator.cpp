@@ -186,7 +186,11 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     memcpy(f.viewProjection, m_vp, sizeof(m_vp));
     const uint32_t count = std::min(in.count, kMaxGenerated);
     if (!e->ip->Dispatch(f, count, in.count))
+    {
+        e->failed = true, m_restart = true;  // its histories are half made: not used again
+        Log("recording a frame failed: showing rendered frames at this size");
         return false;
+    }
     const bool wasReset = f.reset;
     m_restart = false;
     m_ready   = wasReset ? 0 : count;  // on a reset every output is the frame itself
@@ -226,15 +230,21 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         static uint32_t logged = 0;
         if (in.count != logged) Log("%u generated frame(s) per rendered frame", in.count), logged = in.count;
     }
-    Texture& back = *m_dev.Wrap(in.back, false);
-    Texture& out  = *m_dev.Wrap(in.output, true);
+    Texture *pBack = m_dev.Wrap(in.back, false), *pOut = m_dev.Wrap(in.output, true);
+    if (!pBack || !pOut)
+    {
+        m_dev.EndFrame();
+        return false;
+    }
+    Texture &back = *pBack, &out = *pOut;
     const uint32_t k = std::max(1u, in.index) - 1;
     if (k < m_ready && m_current && m_current->ip)
         m_dev.CopyTexture(m_current->ip->Output(k), out), ++m_generated;
     else
         m_dev.CopyTexture(back, out);
     if (in.outputReal && in.outputReal.handle != in.back.handle)
-        m_dev.CopyTexture(back, *m_dev.Wrap(in.outputReal, true));
+        if (Texture* real = m_dev.Wrap(in.outputReal, true))
+            m_dev.CopyTexture(back, *real);
     if (dumpAt >= 0 && rendered >= dumpAt && rendered < dumpAt + 8)
     {
         auto add = [&](const std::string& what, const Texture& t) {
@@ -244,7 +254,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         };
         if (in.index <= 1)
         {
-            add("back", back), add("motion", *m_dev.Wrap(in.motion, false));
+            add("back", back);
             if (in.hudless) add("hudless", *m_dev.Wrap(in.hudless, false));
         }
         add("gen", out);

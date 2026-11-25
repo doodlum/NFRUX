@@ -377,11 +377,13 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
 {
     if (!MakeOuts(count, nullptr))
         return false;
-    const Texture &color = *dev.Wrap(in.color, false), &depth = *dev.Wrap(in.depth, false), &mv = *dev.Wrap(in.motion, false);
-    const Texture& uiSource = in.uiSource ? *dev.Wrap(in.uiSource, false) : color;
-    const bool     needsAlpha = in.uiKind >= 2 && in.uiKind <= 5;
-    const Texture& uiAlpha = needsAlpha && in.uiAlpha ? *dev.Wrap(in.uiAlpha, false) : uiSource;
-    const Texture& noWarp  = in.noWarp ? *dev.Wrap(in.noWarp, false) : uiSource;
+    const bool needsAlpha = in.uiKind >= 2 && in.uiKind <= 5;
+    const Texture *pc = dev.Wrap(in.color, false), *pd = dev.Wrap(in.depth, false), *pm = dev.Wrap(in.motion, false);
+    const Texture *ps = in.uiSource ? dev.Wrap(in.uiSource, false) : pc, *pa = needsAlpha && in.uiAlpha ? dev.Wrap(in.uiAlpha, false) : ps;
+    const Texture *pn = in.noWarp ? dev.Wrap(in.noWarp, false) : ps;
+    if (!pc || !pd || !pm || !ps || !pa || !pn)
+        return false;
+    const Texture &color = *pc, &depth = *pd, &mv = *pm, &uiSource = *ps, &uiAlpha = *pa, &noWarp = *pn;
     const bool     reset   = in.reset || frame == 0;
     const Texture &prev = *colorTm1[frame % 2], &backup = *colorTm1[(frame + 1) % 2];
     ++frame;

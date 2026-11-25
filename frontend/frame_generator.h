@@ -25,10 +25,11 @@ class FrameGenerator
 {
 public:
     // formatOf: an external image's format class for the composite (Unknown: not supported).
-    FrameGenerator(Device& device, bool vulkan) : m_dev(device), m_vulkan(vulkan) {}
+    FrameGenerator(std::unique_ptr<Device> device, bool vulkan) : m_device(std::move(device)), m_dev(*m_device), m_vulkan(vulkan) {}
     ~FrameGenerator();
     // Records one Evaluate. False: nothing usable was passed (the caller reports an invalid parameter).
     bool Evaluate(void* commands, const EvalInputs& in);
+    bool vulkan() const { return m_vulkan; }
     void Restart() { m_restart = true; }
 
 private:
@@ -43,6 +44,7 @@ private:
     bool   Generate(const EvalInputs& in);
     ExternalImage Crop(const ExternalImage& image, const Rect& r, std::unique_ptr<Texture>& cache);
 
+    std::unique_ptr<Device> m_device;  // its own: recording state is never shared between features
     Device&    m_dev;
     bool       m_vulkan;
     std::mutex m_mutex;
