@@ -1,0 +1,1710 @@
+// SPDX-FileCopyrightText: Copyright 2026 Neural Graphics SDK universal contributors
+// SPDX-License-Identifier: MIT
+
+#include "ffx_vk_ml_runtime.h"
+#include "ffx_vk_ml_graph.h"
+
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+
+// Kernels, compiled from shaders/ffx_ml_conv2d.comp at build time.
+#include "ffx_ml_conv2d_scalar_spv.h"
+#include "ffx_ml_conv2d_dot4_spv.h"
+#include "ffx_ml_conv2d_dot4_tiled_spv.h"
+#include "ffx_ml_conv2d_dot4_tiled_img_spv.h"
+#include "ffx_ml_conv2d_dot4_chain_spv.h"
+#include "ffx_ml_conv2d_coopmat_int8_spv.h"
+#include "ffx_ml_conv2d_coopmat_fp16_spv.h"
+#include "ffx_ml_conv2d_coopmat_bf16_spv.h"
+
+namespace ffx_ml
+{
+// FFX_DUMP_PIPELINES=<dir> (tuning, needs VK_KHR_pipeline_executable_properties enabled on the device): each compute
+    // pipeline's driver statistics and internal representations (for RADV: NIR, ACO IR and the final ISA) are written to
+    // <dir>/<pipeline name>.txt.
+    void DumpPipeline(PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkPipeline pipeline, const char* name, const char* dir)
+    {
+        auto execs = (PFN_vkGetPipelineExecutablePropertiesKHR)gdpa(device, "vkGetPipelineExecutablePropertiesKHR");
+        auto stats = (PFN_vkGetPipelineExecutableStatisticsKHR)gdpa(device, "vkGetPipelineExecutableStatisticsKHR");
+        auto irs   = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)gdpa(device, "vkGetPipelineExecutableInternalRepresentationsKHR");
+        if (!execs || !stats || !irs)
+            return;
+        std::string path = std::string(dir) + "/" + (name && *name ? name : "unnamed") + ".txt";
+        for (char& c : path)
+            if (c == ' ')
+                c = '_';
+        FILE* f = fopen(path.c_str(), "w");
+        if (!f)
+            return;
+        VkPipelineInfoKHR info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+        uint32_t          n    = 0;
+        execs(device, &info, &n, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> props(n, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+        execs(device, &info, &n, props.data());
+        for (uint32_t e = 0; e < n; ++e)
+        {
+            fprintf(f, "== %s (%s), subgroup size %u\n", props[e].name, props[e].description, props[e].subgroupSize);
+            VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, e};
+            uint32_t                    sn = 0;
+            stats(device, &ei, &sn, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> st(sn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            stats(device, &ei, &sn, st.data());
+            for (const auto& x : st)
+            {
+                if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR)
+                    fprintf(f, "%s: %llu\n", x.name, (unsigned long long)x.value.u64);
+                else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR)
+                    fprintf(f, "%s: %lld\n", x.name, (long long)x.value.i64);
+                else if (x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR)
+                    fprintf(f, "%s: %f\n", x.name, x.value.f64);
+                else
+                    fprintf(f, "%s: %d\n", x.name, int(x.value.b32));
+            }
+            uint32_t rn = 0;
+            irs(device, &ei, &rn, nullptr);
+            std::vector<VkPipelineExecutableInternalRepresentationKHR> ir(rn, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+            irs(device, &ei, &rn, ir.data());
+            std::vector<std::vector<char>> text(rn);
+            for (uint32_t r = 0; r < rn; ++r)
+            {
+                text[r].resize(ir[r].dataSize + 1);
+                ir[r].pData = text[r].data();
+            }
+            irs(device, &ei, &rn, ir.data());
+            for (uint32_t r = 0; r < rn; ++r)
+                fprintf(f, "\n---- %s (%s)\n%s\n", ir[r].name, ir[r].description, text[r].data());
+        }
+        fclose(f);
+    }
+
+    namespace
+    {
+        struct Functions
+        {
+            PFN_vkGetPhysicalDeviceProperties2                      GetPhysicalDeviceProperties2;
+            PFN_vkGetPhysicalDeviceMemoryProperties                 GetPhysicalDeviceMemoryProperties;
+            PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR   GetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+            PFN_vkCreateBuffer                                      CreateBuffer;
+            PFN_vkDestroyBuffer                                     DestroyBuffer;
+            PFN_vkGetBufferMemoryRequirements                       GetBufferMemoryRequirements;
+            PFN_vkAllocateMemory                                    AllocateMemory;
+            PFN_vkFreeMemory                                        FreeMemory;
+            PFN_vkBindBufferMemory                                  BindBufferMemory;
+            PFN_vkMapMemory                                         MapMemory;
+            PFN_vkUnmapMemory                                       UnmapMemory;
+            PFN_vkCreateShaderModule                                CreateShaderModule;
+            PFN_vkDestroyShaderModule                               DestroyShaderModule;
+            PFN_vkCreateDescriptorSetLayout                         CreateDescriptorSetLayout;
+            PFN_vkDestroyDescriptorSetLayout                        DestroyDescriptorSetLayout;
+            PFN_vkCreatePipelineLayout                              CreatePipelineLayout;
+            PFN_vkDestroyPipelineLayout                             DestroyPipelineLayout;
+            PFN_vkCreateComputePipelines                            CreateComputePipelines;
+            PFN_vkDestroyPipeline                                   DestroyPipeline;
+            PFN_vkCreateDescriptorPool                              CreateDescriptorPool;
+            PFN_vkDestroyDescriptorPool                             DestroyDescriptorPool;
+            PFN_vkAllocateDescriptorSets                            AllocateDescriptorSets;
+            PFN_vkUpdateDescriptorSets                              UpdateDescriptorSets;
+            PFN_vkCmdBindPipeline                                   CmdBindPipeline;
+            PFN_vkCmdBindDescriptorSets                             CmdBindDescriptorSets;
+            PFN_vkCmdDispatch                                       CmdDispatch;
+            PFN_vkCmdPipelineBarrier                                CmdPipelineBarrier;
+            PFN_vkCmdCopyBuffer                                     CmdCopyBuffer;
+            PFN_vkCmdFillBuffer                                     CmdFillBuffer;
+            PFN_vkCmdWriteTimestamp                                 CmdWriteTimestamp;
+
+            bool Load(const DeviceContext& ctx)
+            {
+                bool ok = true;
+#define FFX_ML_INSTANCE_FN(name) ok &= (name = reinterpret_cast<PFN_vk##name>(ctx.getInstanceProcAddr(ctx.instance, "vk" #name))) != nullptr
+#define FFX_ML_DEVICE_FN(name) ok &= (name = reinterpret_cast<PFN_vk##name>(ctx.getDeviceProcAddr(ctx.device, "vk" #name))) != nullptr
+                FFX_ML_INSTANCE_FN(GetPhysicalDeviceProperties2);
+                FFX_ML_INSTANCE_FN(GetPhysicalDeviceMemoryProperties);
+                GetPhysicalDeviceCooperativeMatrixPropertiesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                    ctx.getInstanceProcAddr(ctx.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+                if (ctx.device == VK_NULL_HANDLE)
+                    return ok;
+                FFX_ML_DEVICE_FN(CreateBuffer);
+                FFX_ML_DEVICE_FN(DestroyBuffer);
+                FFX_ML_DEVICE_FN(GetBufferMemoryRequirements);
+                FFX_ML_DEVICE_FN(AllocateMemory);
+                FFX_ML_DEVICE_FN(FreeMemory);
+                FFX_ML_DEVICE_FN(BindBufferMemory);
+                FFX_ML_DEVICE_FN(MapMemory);
+                FFX_ML_DEVICE_FN(UnmapMemory);
+                FFX_ML_DEVICE_FN(CreateShaderModule);
+                FFX_ML_DEVICE_FN(DestroyShaderModule);
+                FFX_ML_DEVICE_FN(CreateDescriptorSetLayout);
+                FFX_ML_DEVICE_FN(DestroyDescriptorSetLayout);
+                FFX_ML_DEVICE_FN(CreatePipelineLayout);
+                FFX_ML_DEVICE_FN(DestroyPipelineLayout);
+                FFX_ML_DEVICE_FN(CreateComputePipelines);
+                FFX_ML_DEVICE_FN(DestroyPipeline);
+                FFX_ML_DEVICE_FN(CreateDescriptorPool);
+                FFX_ML_DEVICE_FN(DestroyDescriptorPool);
+                FFX_ML_DEVICE_FN(AllocateDescriptorSets);
+                FFX_ML_DEVICE_FN(UpdateDescriptorSets);
+                FFX_ML_DEVICE_FN(CmdBindPipeline);
+                FFX_ML_DEVICE_FN(CmdBindDescriptorSets);
+                FFX_ML_DEVICE_FN(CmdDispatch);
+                FFX_ML_DEVICE_FN(CmdPipelineBarrier);
+                FFX_ML_DEVICE_FN(CmdCopyBuffer);
+                FFX_ML_DEVICE_FN(CmdFillBuffer);
+                FFX_ML_DEVICE_FN(CmdWriteTimestamp);
+#undef FFX_ML_INSTANCE_FN
+#undef FFX_ML_DEVICE_FN
+                return ok;
+            }
+        };
+
+        Vendor VendorFromId(uint32_t id)
+        {
+            switch (id)
+            {
+            case 0x10DE:
+                return Vendor::Nvidia;
+            case 0x1002:
+            case 0x1022:
+                return Vendor::Amd;
+            case 0x8086:
+                return Vendor::Intel;
+            case 0x13B5:
+                return Vendor::Arm;
+            case 0x5143:
+                return Vendor::Qualcomm;
+            default:
+                return Vendor::Other;
+            }
+        }
+
+        // Proton reports AMD GPUs as NVIDIA (vendor 0x10DE) so games enable DLSS. The tuning must follow the real
+        // hardware, so the driver ID and the device name take precedence over the vendor ID.
+        Vendor VendorFromDevice(uint32_t vendorId, VkDriverId driverId, const char* deviceName)
+        {
+            switch (driverId)
+            {
+            case VK_DRIVER_ID_MESA_RADV:
+            case VK_DRIVER_ID_AMD_PROPRIETARY:
+            case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+                return Vendor::Amd;
+            case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
+            case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA:
+                return Vendor::Intel;
+            default:
+                break;
+            }
+            if (deviceName && (strstr(deviceName, "RADV") || strstr(deviceName, "AMD") || strstr(deviceName, "Radeon")))
+                return Vendor::Amd;
+            return VendorFromId(vendorId);
+        }
+
+        // Per-vendor kernel tuning. The tile shape itself always comes from what the driver reports.
+        struct VendorTuning
+        {
+            uint32_t coopSubgroups;       // subgroups per workgroup for the coop-matrix kernel
+            uint32_t preferredSubgroup;   // subgroup size to request when subgroup size control is enabled (0 = default)
+            uint32_t preferredTileM;      // preferred M for the coop-matrix tile (0 = largest)
+            uint32_t vectorWorkgroup;     // workgroup size for dot4 / scalar kernels
+            MatType  matOrder[3];         // coop-matrix element types to try, fastest first (all exact)
+            uint32_t splitTargetGroups;   // coop layers with fewer workgroups split their output channels (grid z)
+            // Register-tiled dot4 kernel (ML_DOT4_TILED). 0 keeps the one-thread-per-(pixel, 4 channels) kernel.
+            uint32_t dot4Tiled;           // 1: use the tiled kernel
+            uint32_t dot4Subgroup;        // subgroup size to require for it (0 = driver default)
+            uint32_t dot4Acc;             // accumulators per thread: pixels per thread = dot4Acc / OCB (1..8)
+            uint32_t dot4Ocb;             // max output channels per thread
+            uint32_t dot4WgX, dot4WgY;    // workgroup shape in threads
+            uint32_t dot4TargetThreads;   // layers with fewer threads get narrower tiles (fewer pixels / channels per thread)
+            uint32_t dot4KsplitMax;       // max lanes splitting one tile's input words (1 = off)
+        };
+
+        VendorTuning TuningFor(Vendor vendor)
+        {
+            switch (vendor)
+            {
+            case Vendor::Nvidia:
+                // warp32 tensor cores, 16x16xK tiles (mma.sync m16n8k32 pairs). On the RTX 4080 fp16 beat int8 by ~5-8% and
+                // a split target of 128 workgroups (~2 per SM) was best; see docs/nss_gpu_tuning.md.
+                return {4, 32, 16, 128, {MatType::Fp16, MatType::Bf16, MatType::Int8}, 128};
+            case Vendor::Amd:
+                // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
+                // Steam Deck (Van Gogh); see docs/nss_gpu_tuning.md. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
+                // Workgroups 8 x 8: wider ones (32 x 2) were 2.5% faster for NFRU v2's network alone (nfru_ml_test) but 6% slower
+                // in the proxy (x4, Balanced's sizes between the other passes).
+                return {4, 32, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128, 1, 64, 32, 40, 8, 8, 4096, 4};
+            case Vendor::Intel:
+                return {8, 16, 8, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};    // Xe XMX systolic arrays, SIMD16 with 8xNxK tiles (untuned)
+            default:
+                return {4, 0, 16, 64, {MatType::Int8, MatType::Fp16, MatType::Bf16}, 128};
+            }
+        }
+
+        VkComponentTypeKHR MatComponentType(MatType type)
+        {
+            switch (type)
+            {
+            case MatType::Int8:
+                return VK_COMPONENT_TYPE_SINT8_KHR;
+            case MatType::Fp16:
+                return VK_COMPONENT_TYPE_FLOAT16_KHR;
+            case MatType::Bf16:
+                return VK_COMPONENT_TYPE_BFLOAT16_KHR;
+            default:
+                return VK_COMPONENT_TYPE_MAX_ENUM_KHR;
+            }
+        }
+
+        bool MatTypeEnabled(MatType type, uint32_t features)
+        {
+            switch (type)
+            {
+            case MatType::Int8:
+                return (features & FEATURE_SHADER_INT8) && (features & FEATURE_STORAGE_BUFFER_8BIT);
+            case MatType::Fp16:
+                return (features & FEATURE_SHADER_FLOAT16) && (features & FEATURE_STORAGE_BUFFER_16BIT);
+            case MatType::Bf16:
+                return (features & FEATURE_SHADER_BFLOAT16) && (features & FEATURE_STORAGE_BUFFER_16BIT);
+            default:
+                return false;
+            }
+        }
+
+        uint32_t MatElementSize(MatType type)
+        {
+            return type == MatType::Int8 ? 1u : 2u;
+        }
+
+        uint32_t RoundUp(uint32_t v, uint32_t m)
+        {
+            return (v + m - 1) / m * m;
+        }
+
+        uint16_t FloatToHalf(float f)
+        {
+            // Inputs are small integers, always exactly representable.
+            uint32_t x;
+            memcpy(&x, &f, 4);
+            const uint32_t sign = (x >> 16) & 0x8000u;
+            int32_t        exp  = int32_t((x >> 23) & 0xFF) - 127 + 15;
+            uint32_t       mant = x & 0x7FFFFFu;
+            if (f == 0.0f)
+                return uint16_t(sign);
+            if (exp <= 0)
+                return uint16_t(sign);
+            return uint16_t(sign | (uint32_t(exp) << 10) | (mant >> 13));
+        }
+
+        uint16_t FloatToBf16(float f)
+        {
+            uint32_t x;
+            memcpy(&x, &f, 4);
+            x += 0x7FFFu + ((x >> 16) & 1u);  // round to nearest even
+            return uint16_t(x >> 16);
+        }
+
+    }  // namespace
+
+    const char* ToString(Path path)
+    {
+        switch (path)
+        {
+        case Path::CoopMat:
+            return "coopmat";
+        case Path::Dot4:
+            return "dot4";
+        case Path::Scalar:
+            return "scalar";
+        default:
+            return "auto";
+        }
+    }
+
+    const char* ToString(MatType type)
+    {
+        switch (type)
+        {
+        case MatType::Int8:
+            return "int8";
+        case MatType::Fp16:
+            return "fp16";
+        case MatType::Bf16:
+            return "bf16";
+        default:
+            return "none";
+        }
+    }
+
+    const char* ToString(Vendor vendor)
+    {
+        switch (vendor)
+        {
+        case Vendor::Nvidia:
+            return "NVIDIA";
+        case Vendor::Amd:
+            return "AMD";
+        case Vendor::Intel:
+            return "Intel";
+        case Vendor::Arm:
+            return "Arm";
+        case Vendor::Qualcomm:
+            return "Qualcomm";
+        case Vendor::Other:
+            return "other";
+        default:
+            return "unknown";
+        }
+    }
+
+    std::string Selection::Describe() const
+    {
+        std::string s = std::string(ToString(vendor)) + " " + deviceName + ": " + ToString(path);
+        if (path == Path::CoopMat)
+        {
+            s += " " + std::string(ToString(matType)) + " " + std::to_string(tileM) + "x" + std::to_string(tileN) + "x" + std::to_string(tileK) +
+                 ", " + std::to_string(numSubgroups) + " subgroups of " + std::to_string(subgroupSize);
+        }
+        else if (dot4Tiled)
+        {
+            s += " tiled, subgroup " + std::to_string(subgroupSize);
+        }
+        else
+        {
+            s += ", workgroup " + std::to_string(workgroupSize);
+        }
+        return s;
+    }
+
+    uint32_t QueryDeviceFeatures(VkInstance instance, VkPhysicalDevice physicalDevice, PFN_vkGetInstanceProcAddr getInstanceProcAddr, std::vector<const char*>* extensions)
+    {
+        auto getFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(getInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+        auto enumerateExtensions =
+            reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(getInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties"));
+        if (!getFeatures2 || !enumerateExtensions)
+            return 0;
+    
+        uint32_t available = 0;
+        enumerateExtensions(physicalDevice, nullptr, &available, nullptr);
+        std::vector<VkExtensionProperties> properties(available);
+        enumerateExtensions(physicalDevice, nullptr, &available, properties.data());
+        auto hasExtension = [&](const char* name) {
+            for (const VkExtensionProperties& p : properties)
+                if (strcmp(p.extensionName, name) == 0)
+                    return true;
+            return false;
+        };
+    
+        VkPhysicalDeviceShaderBfloat16FeaturesKHR     bfloat16    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR  coopMatrix  = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        VkPhysicalDeviceVulkan13Features              vulkan13    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan12Features              vulkan12    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan11Features              vulkan11    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+        VkPhysicalDeviceFeatures2                     features2   = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features2.pNext = &vulkan11;
+        vulkan11.pNext  = &vulkan12;
+        vulkan12.pNext  = &vulkan13;
+        void** tail     = &vulkan13.pNext;
+        const bool coopExt     = hasExtension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        const bool bfloat16Ext = hasExtension(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+        if (coopExt)
+        {
+            *tail = &coopMatrix;
+            tail  = &coopMatrix.pNext;
+        }
+        if (bfloat16Ext)
+        {
+            *tail = &bfloat16;
+            tail  = &bfloat16.pNext;
+        }
+        getFeatures2(physicalDevice, &features2);
+    
+        uint32_t                 flags = 0;
+        std::vector<const char*> required;
+        if (vulkan12.shaderInt8)
+            flags |= FEATURE_SHADER_INT8;
+        if (vulkan12.storageBuffer8BitAccess)
+            flags |= FEATURE_STORAGE_BUFFER_8BIT;
+        if (vulkan12.shaderFloat16)
+            flags |= FEATURE_SHADER_FLOAT16;
+        if (vulkan11.storageBuffer16BitAccess)
+            flags |= FEATURE_STORAGE_BUFFER_16BIT;
+        if (vulkan13.shaderIntegerDotProduct)
+            flags |= FEATURE_INTEGER_DOT_PRODUCT;
+        if (vulkan13.subgroupSizeControl && vulkan13.computeFullSubgroups)
+            flags |= FEATURE_SUBGROUP_SIZE_CONTROL;
+        if (vulkan12.vulkanMemoryModel)
+            flags |= FEATURE_VULKAN_MEMORY_MODEL;
+        if (coopExt && coopMatrix.cooperativeMatrix)
+        {
+            flags |= FEATURE_COOPERATIVE_MATRIX;
+            required.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        }
+        if (bfloat16Ext && bfloat16.shaderBFloat16Type && bfloat16.shaderBFloat16CooperativeMatrix)
+        {
+            flags |= FEATURE_SHADER_BFLOAT16;
+            required.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+        }
+    
+        if (extensions)
+            *extensions = required;
+        return flags;
+    }
+
+    void ReadEnvironmentOverrides(Path& path, MatType& type)
+    {
+        if (const char* p = getenv("FFX_ML_PATH"))
+        {
+            if (!strcmp(p, "coopmat"))
+                path = Path::CoopMat;
+            else if (!strcmp(p, "dot4"))
+                path = Path::Dot4;
+            else if (!strcmp(p, "scalar"))
+                path = Path::Scalar;
+        }
+        if (const char* t = getenv("FFX_ML_MATTYPE"))
+        {
+            if (!strcmp(t, "int8"))
+                type = MatType::Int8;
+            else if (!strcmp(t, "fp16"))
+                type = MatType::Fp16;
+            else if (!strcmp(t, "bf16"))
+                type = MatType::Bf16;
+        }
+    }
+
+    bool SubgroupSizeSupported(const DeviceContext& context, uint32_t size)
+    {
+        auto props2 = (PFN_vkGetPhysicalDeviceProperties2)context.getInstanceProcAddr(context.instance, "vkGetPhysicalDeviceProperties2");
+        if (!props2)
+            return false;
+        VkPhysicalDeviceSubgroupSizeControlProperties sizeControl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        VkPhysicalDeviceProperties2                   props       = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sizeControl};
+        props2(context.physicalDevice, &props);
+        return size >= sizeControl.minSubgroupSize && size <= sizeControl.maxSubgroupSize &&
+               (sizeControl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    Selection SelectPath(const DeviceContext& context, Path forcedPath, MatType forcedType)
+    {
+        Functions fn = {};
+        DeviceContext instanceOnly = context;
+        instanceOnly.device        = VK_NULL_HANDLE;
+        fn.Load(instanceOnly);
+
+        Selection sel;
+
+        VkPhysicalDeviceDriverProperties              driver      = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceSubgroupSizeControlProperties sizeControl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, &driver};
+        VkPhysicalDeviceSubgroupProperties            subgroup    = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &sizeControl};
+        VkPhysicalDeviceProperties2                   props       = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &subgroup};
+        fn.GetPhysicalDeviceProperties2(context.physicalDevice, &props);
+
+        sel.vendorId   = props.properties.vendorID;
+        sel.vendor     = VendorFromDevice(sel.vendorId, driver.driverID, props.properties.deviceName);
+        sel.deviceName = props.properties.deviceName;
+        const VendorTuning tuning = TuningFor(sel.vendor);
+        const uint32_t     features = context.enabledFeatures;
+
+        auto allowed = [&](Path p) { return forcedPath == Path::Auto || forcedPath == p; };
+
+        // Is the coop-matrix kernel buildable on this device? Needs the extension plus at least one matrix type.
+        if ((allowed(Path::CoopMat) || forcedPath == Path::Auto) && (features & FEATURE_COOPERATIVE_MATRIX) &&
+            (features & FEATURE_VULKAN_MEMORY_MODEL) && fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR && forcedPath != Path::Dot4 &&
+            forcedPath != Path::Scalar)
+        {
+            uint32_t count = 0;
+            fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(context.physicalDevice, &count, nullptr);
+            std::vector<VkCooperativeMatrixPropertiesKHR> shapes(count, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(context.physicalDevice, &count, shapes.data());
+
+            // Exact types only: int8 natively; fp16/bf16 hold every int8 value and fp32 accumulation stays exact. The order
+            // is the vendor's measured preference; FFX_ML_MATTYPE forces one.
+            for (MatType type : tuning.matOrder)
+            {
+                if (forcedType != MatType::None && forcedType != type)
+                    continue;
+                if (!MatTypeEnabled(type, features))
+                    continue;
+                const VkComponentTypeKHR ab  = MatComponentType(type);
+                const VkComponentTypeKHR acc = (type == MatType::Int8) ? VK_COMPONENT_TYPE_SINT32_KHR : VK_COMPONENT_TYPE_FLOAT32_KHR;
+
+                const VkCooperativeMatrixPropertiesKHR* best      = nullptr;
+                int64_t                                 bestScore = -1;
+                for (const auto& s : shapes)
+                {
+                    if (s.AType != ab || s.BType != ab || s.CType != acc || s.ResultType != acc || s.scope != VK_SCOPE_SUBGROUP_KHR || s.saturatingAccumulation)
+                        continue;
+                    if (s.KSize % 4 != 0 || s.NSize > 16 || s.MSize > 16)
+                        continue;
+                    // Prefer N = 16 (fewer passes over the small OC counts), the vendor's preferred M, then the deepest K.
+                    int64_t score = int64_t(s.NSize) * 1000000 + (s.MSize == tuning.preferredTileM ? 100000 : int64_t(s.MSize) * 1000) + s.KSize;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        best      = &s;
+                    }
+                }
+                if (!best)
+                    continue;
+
+                sel.path         = Path::CoopMat;
+                sel.matType      = type;
+                sel.tileM        = best->MSize;
+                sel.tileN        = best->NSize;
+                sel.tileK        = best->KSize;
+                sel.numSubgroups = tuning.coopSubgroups;
+                sel.subgroupSize = subgroup.subgroupSize;
+                if ((features & FEATURE_SUBGROUP_SIZE_CONTROL) && tuning.preferredSubgroup != 0 && tuning.preferredSubgroup >= sizeControl.minSubgroupSize &&
+                    tuning.preferredSubgroup <= sizeControl.maxSubgroupSize && (sizeControl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+                {
+                    sel.subgroupSize        = tuning.preferredSubgroup;
+                    sel.requireSubgroupSize = true;
+                }
+                sel.workgroupSize = sel.numSubgroups * sel.subgroupSize;
+                return sel;
+            }
+        }
+
+        if (allowed(Path::Dot4) && (features & FEATURE_INTEGER_DOT_PRODUCT))
+        {
+            sel.path          = Path::Dot4;
+            sel.workgroupSize = tuning.vectorWorkgroup;
+            sel.dot4Tiled     = tuning.dot4Tiled != 0;
+            if (const char* e = getenv("FFX_ML_DOT4_TILED"))
+                sel.dot4Tiled = atoi(e) != 0;
+            uint32_t sgSize = tuning.dot4Subgroup;
+            if (const char* e = getenv("FFX_ML_DOT4_SUBGROUP"))
+                sgSize = uint32_t(atoi(e));
+            sel.subgroupSize = subgroup.subgroupSize;
+            if (sel.dot4Tiled && (features & FEATURE_SUBGROUP_SIZE_CONTROL) && sgSize != 0 && sgSize >= sizeControl.minSubgroupSize &&
+                sgSize <= sizeControl.maxSubgroupSize && (sizeControl.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT))
+            {
+                sel.subgroupSize        = sgSize;
+                sel.requireSubgroupSize = true;
+            }
+            return sel;
+        }
+
+        sel.path          = Path::Scalar;
+        sel.workgroupSize = tuning.vectorWorkgroup;
+        return sel;
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // Graph
+    // -------------------------------------------------------------------------------------------------------------
+    struct Graph::Impl
+    {
+        static constexpr uint32_t kSetGroups = 4;  // descriptor set groups kept for distinct external bindings
+        static constexpr uint32_t kBindings  = 7;
+
+        struct Allocation
+        {
+            VkBuffer       buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceSize   size   = 0;
+        };
+
+        struct Layer
+        {
+            VkPipeline   pipeline = VK_NULL_HANDLE;
+            VkDeviceSize weightsOffset = 0, weightsSize = 0;
+            VkDeviceSize paramsOffset = 0, paramsSize = 0;
+            uint32_t     groups[3] = {1, 1, 1};
+            uint32_t     src[2] = {0, 0};  // StoredTensor indices
+            uint32_t     numSources = 1;
+            uint32_t     dst = 0;
+            uint32_t     chain = 1;        // > 1: this layer dispatches the 1x1 chain kernel for itself and the next chain - 1
+            bool         fused = false;    // in a previous layer's chain: nothing to dispatch
+            uint32_t     side[2] = {0, 0}; // chain: the side tensors of its second and third layers
+            uint32_t     chainDst = 0;     // chain: its last layer's output
+            bool         dstImage = false; // stores its output into the external tensor's image (binding 7)
+        };
+
+        struct SetGroup
+        {
+            std::vector<ExternalTensor>  externals;
+            std::vector<VkDescriptorSet> sets;
+            uint64_t                     lastUse = 0;
+        };
+
+        DeviceContext   ctx;
+        Functions       fn;
+        Selection       selection;
+        tosa::Graph     graph;
+        LoweredGraph    lowered;
+
+        VkDescriptorSetLayout setLayout      = VK_NULL_HANDLE;
+        VkPipelineLayout      pipelineLayout = VK_NULL_HANDLE;
+        VkDescriptorPool      pool           = VK_NULL_HANDLE;
+        VkShaderModule        module         = VK_NULL_HANDLE;
+        VkShaderModule        chainModule    = VK_NULL_HANDLE;
+        VkShaderModule        imageModule    = VK_NULL_HANDLE;  // the tiled kernel storing into an image (imageOutputs)
+        std::vector<uint32_t> imageOutputs;                     // GraphDesc::imageOutputs
+        bool                  writesImages = false;
+        std::vector<Layer>    layers;
+        std::vector<Allocation> internals;
+        // Tiled dot4: internal tensors get one extra pixel holding their consumers' input zero point, so padding taps
+        // read it instead of selecting the zero point per loaded word. INT32_MIN: no zero-point pixel.
+        std::vector<int32_t>    internalZp;
+        std::vector<VkDeviceSize> internalZpOffset;
+        Allocation            constantsDevice;
+        Allocation            constantsStaging;
+        bool                  constantsUploaded = false;
+        std::vector<SetGroup> setGroups;
+        uint64_t              frame = 0;
+        VkQueryPool           profilePool  = VK_NULL_HANDLE;
+        uint32_t              profileFirst = 0;
+        std::map<uint32_t, std::vector<int64_t>> shapes;  // external bindings
+
+        VkPhysicalDeviceMemoryProperties memoryProperties = {};
+
+        ~Impl()
+        {
+            if (ctx.device == VK_NULL_HANDLE)
+                return;
+            for (Layer& l : layers)
+                if (l.pipeline)
+                    fn.DestroyPipeline(ctx.device, l.pipeline, nullptr);
+            for (Allocation& a : internals)
+                Free(a);
+            Free(constantsDevice);
+            Free(constantsStaging);
+            if (module)
+                fn.DestroyShaderModule(ctx.device, module, nullptr);
+            if (chainModule)
+                fn.DestroyShaderModule(ctx.device, chainModule, nullptr);
+            if (imageModule)
+                fn.DestroyShaderModule(ctx.device, imageModule, nullptr);
+            if (pool)
+                fn.DestroyDescriptorPool(ctx.device, pool, nullptr);
+            if (pipelineLayout)
+                fn.DestroyPipelineLayout(ctx.device, pipelineLayout, nullptr);
+            if (setLayout)
+                fn.DestroyDescriptorSetLayout(ctx.device, setLayout, nullptr);
+        }
+
+        void Free(Allocation& a)
+        {
+            if (a.buffer)
+                fn.DestroyBuffer(ctx.device, a.buffer, nullptr);
+            if (a.memory)
+                fn.FreeMemory(ctx.device, a.memory, nullptr);
+            a = {};
+        }
+
+        bool Allocate(Allocation& a, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required)
+        {
+            VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size               = std::max<VkDeviceSize>(size, 16);
+            info.usage              = usage;
+            info.sharingMode        = VK_SHARING_MODE_EXCLUSIVE;
+            if (fn.CreateBuffer(ctx.device, &info, nullptr, &a.buffer) != VK_SUCCESS)
+                return false;
+            VkMemoryRequirements req;
+            fn.GetBufferMemoryRequirements(ctx.device, a.buffer, &req);
+            uint32_t typeIndex = UINT32_MAX;
+            for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i)
+            {
+                if ((req.memoryTypeBits & (1u << i)) && (memoryProperties.memoryTypes[i].propertyFlags & required) == required)
+                {
+                    typeIndex = i;
+                    break;
+                }
+            }
+            if (typeIndex == UINT32_MAX)
+                return false;
+            VkMemoryAllocateInfo alloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            alloc.allocationSize       = req.size;
+            alloc.memoryTypeIndex      = typeIndex;
+            if (fn.AllocateMemory(ctx.device, &alloc, nullptr, &a.memory) != VK_SUCCESS)
+                return false;
+            a.size = info.size;
+            return fn.BindBufferMemory(ctx.device, a.buffer, a.memory, 0) == VK_SUCCESS;
+        }
+
+        struct Dot4Tile
+        {
+            uint32_t px, ocb, blocks, wgX, wgY, ksplit;
+        };
+
+        Dot4Tile ChooseDot4Tile(const FusedConv& fc, const tosa::Node& conv) const
+        {
+            (void)conv;
+            const VendorTuning t   = TuningFor(selection.vendor);
+            auto               env = [](const char* name, uint32_t def) {
+                const char* e = getenv(name);
+                return e ? uint32_t(atoi(e)) : def;
+            };
+            Dot4Tile tile;
+            tile.wgX                = std::max(1u, env("FFX_ML_DOT4_WGX", t.dot4WgX ? t.dot4WgX : 8));
+            tile.wgY                = std::max(1u, env("FFX_ML_DOT4_WGY", t.dot4WgY ? t.dot4WgY : 8));
+            const uint32_t ocbMax   = std::max(4u, env("FFX_ML_DOT4_OCB", t.dot4Ocb ? t.dot4Ocb : 16)) & ~3u;
+            const uint32_t target   = env("FFX_ML_DOT4_TARGET_THREADS", t.dot4TargetThreads);
+            const uint32_t oc4      = RoundUp(uint32_t(fc.outC), 4);
+            tile.blocks             = (oc4 + ocbMax - 1) / ocbMax;
+            tile.ocb                = RoundUp((oc4 + tile.blocks - 1) / tile.blocks, 4);
+            // Narrow layers (few output channels) take several pixels per thread so each input word still feeds enough dot4s.
+            // Capped at 4: the 4-channel output layer (16 -> 4 at full resolution) measured faster at 4 than at 8 pixels.
+            uint32_t px = std::min(env("FFX_ML_DOT4_PX_MAX", 4u), std::max(1u, env("FFX_ML_DOT4_ACC", t.dot4Acc ? t.dot4Acc : 64) / tile.ocb));
+            if (const char* e = getenv("FFX_ML_DOT4_PX"))
+                px = std::max(1u, uint32_t(atoi(e)));
+            auto threads            = [&](uint32_t p, uint32_t blocks) { return ((uint32_t(fc.outW) + p - 1) / p) * uint32_t(fc.outH) * blocks; };
+            // Small layers: fewer pixels per thread first, then narrower channel blocks, until the target thread count is met.
+            // FFX_ML_DOT4_KSPLIT_FIRST=1 leaves the channel blocks alone and lets the KSPLIT below take the shortfall.
+            while (target && px > 1 && threads(px, tile.blocks) < target)
+                px /= 2;
+            while (target && !env("FFX_ML_DOT4_KSPLIT_FIRST", 0) && tile.ocb > 4 && threads(px, tile.blocks) < target)
+            {
+                const uint32_t ocb = tile.ocb / 2 >= 4 ? RoundUp(tile.ocb / 2, 4) : 4;
+                tile.blocks        = (oc4 + ocb - 1) / ocb;
+                tile.ocb           = RoundUp((oc4 + tile.blocks - 1) / tile.blocks, 4);
+            }
+            tile.px = px;
+            // Input-word split across KSPLIT subgroups of one workgroup (partial sums reduced exactly in shared memory):
+            // shortens each thread's serial chain on layers too small to fill the GPU. Needs one subgroup per z slice
+            // (WG_X * WG_Y == required subgroup size), PX * OCB / KSPLIT a multiple of 4 and the partial sums in 32 KB.
+            uint32_t       k       = 1;
+            const uint32_t kMax    = env("FFX_ML_DOT4_KSPLIT_MAX", t.dot4KsplitMax);
+            const uint32_t icWords = (uint32_t(fc.inC) + 3) / 4;
+            auto           kOk     = [&](uint32_t kk) {
+                return kk <= icWords && (tile.px * tile.ocb) % (4 * kk) == 0 && kk * tile.px * tile.ocb * tile.wgX * tile.wgY * 4 <= 32768 &&
+                       selection.requireSubgroupSize && tile.wgX * tile.wgY == selection.subgroupSize;
+            };
+            while (k < kMax && kOk(k * 2) && threads(px, tile.blocks) * k < target)
+                k *= 2;
+            if (const char* e = getenv("FFX_ML_DOT4_KSPLIT"))
+            {
+                k = 1;
+                while (k * 2 <= uint32_t(atoi(e)) && kOk(k * 2))
+                    k *= 2;
+            }
+            tile.ksplit = k;
+            return tile;
+        }
+
+        const uint32_t* KernelCode(size_t& bytes) const
+        {
+            switch (selection.path)
+            {
+            case Path::CoopMat:
+                switch (selection.matType)
+                {
+                case MatType::Int8:
+                    bytes = sizeof(ffx_ml_conv2d_coopmat_int8);
+                    return ffx_ml_conv2d_coopmat_int8;
+                case MatType::Fp16:
+                    bytes = sizeof(ffx_ml_conv2d_coopmat_fp16);
+                    return ffx_ml_conv2d_coopmat_fp16;
+                case MatType::Bf16:
+                    bytes = sizeof(ffx_ml_conv2d_coopmat_bf16);
+                    return ffx_ml_conv2d_coopmat_bf16;
+                default:
+                    return nullptr;
+                }
+            case Path::Dot4:
+                if (selection.dot4Tiled)
+                {
+                    bytes = sizeof(ffx_ml_conv2d_dot4_tiled);
+                    return ffx_ml_conv2d_dot4_tiled;
+                }
+                bytes = sizeof(ffx_ml_conv2d_dot4);
+                return ffx_ml_conv2d_dot4;
+            default:
+                bytes = sizeof(ffx_ml_conv2d_scalar);
+                return ffx_ml_conv2d_scalar;
+            }
+        }
+
+        bool Build(std::string* error)
+        {
+            auto fail = [&](const std::string& m) {
+                if (error)
+                    *error = m;
+                return false;
+            };
+
+            fn.GetPhysicalDeviceMemoryProperties(ctx.physicalDevice, &memoryProperties);
+            VkPhysicalDeviceProperties2 deviceProperties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            fn.GetPhysicalDeviceProperties2(ctx.physicalDevice, &deviceProperties);
+            const uint32_t sharedMemoryLimit = deviceProperties.properties.limits.maxComputeSharedMemorySize;
+
+            // Descriptor layout: src0, src1, weights, params, dst; and the 1x1 chain kernel's two side tensors.
+            // Binding 7: the output image of a layer storing into one (imageOutputs).
+            VkDescriptorSetLayoutBinding bindings[kBindings + 1] = {};
+            for (uint32_t i = 0; i < kBindings; ++i)
+                bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            bindings[kBindings] = {kBindings, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo setInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            setInfo.bindingCount                    = kBindings + 1;
+            setInfo.pBindings                       = bindings;
+            if (fn.CreateDescriptorSetLayout(ctx.device, &setInfo, nullptr, &setLayout) != VK_SUCCESS)
+                return fail("vkCreateDescriptorSetLayout failed");
+            VkPipelineLayoutCreateInfo layoutInfo = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.setLayoutCount             = 1;
+            layoutInfo.pSetLayouts                = &setLayout;
+            if (fn.CreatePipelineLayout(ctx.device, &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS)
+                return fail("vkCreatePipelineLayout failed");
+
+            size_t          codeBytes = 0;
+            const uint32_t* code      = KernelCode(codeBytes);
+            VkShaderModuleCreateInfo moduleInfo = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize                 = codeBytes;
+            moduleInfo.pCode                    = code;
+            if (fn.CreateShaderModule(ctx.device, &moduleInfo, nullptr, &module) != VK_SUCCESS)
+                return fail("vkCreateShaderModule failed");
+
+            // Internal tensors.
+            internals.resize(lowered.internalTensorCount);
+            internalZp.assign(lowered.internalTensorCount, INT32_MIN);
+            internalZpOffset.assign(lowered.internalTensorCount, 0);
+            const bool zpPixels = selection.path == Path::Dot4 && selection.dot4Tiled && !getenv("FFX_ML_NO_ZP_PIXEL");
+            if (zpPixels)
+            {
+                for (const FusedConv& fc : lowered.convs)
+                    for (const ConvSource& src : fc.sources)
+                    {
+                        const StoredTensor& t = lowered.tensors[src.tensor];
+                        if (t.external)
+                            continue;
+                        int32_t& zp = internalZp[t.internalIndex];
+                        zp          = (zp == INT32_MIN || zp == fc.conv->inputZp) ? fc.conv->inputZp : -1000;  // -1000: conflict
+                    }
+            }
+            for (const StoredTensor& t : lowered.tensors)
+            {
+                if (t.external)
+                {
+                    shapes[t.binding] = {1, t.h, t.w, t.c};
+                    continue;
+                }
+                VkDeviceSize bytes = VkDeviceSize(t.h) * t.w * t.channelStride;
+                internalZpOffset[t.internalIndex] = bytes;
+                const int32_t zp = internalZp[t.internalIndex];
+                if (zp >= -128 && zp <= 127)
+                    bytes += t.channelStride;  // the zero-point pixel
+                else
+                    internalZp[t.internalIndex] = INT32_MIN;  // not used by a tiled kernel, or consumers disagree
+                if (!Allocate(internals[t.internalIndex], bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+                    return fail("failed to allocate an intermediate tensor");
+            }
+
+            // Pack weights and epilogue parameters for every layer into one constants buffer.
+            std::vector<uint8_t> constants;
+            auto                 align = [&](size_t a) { constants.resize(RoundUp(uint32_t(constants.size()), uint32_t(a)), 0); };
+
+            const bool coop = selection.path == Path::CoopMat;
+            const bool rawInput = !coop || selection.matType == MatType::Int8;
+
+            layers.resize(lowered.convs.size());
+
+            // 1x1 chains (fp32 requantisation only, as the kernel): from a 1x1 conv with two whole sources, the next
+            // 1x1 convs whose second source is the previous one's output and that nothing else reads, up to 3 layers,
+            // channels in whole words. FFX_ML_NO_CHAIN=1 keeps them separate.
+            {
+                const char* rf       = getenv("FFX_ML_RESCALE_FLOAT");
+                const bool  floatRq  = rf ? strcmp(rf, "0") != 0 : selection.rescaleFloat;
+                const bool  chains   = selection.path == Path::Dot4 && selection.dot4Tiled && floatRq && !getenv("FFX_ML_NO_CHAIN");
+                std::vector<uint32_t> readers(lowered.tensors.size(), 0);
+                for (const FusedConv& fc : lowered.convs)
+                    for (const ConvSource& src : fc.sources)
+                        ++readers[src.tensor];
+                auto plain1x1 = [&](const FusedConv& fc) {
+                    const tosa::Node& c = *fc.conv;
+                    bool ok = c.kernelH == 1 && c.kernelW == 1 && c.stride[0] == 1 && c.stride[1] == 1 && c.pad[0] == 0 && c.pad[1] == 0 &&
+                              c.pad[2] == 0 && c.pad[3] == 0 && !fc.table && fc.sources.size() == 2 && fc.outC % 4 == 0 && fc.inH == fc.outH &&
+                              fc.inW == fc.outW;
+                    for (const ConvSource& src : fc.sources)
+                    {
+                        const StoredTensor& t = lowered.tensors[src.tensor];
+                        ok = ok && !src.resize && t.c % 4 == 0 && t.h == fc.outH && t.w == fc.outW;
+                    }
+                    return ok;
+                };
+                for (size_t li = 0; chains && li < lowered.convs.size(); ++li)
+                {
+                    if (!plain1x1(lowered.convs[li]) || lowered.convs[li].inC > 64)
+                        continue;
+                    uint32_t n = 1;
+                    while (n < 3 && li + n < lowered.convs.size())
+                    {
+                        const FusedConv& prev = lowered.convs[li + n - 1];
+                        const FusedConv& next = lowered.convs[li + n];
+                        if (!plain1x1(next) || next.sources[1].tensor != prev.output || readers[prev.output] != 1 ||
+                            lowered.tensors[prev.output].external || next.outH != prev.outH || next.outW != prev.outW || next.inC > 64 ||
+                            prev.outC > 64)
+                            break;
+                        ++n;
+                    }
+                    if (n < 2 || lowered.convs[li + n - 1].outC > 64)
+                        continue;
+                    layers[li].chain = n;
+                    for (uint32_t k = 1; k < n; ++k)
+                    {
+                        layers[li + k].fused     = true;
+                        layers[li].side[k - 1] = lowered.convs[li + k].sources[0].tensor;
+                    }
+                    layers[li].chainDst = lowered.convs[li + n - 1].output;
+                    li += n - 1;
+                }
+            }
+
+            for (size_t li = 0; li < lowered.convs.size(); ++li)
+            {
+                const FusedConv&  fc   = lowered.convs[li];
+                const tosa::Node& conv = *fc.conv;
+                const tosa::Node& rs   = *fc.rescale;
+                Layer&            layer = layers[li];
+
+                const uint32_t IC   = uint32_t(fc.inC);
+                const uint32_t OC   = uint32_t(fc.outC);
+                const uint32_t taps = uint32_t(conv.kernelH * conv.kernelW);
+                const uint32_t icPad = coop ? RoundUp(IC, selection.tileK) : RoundUp(IC, 4);
+                const uint32_t ocPad = coop ? RoundUp(OC, selection.tileN) : OC;
+
+                auto weightAt = [&](uint32_t oc, uint32_t tap, uint32_t ic) -> int32_t {
+                    return conv.weights[(size_t(oc) * taps + tap) * IC + ic];
+                };
+
+                // Tiled dot4: pixels and output channels per thread, output-channel blocks (grid z), workgroup shape.
+                const bool tiled = selection.path == Path::Dot4 && selection.dot4Tiled;
+                Dot4Tile   tile  = {};
+                if (tiled)
+                    tile = ChooseDot4Tile(fc, conv);
+                const bool inChain = layers[li].chain > 1 || layers[li].fused;
+                if (tiled && inChain)  // the chain kernel reads [icWord][OC4]: one output block
+                    tile.blocks = 1, tile.ocb = RoundUp(OC, 4);
+
+                // Weights
+                align(64);
+                layer.weightsOffset = constants.size();
+                if (coop)
+                {
+                    const uint32_t elem = MatElementSize(selection.matType);
+                    const size_t   base = constants.size();
+                    constants.resize(base + size_t(taps) * icPad * ocPad * elem, 0);
+                    for (uint32_t tap = 0; tap < taps; ++tap)
+                        for (uint32_t ic = 0; ic < IC; ++ic)
+                            for (uint32_t oc = 0; oc < OC; ++oc)
+                            {
+                                const int32_t w   = weightAt(oc, tap, ic);
+                                const size_t  idx = (size_t(tap) * icPad + ic) * ocPad + oc;
+                                uint8_t*      dst = &constants[base + idx * elem];
+                                switch (selection.matType)
+                                {
+                                case MatType::Int8:
+                                    dst[0] = uint8_t(int8_t(w));
+                                    break;
+                                case MatType::Fp16:
+                                {
+                                    const uint16_t h = FloatToHalf(float(w));
+                                    memcpy(dst, &h, 2);
+                                    break;
+                                }
+                                case MatType::Bf16:
+                                {
+                                    const uint16_t h = FloatToBf16(float(w));
+                                    memcpy(dst, &h, 2);
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+                            }
+                }
+                else if (tiled)
+                {
+                    // [ocBlock][tap][icWord][OCB] words, zero padded past OC.
+                    const uint32_t icWords = icPad / 4;
+                    const size_t   base    = constants.size();
+                    constants.resize(base + size_t(tile.blocks) * tile.ocb * taps * icWords * 4, 0);
+                    for (uint32_t oc = 0; oc < OC; ++oc)
+                    {
+                        const uint32_t blk = oc / tile.ocb, o = oc % tile.ocb;
+                        for (uint32_t tap = 0; tap < taps; ++tap)
+                            for (uint32_t ic = 0; ic < IC; ++ic)
+                            {
+                                const size_t word = ((size_t(blk) * taps + tap) * icWords + ic / 4) * tile.ocb + o;
+                                constants[base + word * 4 + (ic & 3)] = uint8_t(int8_t(weightAt(oc, tap, ic)));
+                            }
+                    }
+                }
+                else
+                {
+                    const uint32_t icWords = icPad / 4;
+                    const size_t   base    = constants.size();
+                    constants.resize(base + size_t(OC) * taps * icWords * 4, 0);
+                    for (uint32_t oc = 0; oc < OC; ++oc)
+                        for (uint32_t tap = 0; tap < taps; ++tap)
+                            for (uint32_t ic = 0; ic < IC; ++ic)
+                                constants[base + ((size_t(oc) * taps + tap) * icWords) * 4 + ic] = uint8_t(int8_t(weightAt(oc, tap, ic)));
+                }
+                layer.weightsSize = constants.size() - layer.weightsOffset;
+
+                // Params: bias (with the input zero point folded in for raw int8 paths), multiplier, shift, table.
+                align(64);
+                layer.paramsOffset     = constants.size();
+                const uint32_t stride  = RoundUp(OC, 4);
+                // + 2 * stride: float scale and offset per channel for the non-exact FFX_ML_RESCALE_FLOAT epilogue.
+                std::vector<int32_t> p(size_t(stride) * 5 + 64, 0);
+                for (uint32_t oc = 0; oc < OC; ++oc)
+                {
+                    int64_t b = conv.bias[oc];
+                    if (rawInput)
+                    {
+                        int64_t sum = 0;
+                        for (uint32_t tap = 0; tap < taps; ++tap)
+                            for (uint32_t ic = 0; ic < IC; ++ic)
+                                sum += weightAt(oc, tap, ic);
+                        b -= int64_t(conv.inputZp) * sum;
+                    }
+                    p[oc] = int32_t(b);
+                }
+                const size_t mulCount = rs.perChannel ? OC : 1;
+                int32_t      minShift = 64, maxShift = 0;
+                for (size_t i = 0; i < mulCount; ++i)
+                {
+                    p[stride + i]     = rs.multiplier[i];
+                    p[2 * stride + i] = rs.shift[i];
+                    minShift          = std::min(minShift, rs.shift[i]);
+                    maxShift          = std::max(maxShift, rs.shift[i]);
+                }
+                if (getenv("FFX_ML_DEBUG_LAYERS"))
+                    printf("[ffx_ml] layer %zu: IC %u OC %u %dx%d->%dx%d, shift %d..%d%s%s, scale32 %d, tile px %u ocb %u blocks %u ksplit %u\n", li, IC, OC, fc.inH,
+                           fc.inW, fc.outH, fc.outW, minShift, maxShift, rs.doubleRound ? " double-round" : "", fc.table ? " table" : "", rs.scale32 ? 1 : 0,
+                           tile.px, tile.ocb, tile.blocks, tile.ksplit);
+                if (getenv("FFX_ML_DEBUG_LAYERS"))
+                {
+                    printf("[ffx_ml]   out t%u <-", fc.output);
+                    for (const ConvSource& src : fc.sources)
+                        printf(" t%u%s", src.tensor, src.resize ? "(resize)" : "");
+                    printf("\n");
+                }
+                if (fc.table)
+                {
+                    for (uint32_t i = 0; i < 256; ++i)
+                        reinterpret_cast<uint8_t*>(&p[3 * stride])[i] = uint8_t(fc.table->table[i]);
+                }
+                // NOT BIT EXACT (FFX_ML_RESCALE_FLOAT=1): out = round(acc * s + o), s = multiplier / 2^shift and
+                // o = (bias - rescale_in_zp) * s + rescale_out_zp, acc without the bias.
+                for (uint32_t oc = 0; oc < OC; ++oc)
+                {
+                    const size_t  pi    = rs.perChannel ? oc : 0;
+                    const double  scale = double(rs.multiplier[pi]) / std::ldexp(1.0, rs.shift[pi]);
+                    const double  off   = (double(p[oc]) - double(rs.rescaleInZp)) * scale + double(rs.rescaleOutZp);
+                    const float   fs = float(scale), fo = float(off);
+                    memcpy(&p[3 * stride + 64 + oc], &fs, 4);
+                    memcpy(&p[4 * stride + 64 + oc], &fo, 4);
+                }
+                const size_t pBytes = p.size() * 4;
+                constants.resize(constants.size() + pBytes);
+                memcpy(&constants[layer.paramsOffset], p.data(), pBytes);
+                layer.paramsSize = pBytes;
+
+                // Sources / destination.
+                layer.numSources = uint32_t(fc.sources.size());
+                layer.src[0]     = fc.sources[0].tensor;
+                layer.src[1]     = fc.sources.size() > 1 ? fc.sources[1].tensor : fc.sources[0].tensor;
+                layer.dst        = fc.output;
+                {
+                    const StoredTensor& out = lowered.tensors[fc.output];
+                    layer.dstImage = tiled && !inChain && out.external && out.channelStride == 4 &&
+                                     std::find(imageOutputs.begin(), imageOutputs.end(), out.binding) != imageOutputs.end();
+                }
+
+                // Specialization constants.
+                std::vector<VkSpecializationMapEntry> entries;
+                std::vector<int32_t>                  values;
+                auto spec = [&](uint32_t id, int32_t value) {
+                    entries.push_back({id, uint32_t(values.size() * 4), 4});
+                    values.push_back(value);
+                };
+                // Coop-matrix tile height: as many rows per subgroup (up to 4) as the input patch lets fit in shared memory.
+                // Coop-matrix tile: one row per subgroup (keeps occupancy high on the small NSS layers).
+                uint32_t tileRows      = getenv("FFX_ML_TILE_ROWS") ? uint32_t(atoi(getenv("FFX_ML_TILE_ROWS"))) : 1;
+                uint32_t weightsShared  = 0;
+                uint32_t ntPerWorkgroup = ocPad / std::max(selection.tileN, 1u);
+                if (coop)
+                {
+                    // Output-channel split: each workgroup computes a subset of the N tiles (grid z), which shortens the
+                    // per-subgroup MMA chain and multiplies the workgroup count. Small, low-resolution layers are split until
+                    // they have at least VendorTuning::splitTargetGroups workgroups; large layers are left whole (splitting them re-stages
+                    // the same input patch per split and measured slower). FFX_ML_N_SPLIT forces a split for experiments.
+                    const uint32_t numNt          = ntPerWorkgroup;
+                    const uint32_t tileH          = selection.numSubgroups * tileRows;
+                    const uint32_t spatialGroups  = ((uint32_t(fc.outW) + selection.tileM - 1) / selection.tileM) * ((uint32_t(fc.outH) + tileH - 1) / tileH);
+                    const uint32_t splitTarget    = getenv("FFX_ML_N_SPLIT_TARGET") ? uint32_t(atoi(getenv("FFX_ML_N_SPLIT_TARGET"))) : TuningFor(selection.vendor).splitTargetGroups;
+                    uint32_t       split          = 1;
+                    while (split < numNt && spatialGroups * split < splitTarget)
+                        ++split;
+                    if (getenv("FFX_ML_N_SPLIT"))
+                        split = uint32_t(atoi(getenv("FFX_ML_N_SPLIT")));
+                    split = std::max(1u, std::min(split, numNt));
+                    while (numNt % split)
+                        ++split;
+                    ntPerWorkgroup = numNt / split;
+                    const uint32_t elem        = MatElementSize(selection.matType);
+                    const uint32_t weightBytes = taps * icPad * ocPad * elem;
+                    auto sharedBytes           = [&](uint32_t rows, bool withWeights) {
+                        const uint32_t tileH  = selection.numSubgroups * rows;
+                        const uint32_t patchW = (selection.tileM - 1) * conv.stride[1] + (conv.kernelW - 1) * conv.dilation[1] + 1;
+                        const uint32_t patchH = (tileH - 1) * conv.stride[0] + (conv.kernelH - 1) * conv.dilation[0] + 1;
+                        return patchW * patchH * icPad * elem + selection.numSubgroups * selection.tileM * ocPad * 4 + (withWeights ? weightBytes : 16);
+                    };
+                    while (tileRows > 1 && sharedBytes(tileRows, false) > sharedMemoryLimit)
+                        --tileRows;
+                    if (sharedBytes(tileRows, false) > sharedMemoryLimit)
+                        return fail("layer " + std::to_string(li) + " does not fit in shared memory");
+                    // Staging the weights per workgroup measured slower than reading them through the cache on the RTX 4080,
+                    // so it is opt-in (FFX_ML_WEIGHTS_SHARED_LIMIT=<bytes>) for experiments on other GPUs.
+                    const uint32_t weightBudget = getenv("FFX_ML_WEIGHTS_SHARED_LIMIT") ? uint32_t(atoi(getenv("FFX_ML_WEIGHTS_SHARED_LIMIT"))) : 0u;
+                    weightsShared = sharedBytes(tileRows, true) <= std::min(sharedMemoryLimit, weightBudget) ? 1u : 0u;
+                }
+                spec(0, int32_t(coop ? selection.numSubgroups * selection.subgroupSize : tiled ? tile.wgX : selection.workgroupSize));
+                if (tiled)
+                {
+                    spec(53, int32_t(tile.wgY));
+                    spec(54, int32_t(tile.px));
+                    spec(55, int32_t(tile.ocb));
+                    spec(56, int32_t(tile.ksplit));
+                    spec(61, (uint32_t(fc.outC) % tile.ocb) == 0 ? 1 : 0);
+                    // Cheaper exact rescale when no shift needs the low product word (the NSS models: shifts 35..49).
+                    const bool hiOnly = rs.scale32 && !rs.doubleRound && minShift >= 33 && maxShift <= 62 && !getenv("FFX_ML_NO_SCALE_HI_ONLY");
+                    spec(58, hiOnly ? 1 : 0);
+                    const char* rf = getenv("FFX_ML_RESCALE_FLOAT");
+                    spec(62, (rf ? strcmp(rf, "0") != 0 : selection.rescaleFloat) ? 1 : 0);
+                }
+                if (coop)
+                {
+                    spec(1, int32_t(selection.tileM));
+                    spec(2, int32_t(selection.tileN));
+                    spec(3, int32_t(selection.tileK));
+                    spec(4, int32_t(selection.numSubgroups));
+                    spec(5, int32_t(ocPad / selection.tileN));
+                    spec(6, int32_t(ocPad));
+                    spec(7, int32_t(icPad));
+                    spec(8, int32_t(tileRows));
+                    spec(9, int32_t(weightsShared));
+                    spec(52, int32_t(ntPerWorkgroup));
+                }
+                spec(10, fc.inH);
+                spec(11, fc.inW);
+                spec(12, fc.outH);
+                spec(13, fc.outW);
+                spec(14, fc.outC);
+                spec(15, lowered.tensors[fc.output].channelStride);
+                spec(16, conv.kernelH);
+                spec(17, conv.kernelW);
+                spec(18, conv.stride[0]);
+                spec(19, conv.stride[1]);
+                spec(20, conv.pad[0]);
+                spec(21, conv.pad[2]);
+                spec(22, conv.dilation[0]);
+                spec(23, conv.dilation[1]);
+                spec(24, conv.inputZp);
+                spec(25, int32_t(icPad / 4));
+                spec(26, rs.rescaleInZp);
+                spec(27, rs.rescaleOutZp);
+                spec(28, (rs.doubleRound ? 1 : 0) | (rs.perChannel ? 2 : 0) | (fc.table ? 4 : 0));
+                spec(29, int32_t(fc.sources.size()));
+                for (size_t s = 0; s < 2; ++s)
+                {
+                    const uint32_t base = s == 0 ? 30 : 41;
+                    if (s >= fc.sources.size())
+                    {
+                        spec(base + 2, 0);  // S1_C = 0
+                        continue;
+                    }
+                    const ConvSource&   src = fc.sources[s];
+                    const StoredTensor& t   = lowered.tensors[src.tensor];
+                    spec(base + 0, t.h);
+                    spec(base + 1, t.w);
+                    spec(base + 2, t.c);
+                    spec(base + 3, t.channelStride);
+                    spec(base + 4, src.resize ? 1 : 0);
+                    if (tiled)
+                        spec(s == 0 ? 59 : 60, (!t.external && internalZp[t.internalIndex] != INT32_MIN) ? 1 : 0);
+                    spec(base + 5, src.scale[0]);
+                    spec(base + 6, src.scale[1]);
+                    spec(base + 7, src.offset[0]);
+                    spec(base + 8, src.scale[2]);
+                    spec(base + 9, src.scale[3]);
+                    spec(base + 10, src.offset[1]);
+                }
+
+                VkSpecializationInfo specInfo = {uint32_t(entries.size()), entries.data(), values.size() * 4, values.data()};
+
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfo requiredSize = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+                requiredSize.requiredSubgroupSize = selection.subgroupSize;
+
+                VkComputePipelineCreateInfo pipeInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pipeInfo.stage.sType                 = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                pipeInfo.stage.stage                 = VK_SHADER_STAGE_COMPUTE_BIT;
+                if (layer.dstImage && !imageModule)
+                {
+                    VkShaderModuleCreateInfo imageInfo = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    imageInfo.codeSize                 = sizeof(ffx_ml_conv2d_dot4_tiled_img);
+                    imageInfo.pCode                    = ffx_ml_conv2d_dot4_tiled_img;
+                    if (fn.CreateShaderModule(ctx.device, &imageInfo, nullptr, &imageModule) != VK_SUCCESS)
+                        return fail("vkCreateShaderModule failed (image output)");
+                }
+                pipeInfo.stage.module                = layer.dstImage ? imageModule : module;
+                pipeInfo.stage.pName                 = "main";
+                pipeInfo.stage.pSpecializationInfo   = &specInfo;
+                if (coop && selection.requireSubgroupSize)
+                {
+                    pipeInfo.stage.pNext = &requiredSize;
+                    pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                }
+                else if (tiled && selection.requireSubgroupSize)
+                {
+                    // Full subgroups need the workgroup X size to be a multiple of the subgroup size.
+                    pipeInfo.stage.pNext = &requiredSize;
+                    if (tile.wgX % selection.subgroupSize == 0)
+                        pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+                }
+                pipeInfo.layout = pipelineLayout;
+                static const char* dumpDir = getenv("FFX_DUMP_PIPELINES");  // ACO statistics and ISA per layer (tuning)
+                if (dumpDir && *dumpDir)
+                    pipeInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+                if (fn.CreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &layer.pipeline) != VK_SUCCESS)
+                    return fail("vkCreateComputePipelines failed for layer " + std::to_string(li));
+                if (dumpDir && *dumpDir)
+                    DumpPipeline(ctx.getDeviceProcAddr, ctx.device, layer.pipeline, ("ML_layer_" + std::to_string(li)).c_str(), dumpDir);
+
+                const uint32_t pixels = uint32_t(fc.outH * fc.outW);
+                if (coop)
+                {
+                    const uint32_t tileH = selection.numSubgroups * tileRows;
+                    layer.groups[0]      = (uint32_t(fc.outW) + selection.tileM - 1) / selection.tileM;
+                    layer.groups[1]      = (uint32_t(fc.outH) + tileH - 1) / tileH;
+                    layer.groups[2]      = (ocPad / selection.tileN) / ntPerWorkgroup;
+                }
+                else if (tiled)
+                {
+                    const uint32_t threadsX = (uint32_t(fc.outW) + tile.px - 1) / tile.px;
+                    layer.groups[0]         = (threadsX + tile.wgX - 1) / tile.wgX;
+                    layer.groups[1]         = (uint32_t(fc.outH) + tile.wgY - 1) / tile.wgY;
+                    layer.groups[2]         = tile.blocks;
+                }
+                else
+                {
+                    layer.groups[0] = (pixels + selection.workgroupSize - 1) / selection.workgroupSize;
+                    layer.groups[1] = (OC + 3) / 4;
+                }
+            }
+
+            // The chains' pipelines: every member's constants at its base in the whole constants buffer.
+            for (size_t li = 0; li < layers.size(); ++li)
+            {
+                Layer& head = layers[li];
+                if (head.chain < 2)
+                    continue;
+                if (!chainModule)
+                {
+                    VkShaderModuleCreateInfo chainInfo = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    chainInfo.codeSize                 = sizeof(ffx_ml_conv2d_dot4_chain);
+                    chainInfo.pCode                    = ffx_ml_conv2d_dot4_chain;
+                    if (fn.CreateShaderModule(ctx.device, &chainInfo, nullptr, &chainModule) != VK_SUCCESS)
+                        return fail("vkCreateShaderModule failed (1x1 chain)");
+                }
+                std::vector<VkSpecializationMapEntry> entries;
+                std::vector<int32_t>                  values;
+                auto spec = [&](uint32_t id, int32_t value) {
+                    entries.push_back({id, uint32_t(values.size() * 4), 4});
+                    values.push_back(value);
+                };
+                const FusedConv&    first = lowered.convs[li];
+                const StoredTensor& a     = lowered.tensors[first.sources[0].tensor];
+                const StoredTensor& b     = lowered.tensors[first.sources[1].tensor];
+                const uint32_t      wg    = 64;
+                spec(0, int32_t(wg));
+                spec(70, int32_t(head.chain));
+                spec(71, first.outH * first.outW);
+                spec(72, a.c / 4), spec(73, a.channelStride / 4), spec(74, b.c / 4), spec(75, b.channelStride / 4);
+                for (uint32_t k = 0; k < head.chain; ++k)
+                {
+                    const FusedConv& fc = lowered.convs[li + k];
+                    spec(76 + 4 * k, fc.outC / 4);
+                    spec(77 + 4 * k, int32_t(layers[li + k].weightsOffset / 4));
+                    spec(78 + 4 * k, int32_t(layers[li + k].paramsOffset / 4));
+                    spec(79 + 4 * k, int32_t(RoundUp(uint32_t(fc.outC), 4)));
+                    if (k > 0)
+                    {
+                        const StoredTensor& side = lowered.tensors[fc.sources[0].tensor];
+                        spec(k == 1 ? 88 : 90, side.c / 4), spec(k == 1 ? 89 : 91, side.channelStride / 4);
+                    }
+                }
+                spec(92, lowered.tensors[head.chainDst].channelStride / 4);
+                VkSpecializationInfo        specInfo = {uint32_t(entries.size()), entries.data(), values.size() * 4, values.data()};
+                VkComputePipelineCreateInfo pipeInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pipeInfo.stage.sType                 = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                pipeInfo.stage.stage                 = VK_SHADER_STAGE_COMPUTE_BIT;
+                pipeInfo.stage.module                = chainModule;
+                pipeInfo.stage.pName                 = "main";
+                pipeInfo.stage.pSpecializationInfo   = &specInfo;
+                pipeInfo.layout                      = pipelineLayout;
+                fn.DestroyPipeline(ctx.device, head.pipeline, nullptr);
+                head.pipeline = VK_NULL_HANDLE;
+                if (fn.CreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &head.pipeline) != VK_SUCCESS)
+                    return fail("vkCreateComputePipelines failed for the 1x1 chain at layer " + std::to_string(li));
+                head.groups[0] = (uint32_t(first.outH * first.outW) + wg - 1) / wg, head.groups[1] = 1, head.groups[2] = 1;
+                if (getenv("FFX_ML_DEBUG_LAYERS"))
+                    printf("[ffx_ml] layers %zu-%zu: one 1x1 chain dispatch\n", li, li + head.chain - 1);
+            }
+
+            align(64);
+            if (!Allocate(constantsDevice, constants.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+                !Allocate(constantsStaging, constants.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                return fail("failed to allocate the weight buffers");
+            void* mapped = nullptr;
+            if (fn.MapMemory(ctx.device, constantsStaging.memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+                return fail("vkMapMemory failed");
+            memcpy(mapped, constants.data(), constants.size());
+            fn.UnmapMemory(ctx.device, constantsStaging.memory);
+
+            // Every requested image output written by a layer storing into it?
+            writesImages = !imageOutputs.empty();
+            for (uint32_t binding : imageOutputs)
+            {
+                bool stored = false;
+                for (size_t li = 0; li < layers.size(); ++li)
+                {
+                    const StoredTensor& t = lowered.tensors[layers[li].dst];
+                    stored = stored || (layers[li].dstImage && t.external && t.binding == binding);
+                }
+                writesImages = writesImages && stored;
+            }
+            const VkDescriptorPoolSize poolSizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(kBindings * layers.size() * kSetGroups)},
+                                                       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, uint32_t(layers.size() * kSetGroups)}};
+            VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            poolInfo.maxSets                    = uint32_t(layers.size() * kSetGroups);
+            poolInfo.poolSizeCount              = 2;
+            poolInfo.pPoolSizes                 = poolSizes;
+            if (fn.CreateDescriptorPool(ctx.device, &poolInfo, nullptr, &pool) != VK_SUCCESS)
+                return fail("vkCreateDescriptorPool failed");
+            return true;
+        }
+
+        bool FindExternal(const ExternalTensor* tensors, uint32_t count, uint32_t binding, ExternalTensor& out) const
+        {
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                if (tensors[i].binding == binding)
+                {
+                    out = tensors[i];
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        VkDescriptorBufferInfo TensorInfo(uint32_t tensorIndex, const ExternalTensor* tensors, uint32_t count) const
+        {
+            const StoredTensor& t = lowered.tensors[tensorIndex];
+            if (!t.external)
+                return {internals[t.internalIndex].buffer, 0, VK_WHOLE_SIZE};
+            ExternalTensor ext = {};
+            FindExternal(tensors, count, t.binding, ext);
+            return {ext.buffer, ext.offset, VK_WHOLE_SIZE};
+        }
+
+        SetGroup* GetSetGroup(const ExternalTensor* tensors, uint32_t count)
+        {
+            std::vector<ExternalTensor> key(tensors, tensors + count);
+            std::sort(key.begin(), key.end(), [](const ExternalTensor& a, const ExternalTensor& b) { return a.binding < b.binding; });
+            auto same = [&](const SetGroup& g) {
+                if (g.externals.size() != key.size())
+                    return false;
+                for (size_t i = 0; i < key.size(); ++i)
+                    if (g.externals[i].binding != key[i].binding || g.externals[i].buffer != key[i].buffer || g.externals[i].offset != key[i].offset ||
+                        g.externals[i].image != key[i].image)
+                        return false;
+                return true;
+            };
+            for (SetGroup& g : setGroups)
+            {
+                if (same(g))
+                {
+                    g.lastUse = frame;
+                    return &g;
+                }
+            }
+
+            SetGroup* group = nullptr;
+            if (setGroups.size() < kSetGroups)
+            {
+                setGroups.emplace_back();
+                group = &setGroups.back();
+                group->sets.resize(layers.size());
+                std::vector<VkDescriptorSetLayout> layouts(layers.size(), setLayout);
+                VkDescriptorSetAllocateInfo        alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                alloc.descriptorPool                     = pool;
+                alloc.descriptorSetCount                 = uint32_t(layers.size());
+                alloc.pSetLayouts                        = layouts.data();
+                if (fn.AllocateDescriptorSets(ctx.device, &alloc, group->sets.data()) != VK_SUCCESS)
+                    return nullptr;
+            }
+            else
+            {
+                // Recycle the least recently used group; it is several frames old by now.
+                group = &*std::min_element(setGroups.begin(), setGroups.end(), [](const SetGroup& a, const SetGroup& b) { return a.lastUse < b.lastUse; });
+            }
+            group->externals = key;
+            group->lastUse   = frame;
+
+            std::vector<VkDescriptorBufferInfo> infos(layers.size() * kBindings);
+            std::vector<VkWriteDescriptorSet>   writes(layers.size() * kBindings, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
+            for (size_t li = 0; li < layers.size(); ++li)
+            {
+                const Layer&            l = layers[li];
+                VkDescriptorBufferInfo* i = &infos[li * kBindings];
+                i[0] = TensorInfo(l.src[0], tensors, count);
+                i[1] = TensorInfo(l.src[1], tensors, count);
+                i[2] = {constantsDevice.buffer, l.weightsOffset, l.weightsSize};
+                i[3] = {constantsDevice.buffer, l.paramsOffset, l.paramsSize};
+                i[4] = TensorInfo(l.dst, tensors, count);
+                i[5] = i[0], i[6] = i[0];
+                if (l.chain > 1)  // every layer's constants at its base, the last layer's output, the side tensors
+                {
+                    i[2] = i[3] = {constantsDevice.buffer, 0, VK_WHOLE_SIZE};
+                    i[4]        = TensorInfo(l.chainDst, tensors, count);
+                    i[5]        = TensorInfo(l.side[0], tensors, count);
+                    i[6]        = l.chain > 2 ? TensorInfo(l.side[1], tensors, count) : i[0];
+                }
+                for (uint32_t b = 0; b < kBindings; ++b)
+                {
+                    VkWriteDescriptorSet& w = writes[li * kBindings + b];
+                    w.dstSet                = group->sets[li];
+                    w.dstBinding            = b;
+                    w.descriptorCount       = 1;
+                    w.descriptorType        = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pBufferInfo           = &infos[li * kBindings + b];
+                }
+            }
+            // The layers storing into an image: binding 7.
+            std::vector<VkDescriptorImageInfo> imageInfos(layers.size());
+            for (size_t li = 0; li < layers.size(); ++li)
+            {
+                if (!layers[li].dstImage)
+                    continue;
+                ExternalTensor ext = {};
+                FindExternal(tensors, count, lowered.tensors[layers[li].dst].binding, ext);
+                imageInfos[li]          = {VK_NULL_HANDLE, ext.image, VK_IMAGE_LAYOUT_GENERAL};
+                VkWriteDescriptorSet w  = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet                = group->sets[li];
+                w.dstBinding            = kBindings;
+                w.descriptorCount       = 1;
+                w.descriptorType        = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                w.pImageInfo            = &imageInfos[li];
+                writes.push_back(w);
+            }
+            fn.UpdateDescriptorSets(ctx.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+            return group;
+        }
+
+        // Several graphs of the same model (each with its own tensors) a layer at a time: one barrier where any of them
+        // needs one, then that layer for each, so the GPU has several independent dispatches between barriers where
+        // one graph alone leaves it idle while each layer drains. Same results as recording them one after another.
+        static void RecordInterleaved(VkCommandBuffer cmd, Impl* const* graphs, const ExternalTensor* const* tensors, const uint32_t* counts,
+                                      uint32_t n)
+        {
+            std::vector<SetGroup*> groups(n);
+            for (uint32_t g = 0; g < n; ++g)
+            {
+                graphs[g]->Prepare(cmd);
+                groups[g] = graphs[g]->GetSetGroup(tensors[g], counts[g]);
+                if (!groups[g])
+                    return;
+            }
+            const Impl& first = *graphs[0];
+            std::vector<std::vector<uint8_t>> written(n), read(n);
+            for (uint32_t g = 0; g < n; ++g)
+                written[g].assign(graphs[g]->lowered.tensors.size(), 0), read[g].assign(graphs[g]->lowered.tensors.size(), 0);
+            for (size_t li = 0; li < first.layers.size(); ++li)
+            {
+                if (first.layers[li].fused)
+                    continue;
+                bool hazard = false;
+                for (uint32_t g = 0; g < n; ++g)
+                {
+                    const Layer& l   = graphs[g]->layers[li];
+                    const uint32_t out = l.chain > 1 ? l.chainDst : l.dst;
+                    hazard = hazard || written[g][out] || read[g][out];
+                    for (uint32_t s = 0; s < l.numSources; ++s)
+                        hazard = hazard || written[g][l.src[s]];
+                    for (uint32_t k = 1; k < l.chain; ++k)
+                        hazard = hazard || written[g][l.side[k - 1]];
+                }
+                if (li > 0 && hazard)
+                {
+                    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                    first.fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                    for (uint32_t g = 0; g < n; ++g)
+                        std::fill(written[g].begin(), written[g].end(), 0), std::fill(read[g].begin(), read[g].end(), 0);
+                }
+                for (uint32_t g = 0; g < n; ++g)
+                {
+                    Impl&        G   = *graphs[g];
+                    const Layer& l   = G.layers[li];
+                    const uint32_t out = l.chain > 1 ? l.chainDst : l.dst;
+                    written[g][out] = 1;
+                    for (uint32_t s = 0; s < l.numSources; ++s)
+                        read[g][l.src[s]] = 1;
+                    for (uint32_t k = 1; k < l.chain; ++k)
+                        read[g][l.side[k - 1]] = 1;
+                    G.fn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l.pipeline);
+                    G.fn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipelineLayout, 0, 1, &groups[g]->sets[li], 0, nullptr);
+                    G.fn.CmdDispatch(cmd, l.groups[0], l.groups[1], l.groups[2]);
+                }
+            }
+        }
+
+        void Prepare(VkCommandBuffer cmd)
+        {
+            ++frame;
+            if (!constantsUploaded)
+            {
+                VkBufferCopy copy = {0, 0, constantsStaging.size};
+                fn.CmdCopyBuffer(cmd, constantsStaging.buffer, constantsDevice.buffer, 1, &copy);
+                // Zero-point pixels after the internal tensors (never written by the layers).
+                for (const StoredTensor& t : lowered.tensors)
+                {
+                    if (t.external || internalZp[t.internalIndex] == INT32_MIN)
+                        continue;
+                    const uint32_t b = uint32_t(internalZp[t.internalIndex]) & 0xFFu;
+                    fn.CmdFillBuffer(cmd, internals[t.internalIndex].buffer, internalZpOffset[t.internalIndex], VkDeviceSize(t.channelStride),
+                                     b | (b << 8) | (b << 16) | (b << 24));
+                }
+                VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+                fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                constantsUploaded = true;
+            }
+        }
+
+        void Record(VkCommandBuffer cmd, const ExternalTensor* tensors, uint32_t count)
+        {
+            Prepare(cmd);
+            SetGroup* group = GetSetGroup(tensors, count);
+            if (!group)
+                return;
+
+            if (profilePool)
+                fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst);
+            // A barrier only before a layer that reads a tensor written since the last one, or writes one read or
+            // written since: independent layers (NFRU's branches off one tensor) run back to back and overlap. Each
+            // stored tensor has its own memory. Profiling keeps one after every layer, as its timestamps need.
+            static const bool noBarriers  = getenv("FFX_ML_EXPERIMENT_NO_BARRIERS") != nullptr;  // timing experiments only: wrong results
+            static const bool allBarriers = getenv("FFX_ML_ALL_BARRIERS") != nullptr;
+            std::vector<uint8_t> written(lowered.tensors.size()), read(lowered.tensors.size());
+            for (size_t li = 0; li < layers.size(); ++li)
+            {
+                const Layer& l = layers[li];
+                if (l.fused)
+                {
+                    if (profilePool)
+                        fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst + uint32_t(li) + 1);
+                    continue;
+                }
+                const uint32_t out    = l.chain > 1 ? l.chainDst : l.dst;
+                bool           hazard = written[out] || read[out];
+                for (uint32_t s = 0; s < l.numSources; ++s)
+                    hazard = hazard || written[l.src[s]];
+                for (uint32_t k = 1; k < l.chain; ++k)
+                    hazard = hazard || written[l.side[k - 1]];
+                if (li > 0 && !noBarriers && (hazard || allBarriers || profilePool))
+                {
+                    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                    fn.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                    std::fill(written.begin(), written.end(), 0), std::fill(read.begin(), read.end(), 0);
+                }
+                written[out] = 1;
+                for (uint32_t s = 0; s < l.numSources; ++s)
+                    read[l.src[s]] = 1;
+                for (uint32_t k = 1; k < l.chain; ++k)
+                    read[l.side[k - 1]] = 1;
+                fn.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, l.pipeline);
+                fn.CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &group->sets[li], 0, nullptr);
+                fn.CmdDispatch(cmd, l.groups[0], l.groups[1], l.groups[2]);
+                if (profilePool)
+                    fn.CmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profilePool, profileFirst + uint32_t(li) + 1);
+            }
+        }
+    };
+
+    std::unique_ptr<Graph> Graph::Create(const DeviceContext& context, const Selection& selection, const GraphDesc& desc, std::string* error)
+    {
+        std::unique_ptr<Graph> graph(new Graph());
+        graph->m_selection   = selection;
+        graph->m_impl        = std::make_unique<Impl>();
+        Impl& impl           = *graph->m_impl;
+        impl.ctx             = context;
+        impl.selection       = selection;
+        if (!impl.fn.Load(context))
+        {
+            if (error)
+                *error = "failed to load Vulkan entry points";
+            impl.ctx.device = VK_NULL_HANDLE;
+            return nullptr;
+        }
+        impl.imageOutputs    = desc.imageOutputs;
+        if (!tosa::Parse(desc, impl.graph, error) || !Lower(impl.graph, impl.lowered, error) || !impl.Build(error))
+            return nullptr;
+        return graph;
+    }
+
+    Graph::~Graph() = default;
+
+    void Graph::Record(VkCommandBuffer commandBuffer, const ExternalTensor* tensors, uint32_t tensorCount)
+    {
+        m_impl->Record(commandBuffer, tensors, tensorCount);
+    }
+
+    void Graph::RecordInterleaved(VkCommandBuffer commandBuffer, Graph* const* graphs, const ExternalTensor* const* tensors,
+                                  const uint32_t* tensorCounts, uint32_t count)
+    {
+        std::vector<Impl*> impls(count);
+        for (uint32_t i = 0; i < count; ++i)
+            impls[i] = graphs[i]->m_impl.get();
+        if (count)
+            Impl::RecordInterleaved(commandBuffer, impls.data(), tensors, tensorCounts, count);
+    }
+
+    const std::vector<int64_t>* Graph::GetTensorShape(uint32_t binding) const
+    {
+        auto it = m_impl->shapes.find(binding);
+        return it == m_impl->shapes.end() ? nullptr : &it->second;
+    }
+
+    bool Graph::WritesImages() const
+    {
+        return m_impl->writesImages;
+    }
+
+    uint32_t Graph::GetDispatchCount() const
+    {
+        return uint32_t(m_impl->layers.size());
+    }
+
+    void Graph::SetProfiling(VkQueryPool queryPool, uint32_t firstQuery)
+    {
+        m_impl->profilePool  = queryPool;
+        m_impl->profileFirst = firstQuery;
+    }
+
+    std::string Graph::DescribeLayer(uint32_t index) const
+    {
+        const FusedConv&  fc   = m_impl->lowered.convs[index];
+        const tosa::Node& conv = *fc.conv;
+        std::string s = "conv" + std::to_string(conv.kernelH) + "x" + std::to_string(conv.kernelW) + " s" + std::to_string(conv.stride[0]) + " " +
+                        std::to_string(fc.inC) + "->" + std::to_string(fc.outC) + " " + std::to_string(fc.inH) + "x" + std::to_string(fc.inW) + "->" +
+                        std::to_string(fc.outH) + "x" + std::to_string(fc.outW);
+        for (const ConvSource& src : fc.sources)
+            if (src.resize)
+                s += " (resize in)";
+        if (fc.sources.size() > 1)
+            s += " (concat in)";
+        return s;
+    }
+}  // namespace ffx_ml

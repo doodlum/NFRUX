@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.20)
+project(NFRUX CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_compile_options(/MP /EHsc /wd4244 /wd4267)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(GEN ${CMAKE_BINARY_DIR}/shaders)
+file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/ml/*.hlsl)
+add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN}
+    DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
+add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
+add_library(nfrux_core STATIC core/log.cpp core/model.cpp core/ml/ffx_vk_ml_graph.cpp core/ml/ffx_vk_ml_reference.cpp core/ml/d3d12_network.cpp)
+add_dependencies(nfrux_core nfrux_shaders)
+target_include_directories(nfrux_core PUBLIC core core/ml core/model rhi ${GEN} $ENV{VULKAN_SDK}/Include)
+add_executable(ml_conformance_d3d12 tests/ml_conformance_d3d12.cpp)
+target_link_libraries(ml_conformance_d3d12 nfrux_core d3d12 dxgi dxguid)
