@@ -72,6 +72,7 @@ def run(cmd):
 
 
 RELAXED = len(sys.argv) < 4 or sys.argv[3] not in ("1", "ON")
+ALWAYS = ("kFiDownsample",)  # strict in every build: they round to a texel, often from an exact half, so a fused product picks another one
 FLOAT_OPS = {127, 129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
 
 
@@ -92,7 +93,7 @@ def precise(path, name):
         if op in FLOAT_OPS:
             ops.append(w[i + 2])
         i += n
-    add = [] if RELAXED else [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
+    add = [] if RELAXED and not name.startswith(ALWAYS) else [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
     w[first:first] = add
     import struct
     open(path, "wb").write(struct.pack(f"<{len(w)}I", *w))
@@ -117,7 +118,7 @@ def build(job):
             h = h.replace(".InterlockedMin(", ".InterlockedMin64(")
         open(b + ".hlsl", "w").write(h)
     run([XCROSS, b + ".spv", "--reflect", "--output", b + ".json"])
-    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED else ["-Gis"]),
+    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED and not name.startswith(ALWAYS) else ["-Gis"]),
          *(["-enable-16bit-types"] if sm >= 62 else []), b + ".hlsl", "-Fo", b + ".dxil"])
     refl = json.load(open(b + ".json"))
     hl = open(b + ".hlsl").read()

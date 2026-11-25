@@ -472,11 +472,30 @@ int main(int argc, char** argv)
             if (o.size() != v.size()) { printf("  %-14s sizes %zu %zu\n", n.c_str(), v.size(), o.size()), ++bad; continue; }
             size_t d = 0, d1 = 0, d3 = 0;
             double e = 0;
-            for (size_t i = 0; i < v.size(); ++i)
-            {
-                const int x = abs(int(v[i]) - int(o[i]));
-                d += x != 0, d1 += x > 1, d3 += x > 3, e += double(x) * x;
-            }
+            if (g.format == 2 && n.rfind("frame", 0) == 0)  // packed: by 10-bit code, on the 8-bit scale
+                for (size_t i = 0; i + 3 < v.size(); i += 4)
+                {
+                    uint32_t x, y;
+                    memcpy(&x, &v[i], 4), memcpy(&y, &o[i], 4);
+                    d += x != y;
+                    for (int k = 0; k < 30; k += 10) { const int z = abs(int(x >> k & 1023) - int(y >> k & 1023)); d1 += z > 1, d3 += z > 3, e += double(z) * z / 16; }
+                }
+            else if (g.format == 3 && n.rfind("frame", 0) == 0)  // halves: by value, 6 (the scene's scale) the peak
+                for (size_t i = 0; i + 1 < v.size(); i += 2)
+                {
+                    uint16_t x, y;
+                    memcpy(&x, &v[i], 2), memcpy(&y, &o[i], 2);
+                    d += x != y;
+                    auto f = [](uint16_t h) { const int ex = (h >> 10) & 31; const float m = float(h & 1023) / 1024.0f, r = ex ? ldexpf(1.0f + m, ex - 15) : ldexpf(m, -14); return h & 0x8000 ? -r : r; };
+                    const double z = fabs(double(f(x)) - f(y)) * 255.0 / 6.0;
+                    d1 += z > 1, d3 += z > 3, e += 2 * z * z;
+                }
+            else
+                for (size_t i = 0; i < v.size(); ++i)
+                {
+                    const int x = abs(int(v[i]) - int(o[i]));
+                    d += x != 0, d1 += x > 1, d3 += x > 3, e += double(x) * x;
+                }
             const double psnr = 10 * log10(255.0 * 255.0 / std::max(1e-9, e / std::max<size_t>(1, v.size())));
             if (n.rfind("frame", 0) == 0) ++frames, total += v.size(), off1 += d1, off3 += d3, worst = std::min(worst, psnr);
             anyDiff += d;
@@ -484,8 +503,7 @@ int main(int argc, char** argv)
         }
         printf("  %zu generated frames: worst PSNR %.2f dB, off by more than 1: %.5f%%, by more than 3: %.5f%%\n", frames, worst, 100.0 * off1 / std::max<size_t>(1, total), 100.0 * off3 / std::max<size_t>(1, total));
         // A2: strict, 0 bytes in every output and intermediate; shipped, 60 dB, 99.9% within a code, at most 0.01% over three.
-        const bool fp = g.format == 3;  // bytes of halves: PSNR of the values is not computed here, only strict judges it
-        if (!frames || (g.strict ? anyDiff != 0 : !fp && (worst < 60 || off1 * 1000 > total || off3 * 10000 > total))) printf("  LIMIT MISSED\n"), ++bad;
+        if (!frames || (g.strict ? anyDiff != 0 : (worst < 60 || off1 * 1000 > total || off3 * 10000 > total))) printf("  LIMIT MISSED\n"), ++bad;
     }
     return bad != 0;
 }
