@@ -157,7 +157,7 @@ public:
 
     ~DevN() override
     {
-        for (auto& [name, t] : times) Log("gpu %-44s %.4f ms a batch, %u dispatches", name.c_str(), t.first / std::max(1u, timedFrames - 60), t.second / std::max(1u, timedFrames - 60));
+        for (auto& [name, t] : times) std::sort(t.begin(), t.end()), Log("gpu %-44s %.4f ms median, %.4f 10th percentile, of %zu", name.c_str(), t[t.size() / 2], t[t.size() / 10], t.size());
         if (marks) n.DestroyQueryPool(marks);
         if (markBack) n.DestroyBuffer(markBack);
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
@@ -921,7 +921,7 @@ public:
     uint32_t        markCount = 0;
     std::vector<std::string> markNames[kSlots];
     uint32_t        markValue[kSlots] = {};
-    std::map<std::string, std::pair<double, uint32_t>> times;
+    std::map<std::string, std::vector<float>> times;
     uint32_t        timedFrames = 0;
     void Mark(const char* label) override
     {
@@ -941,7 +941,7 @@ public:
                     const uint64_t* q = v + size_t(slot) * kMarks;
                     const double hz = double(n.GetDeviceDesc(*dev).other.timestampFrequencyHz), ms = hz > 0 ? 1000.0 / hz : 0;  // (a wrapped D3D12 device has no queue to ask: 0)
                     if (markNames[slot].size() > 8 && ++timedFrames > 60)
-                        for (size_t i = 1; i < markNames[slot].size(); ++i) { auto& t = times[markNames[slot][i]]; t.first += double(q[i] - q[i - 1]) * ms, ++t.second; }
+                        for (size_t i = 1; i < markNames[slot].size(); ++i) times[markNames[slot][i]].push_back(float(double(q[i] - q[i - 1]) * ms));
                     n.UnmapBuffer(*markBack);
                 }
             markNames[slot].clear();

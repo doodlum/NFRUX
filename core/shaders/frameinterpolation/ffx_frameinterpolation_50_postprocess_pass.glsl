@@ -55,5 +55,7 @@
 FFX_ARM_FRAMEINTERPOLATION_NUM_THREADS
 void main()
 {
+    s_ui[gl_LocalInvocationIndex] = UiPixel(int32_t2(gl_GlobalInvocationID.xy)) ? 1u : 0u;
+    barrier();
     postprocess(int32_t2(gl_GlobalInvocationID.xy));
 }

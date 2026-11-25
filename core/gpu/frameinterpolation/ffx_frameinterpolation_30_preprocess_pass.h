@@ -127,24 +127,20 @@ FFX_MIN16_F2 LoadMotionQMVD(int32_t2 pixel, out bool dynamic_oob_hole)
 // least one (but not all) zero-motion (no-scatter) neighbour in its 8-neighbourhood.
 // The edge mask suppresses 3x3 depth dilation across hole boundaries and gates
 // the inpaint seed.
+FFX_MIN16_F Count4(bvec4 b) { return FFX_MIN16_F(uint32_t(b.x) + uint32_t(b.y) + uint32_t(b.z) + uint32_t(b.w)); }
+bvec4 And4(bvec4 a, bvec4 b) { return bvec4(a.x && b.x, a.y && b.y, a.z && b.z, a.w && b.w); }
 FFX_MIN16_F2 LoadMotionAndHoleEdgeDetect(int32_t2 pixel, out FFX_MIN16_F hole_edge_mask, out bool dynamic_oob_hole)
 {
-    const int32_t  iSampleCount          = 8;
-    const int32_t2 texture_size          = WarpedMotionQDataTP1Size();
-    const int32_t2 offsets[iSampleCount] = {
-        int32_t2(+1, +0), int32_t2(+0, +1), int32_t2(+0, -1), int32_t2(-1, +0), int32_t2(-1, +1), int32_t2(+1, +1), int32_t2(-1, -1), int32_t2(+1, -1)};
-
-    hole_edge_mask                 = FFX_MIN16_F(0.0f);
-    FFX_MIN16_F valid_sample_count = FFX_MIN16_F(0.0f);
-    for (int32_t i = 0; i < iSampleCount; ++i)
-    {
-        int32_t2    sample_pos         = pixel + offsets[i];
-        int32_t2    clamped_sample_pos = clamp(sample_pos, int32_t2(0), texture_size - int32_t2(1));
-        FFX_MIN16_F valid_sample_mask  = FFX_MIN16_F(all(equal(sample_pos, clamped_sample_pos)));
-        FfxUInt32   tap                = LoadWarpedMotionQDataTP1(clamped_sample_pos);
-        valid_sample_count += valid_sample_mask;
-        hole_edge_mask += valid_sample_mask * FFX_MIN16_F(tap == 0u);
-    }
+    // The eight around it: two gathers (at the pixel's opposite corners) and the two corners they miss. Pixels off the lane do not count.
+    const int32_t2 size   = WarpedMotionQDataTP1Size();
+    const bvec4    side   = bvec4(greaterThan(pixel, int32_t2(0)), lessThan(pixel + 1, size));  // left, up, right, down
+    const bvec4    corner = bvec4(side.x && side.y, side.z && side.w, side.x && side.w, side.z && side.y);
+    const uvec4    ga     = textureGather(usampler2D(r_warped_motion_qdata_tp1, s_PointClamp), float2(pixel) / float2(size));
+    const uvec4    gd     = textureGather(usampler2D(r_warped_motion_qdata_tp1, s_PointClamp), float2(pixel + 1) / float2(size));
+    const uint32_t g0     = LoadWarpedMotionQDataTP1(clamp(pixel + int32_t2(-1, 1), int32_t2(0), size - 1));
+    const uint32_t g1     = LoadWarpedMotionQDataTP1(clamp(pixel + int32_t2(1, -1), int32_t2(0), size - 1));
+    hole_edge_mask = Count4(And4(side, equal(uvec4(ga.x, ga.z, gd.z, gd.x), uvec4(0u)))) + Count4(And4(corner, equal(uvec4(ga.w, gd.y, g0, g1), uvec4(0u))));
+    const FFX_MIN16_F valid_sample_count = Count4(side) + Count4(corner);
     hole_edge_mask *= FFX_MIN16_F(hole_edge_mask != valid_sample_count);
 
     return LoadMotionQMVD(pixel, dynamic_oob_hole);
@@ -168,16 +164,11 @@ float LoadDilatedDepthTm1(int32_t2 pos, int32_t2 depth_size, FFX_MIN16_F mask, o
     const bool     vx0 = pos.x >= 0 && pos.x < depth_size.x;
     const bool     vym = pos.y - 1 >= 0 && pos.y - 1 < depth_size.y, vyp = pos.y + 1 >= 0 && pos.y + 1 < depth_size.y;
     const bool     vy0 = pos.y >= 0 && pos.y < depth_size.y;
-    const int32_t  cx  = clamp(pos.x, 0, depth_size.x - 1), cy = clamp(pos.y, 0, depth_size.y - 1);
-    float sd[8];
-    bool  v[8];
-    for (int32_t i = 0; i < 8; ++i)
-    {
-        const int32_t2 o = offsets[i];
-        const int32_t  x = o.x < 0 ? lo.x : (o.x > 0 ? hi.x : cx), y = o.y < 0 ? lo.y : (o.y > 0 ? hi.y : cy);
-        sd[i] = LoadInputDepthTm1Pixel(int32_t2(x, y));
-        v[i]  = (o.x < 0 ? vxm : (o.x > 0 ? vxp : vx0)) && (o.y < 0 ? vym : (o.y > 0 ? vyp : vy0));
-    }
+    // The eight around it: two gathers (at the pixel's opposite corners) and the two corners they miss.
+    const float4 ga = textureGather(sampler2D(r_depth_tm1, s_PointClamp), float2(pos) / float2(depth_size));
+    const float4 gd = textureGather(sampler2D(r_depth_tm1, s_PointClamp), float2(pos + 1) / float2(depth_size));
+    const float  sd[8] = {gd.z, gd.x, ga.z, ga.x, LoadInputDepthTm1Pixel(int32_t2(lo.x, hi.y)), gd.y, ga.w, LoadInputDepthTm1Pixel(int32_t2(hi.x, lo.y))};
+    const bool   v[8]  = {vxp && vy0, vx0 && vyp, vx0 && vym, vxm && vy0, vxm && vyp, vxp && vyp, vxm && vym, vxp && vym};
     for (int32_t i = 0; i < 8; ++i)
     {
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH
@@ -208,16 +199,11 @@ float LoadDilatedDepthTp1(int32_t2 pos, int32_t2 depth_size, FFX_MIN16_F mask, o
     const bool     vx0 = pos.x >= 0 && pos.x < depth_size.x;
     const bool     vym = pos.y - 1 >= 0 && pos.y - 1 < depth_size.y, vyp = pos.y + 1 >= 0 && pos.y + 1 < depth_size.y;
     const bool     vy0 = pos.y >= 0 && pos.y < depth_size.y;
-    const int32_t  cx  = clamp(pos.x, 0, depth_size.x - 1), cy = clamp(pos.y, 0, depth_size.y - 1);
-    float sd[8];
-    bool  v[8];
-    for (int32_t i = 0; i < 8; ++i)
-    {
-        const int32_t2 o = offsets[i];
-        const int32_t  x = o.x < 0 ? lo.x : (o.x > 0 ? hi.x : cx), y = o.y < 0 ? lo.y : (o.y > 0 ? hi.y : cy);
-        sd[i] = LoadDepthTp1FeedbackPixel(int32_t2(x, y));
-        v[i]  = (o.x < 0 ? vxm : (o.x > 0 ? vxp : vx0)) && (o.y < 0 ? vym : (o.y > 0 ? vyp : vy0));
-    }
+    // The eight around it: two gathers (at the pixel's opposite corners) and the two corners they miss.
+    const float4 ga = textureGather(sampler2D(r_depth_tm1_next, s_PointClamp), float2(pos) / float2(depth_size));
+    const float4 gd = textureGather(sampler2D(r_depth_tm1_next, s_PointClamp), float2(pos + 1) / float2(depth_size));
+    const float  sd[8] = {gd.z, gd.x, ga.z, ga.x, LoadDepthTp1FeedbackPixel(int32_t2(lo.x, hi.y)), gd.y, ga.w, LoadDepthTp1FeedbackPixel(int32_t2(hi.x, lo.y))};
+    const bool   v[8]  = {vxp && vy0, vx0 && vyp, vx0 && vym, vxm && vy0, vxm && vyp, vxp && vyp, vxm && vym, vxp && vym};
     for (int32_t i = 0; i < 8; ++i)
     {
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH

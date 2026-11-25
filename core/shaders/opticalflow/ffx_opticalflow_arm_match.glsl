@@ -35,9 +35,8 @@ layout(set = 0, binding = 5, r32ui) uniform writeonly uimage2D rw_arm_match;  //
 
 #define SR 3
 #define SW (2 * SR + 1)
-const FfxInt32 kSpiral[SW * SW] = {24, 30, 31, 32, 25, 18, 17, 16, 23, 36, 37, 38, 39, 40, 33, 26, 19,
-                                   12, 11, 10, 9,  8,  15, 22, 29, 42, 43, 44, 45, 46, 47, 48, 41, 34,
-                                   27, 20, 13, 6,  5,  4,  3,  2,  1,  0,  7,  14, 21, 28, 35};
+// Each window offset's place in the spiral: the earliest of equal costs wins.
+const FfxUInt32 kRank[SW * SW] = {43, 42, 41, 40, 39, 38, 37, 44, 21, 20, 19, 18, 17, 36, 45, 22, 7, 6, 5, 16, 35, 46, 23, 8, 0, 4, 15, 34, 47, 24, 1, 2, 3, 14, 33, 48, 9, 10, 11, 12, 13, 32, 25, 26, 27, 28, 29, 30, 31};
 
 float16_t TemplateClamp(FfxInt32x2 p)
 {
@@ -56,7 +55,7 @@ float16_t SearchZero(FfxInt32x2 p)
 const FfxInt32 kT = 8 + 2 * ARM_BLOCK_R, kW = 8 + 2 * ARM_BLOCK_R + 2 * SR;
 shared FfxUInt32 sT[kT * kT];
 shared FfxUInt32 sW[kW * kW];
-shared FfxUInt32 sH[kT * 8];
+shared FfxUInt32 sH[SW * kT * 8];
 
 void main()
 {
@@ -75,26 +74,30 @@ void main()
     barrier();
     FfxUInt32  best    = 0xffffffffu;
     FfxInt32x2 intFlow = FfxInt32x2(0);
-    for (FfxInt32 si = 0; si < SW * SW; ++si)
+    // A row of seven offsets at a time: all their row sums (5 differences, for the tile's 12 rows and the group's 8 columns), then the block sums.
+    for (FfxInt32 sy = 0; sy < SW; ++sy)
     {
-        const FfxInt32 sx = kSpiral[si] % SW, sy = kSpiral[si] / SW;  // window offset of the block
-        // Row sums of the 5 differences for each of the tile's 12 rows and the workgroup's 8 columns.
-        for (FfxInt32 k = li; k < kT * 8; k += 64)
+        for (FfxInt32 k = li; k < SW * kT * 8; k += 64)
         {
-            const FfxInt32 y = k / 8, x = k % 8;
+            const FfxInt32 sx = k / (kT * 8), y = (k / 8) % kT, x = k % 8;
             FfxUInt32      h = 0u;
             [[unroll]] for (FfxInt32 i = 0; i < 5; ++i)
                 h += FfxUInt32(abs(FfxInt32(sW[(y + sy) * kW + x + i + sx]) - FfxInt32(sT[y * kT + x + i])));
             sH[k] = h;
         }
         barrier();
-        FfxUInt32 d = 0u;
-        [[unroll]] for (FfxInt32 j = 0; j < 5; ++j)
-            d += sH[(lid.y + j) * 8 + lid.x];
-        if (d < best)
-            best = d, intFlow = FfxInt32x2(sx - SR, sy - SR);
+        [[unroll]] for (FfxInt32 sx = 0; sx < SW; ++sx)
+        {
+            FfxUInt32 d = 0u;
+            [[unroll]] for (FfxInt32 j = 0; j < 5; ++j)
+                d += sH[(sx * kT + lid.y + j) * 8 + lid.x];
+            const FfxUInt32 key = (d << 6) | kRank[sy * SW + sx];  // the cost is at most 25 x 255
+            if (key < best)
+                best = key, intFlow = FfxInt32x2(sx - SR, sy - SR);
+        }
         barrier();
     }
+    best >>= 6;
     if (any(greaterThanEqual(pos, ubo._LevelDims)))
         return;
     imageStore(rw_arm_match, pos, FfxUInt32x4(best, 0u, 0u, 0u));

@@ -68,6 +68,22 @@ bool QuadAny(bool b)
 }
 #endif
 
+// The UI test by 2x2 blocks: every lane of the group tests its own pixel once, the block takes its four (the edge's missing pixels repeat others).
+shared uint32_t s_ui[FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH * FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT];
+bool UiPixel(int32_t2 p)
+{
+    if (any(greaterThanEqual(p, DisplaySize())) || UiKind() == 2u || UiKind() == 3u)
+        return false;
+    if (UiKind() == 4u || UiKind() == 5u)
+        return LoadUiAlpha(p, UiKind() == 5u) > FFX_MIN16_F(0.4f);
+    const FFX_MIN16_F3 d = abs(LoadUiSource(p).rgb - LoadCurrentBackbuffer(p));
+    return max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
+}
+bool UiBlock()
+{
+    const uint32_t w = uint32_t(FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH), i = (gl_LocalInvocationID.y & ~1u) * w + (gl_LocalInvocationID.x & ~1u);
+    return (s_ui[i] | s_ui[i + 1u] | s_ui[i + w] | s_ui[i + w + 1u]) != 0u;
+}
 void postprocess(int32_t2 output_pixel)
 {
     //-------------------------------------------------------------------------
@@ -179,14 +195,7 @@ void postprocess(int32_t2 output_pixel)
 #if FFX_FRAMEINTERPOLATION_QUAD_UI
             const bool isUi = QuadAny(LoadUiAlpha(output_pixel, UiKind() == 5u) > FFX_MIN16_F(0.4f));
 #else
-            const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
-            bool           isUi  = false;
-            for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
-            {
-                const int32_t2 q = min(block + int32_t2(i % FFX_FRAMEINTERPOLATION_UI_BLOCK, i / FFX_FRAMEINTERPOLATION_UI_BLOCK),
-                                       displaySize - 1);
-                isUi = isUi || LoadUiAlpha(q, UiKind() == 5u) > FFX_MIN16_F(0.4f);
-            }
+            const bool isUi = UiBlock();
 #endif
             if (isUi)
                 rgb_t = ui.rgb;
@@ -201,15 +210,7 @@ void postprocess(int32_t2 output_pixel)
             const FFX_MIN16_F3 d    = abs(ui.rgb - LoadCurrentBackbuffer(output_pixel));
             const bool         isUi = QuadAny(max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f));
 #else
-            const int32_t2 block = output_pixel & ~int32_t2(FFX_FRAMEINTERPOLATION_UI_BLOCK - 1);
-            bool           isUi  = false;
-            for (int32_t i = 0; i < FFX_FRAMEINTERPOLATION_UI_BLOCK * FFX_FRAMEINTERPOLATION_UI_BLOCK; ++i)
-            {
-                const int32_t2 q = min(block + int32_t2(i % FFX_FRAMEINTERPOLATION_UI_BLOCK, i / FFX_FRAMEINTERPOLATION_UI_BLOCK),
-                                       displaySize - 1);
-                const FFX_MIN16_F3 d   = abs(LoadUiSource(q).rgb - LoadCurrentBackbuffer(q));
-                isUi = isUi || max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
-            }
+            const bool isUi = UiBlock();
 #endif
             if (isUi)
                 rgb_t = ui.rgb;
