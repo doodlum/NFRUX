@@ -18,5 +18,6 @@ struct VulkanHost
     uint32_t                  mlFeatures     = 0;      // ffx_ml::FEATURE_* known to be enabled on the device
 };
 std::unique_ptr<Device> CreateNriVulkanDevice(const VulkanHost& host);
+void LogD3D12Messages(ID3D12Device* device);  // NFRUX_TEST_D3D12_MESSAGES: the debug layer's messages into the log
 std::unique_ptr<Device> CreateNriD3D12Device(ID3D12Device* device);
 }  // namespace nfrux

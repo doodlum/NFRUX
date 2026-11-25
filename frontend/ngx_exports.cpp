@@ -109,6 +109,10 @@ ExternalImage Image12(NgxParameter* p, const char* n)
     if (!r) return e;
     const D3D12_RESOURCE_DESC d = r->GetDesc();
     e.handle = r, e.format = d.Format, e.width = uint32_t(d.Width), e.height = d.Height, e.state = 0;
+    // Streamline's copies of tags valid only when tagged stay in COPY_DEST (seen under the debug layer), not in the guide's state.
+    wchar_t name[128] = {};
+    UINT size = sizeof(name) - sizeof(wchar_t);
+    if (SUCCEEDED(r->GetPrivateData(WKPDID_D3DDebugObjectNameW, &size, name)) && wcsstr(name, L"clone.tagVolatile")) e.state = D3D12_RESOURCE_STATE_COPY_DEST;
     return e;
 }
 ExternalImage ImageVk(NgxParameter* p, const char* n)

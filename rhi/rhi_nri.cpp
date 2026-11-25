@@ -29,6 +29,11 @@ namespace nfrux
 {
 namespace
 {
+thread_local bool t_recording = false;
+}  // namespace
+void LogBarriers(ID3D12GraphicsCommandList* list);
+namespace
+{
 constexpr uint32_t kSlots = 32, kSets = 160, kConstants = 512, kConstantStride = 512;
 #define NRI_OK(x) ((x) == nri::Result::SUCCESS)
 
@@ -138,6 +143,7 @@ public:
     struct Read { nri::Buffer* buf; std::shared_ptr<std::vector<uint8_t>> out; uint32_t pitch, row, rows, slot, value; uint64_t size; };
     std::vector<Read>       reads;
     std::vector<std::pair<uint64_t, nri::Buffer*>> freeReads;  // small ones, kept
+    std::vector<std::pair<uint32_t, nri::Buffer*>> dying;      // the recording they were finished in; destroyed 16 later
 
     ~DevN() override
     {
@@ -151,6 +157,7 @@ public:
         for (auto* x : old) n.DestroyBuffer(x);
         for (auto& x : reads) n.DestroyBuffer(x.buf);
         for (auto& x : freeReads) n.DestroyBuffer(x.second);
+        for (auto& x : dying) n.DestroyBuffer(x.second);
         if (dev) nri::nriDestroyDevice(dev);
     }
     const Caps& caps() const override { return c; }
@@ -216,8 +223,7 @@ public:
             D3D12_FEATURE_DATA_SHADER_MODEL sm = {D3D_SHADER_MODEL(m)};
             if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm)))) { c.shaderModel = uint32_t(sm.HighestShaderModel); break; }
         }
-        D3D12_FEATURE_DATA_D3D12_OPTIONS1 o1 = {};
-        device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, &o1, sizeof(o1));
+        LogD3D12Messages(device);
         c.dot4 = c.shaderModel >= 0x64;
         c.cuda  = c.vendorId == uint32_t(nri::Vendor::NVIDIA) && GetModuleHandleA("nvapi64.dll");
         Log("D3D12 (NRI): %s, shader model %x, dot4 %d", c.name.c_str(), c.shaderModel, c.dot4);
@@ -462,6 +468,8 @@ public:
         for (auto it = retired.begin(); it != retired.end();)
             // Our work in the host's command buffer has finished, but the buffer may still count as pending (its tail, its fence): kept 16 recordings more.
             if (next - it->value >= 16 && Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); ++finished, it = retired.erase(it); } else ++it;
+        for (auto it = dying.begin(); it != dying.end();)
+            if (next - it->first >= 16) n.DestroyBuffer(it->second), it = dying.erase(it); else ++it;
         for (auto it = reads.begin(); it != reads.end();)
             if (Done(it->slot, it->value)) { Finish(*it); it = reads.erase(it); } else ++it;
     }
@@ -474,7 +482,7 @@ public:
             n.UnmapBuffer(*r.buf);
         }
         if (r.size <= 4096 && freeReads.size() < 16) freeReads.push_back({r.size, r.buf});
-        else n.DestroyBuffer(r.buf);
+        else dying.push_back({next, r.buf});  // the token is written before the host's list ends: not free yet
     }
     std::atomic<int> cudaState = 0;  // 0 not tried, 1 in use, -1 not
     uint32_t    finished = 0;
@@ -504,7 +512,8 @@ public:
     {
         Poll();
         if (cudaState == 1 && finished >= 10 && !marked) marked = true, MarkerOk(Rung());  // ten recordings completed
-        nativeCmd = commands;
+        nativeCmd = commands, t_recording = true;
+        if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));
         if (isVk)
         {
             nri::CommandBufferVKDesc d = {};
@@ -555,7 +564,7 @@ public:
         used.clear();
         retired.push_back({std::move(wrapped), cmd, slot, slotValue[slot]});
         wrapped.clear(), wrappedHome.clear();
-        cmd = nullptr;
+        cmd = nullptr, t_recording = false;
     }
     Texture* Wrap(const ExternalImage& e, bool output) override
     {
@@ -586,7 +595,7 @@ public:
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
         if (!IsSrgb(e) && !Views(*t, f, false)) return nullptr;
-        const nri::AccessLayoutStage& home = isVk ? (!output && e.state == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? kHostVkRead : kHostVk) : output ? kUav : kSrv;
+        const nri::AccessLayoutStage& home = isVk ? (!output && e.state == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? kHostVkRead : kHostVk) : output ? kUav : e.state == D3D12_RESOURCE_STATE_COPY_DEST ? kDst : kSrv;
         t->state = home;
         wrapped.push_back(std::move(t)), wrappedHome.push_back(home);
         return wrapped.back().get();
@@ -637,7 +646,7 @@ public:
         if (sx >= s.width || sy >= s.height || dx >= d.width || dy >= d.height) return;
         Copy(s, sx, sy, d, dx, dy, std::min({w, s.width - sx, d.width - dx}), std::min({h, s.height - sy, d.height - dy}));
     }
-    // A word into one of the host's buffers (D3D12: in UNORDERED_ACCESS).
+    // A word into one of the host's buffers (D3D12: in COPY_DEST, as Streamline gives it).
     void WriteWord(void* buffer, uint32_t value) override
     {
         Flush();
@@ -657,13 +666,8 @@ public:
         auto* res = static_cast<ID3D12Resource*>(buffer);
         ID3D12GraphicsCommandList2* l2 = nullptr;
         if (FAILED(list->QueryInterface(__uuidof(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&l2)))) return;
-        D3D12_RESOURCE_BARRIER b = {};
-        b.Transition = {res, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST};
-        list->ResourceBarrier(1, &b);
         const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER p = {res->GetGPUVirtualAddress(), value};
         l2->WriteBufferImmediate(1, &p, nullptr);
-        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-        list->ResourceBarrier(1, &b);
         l2->Release();
     }
     void CopyRegion(const Texture& s, uint32_t x, uint32_t y, const Texture& d) override { Copy(s, x, y, d, 0, 0, d.width, d.height); }
@@ -841,6 +845,55 @@ uint32_t TexelSize(Format f)
     case Format::RGBA16Float: return 8;
     default: return 4;
     }
+}
+// With NFRUX_TEST_D3D12_MESSAGES: every barrier on lists of this kind, the host's and NFRUX's.
+using BarrierFn = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+static BarrierFn g_barrier;
+static void STDMETHODCALLTYPE LoggedBarrier(ID3D12GraphicsCommandList* l, UINT n, const D3D12_RESOURCE_BARRIER* b)
+{
+    static std::atomic<int> count;
+    for (UINT i = 0; i < n && count < 4000; ++i)
+        if (b[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && count++ < 4000)
+        {
+            wchar_t name[128] = L"?", list[128] = L"?";
+            UINT s = sizeof(name) - 2;
+            if (b[i].Transition.pResource) b[i].Transition.pResource->GetPrivateData(WKPDID_D3DDebugObjectNameW, &s, name);
+            s = sizeof(list) - 2;
+            l->GetPrivateData(WKPDID_D3DDebugObjectNameW, &s, list);
+            if (!wcsstr(list, L"dlssg") && !wcsstr(name, L"PreUI") && !wcsstr(name, L"GBufferMotion") && !wcsstr(name, L"clone.tag")) { --count; continue; }
+            char an[128] = "?";
+            s = sizeof(an) - 1;
+            if (name[0] == L'?' && b[i].Transition.pResource) b[i].Transition.pResource->GetPrivateData(WKPDID_D3DDebugObjectName, &s, an);
+            Log("barrier%s %p %ls: %ls %s %x -> %x", t_recording ? " (NFRUX)" : "", (void*)l, list, name, an, b[i].Transition.StateBefore, b[i].Transition.StateAfter);
+        }
+    g_barrier(l, n, b);
+}
+void LogBarriers(ID3D12GraphicsCommandList* list)
+{
+    if (g_barrier || !Env("NFRUX_TEST_D3D12_MESSAGES")) return;
+    void** v = *reinterpret_cast<void***>(list);
+    DWORD old;
+    if (!VirtualProtect(&v[26], 8, PAGE_READWRITE, &old)) return;
+    g_barrier = reinterpret_cast<BarrierFn>(v[26]), v[26] = reinterpret_cast<void*>(LoggedBarrier);
+    VirtualProtect(&v[26], 8, old, &old);
+}void LogD3D12Messages(ID3D12Device* device)
+{
+        if (Env("NFRUX_TEST_D3D12_MESSAGES"))  // the host runs the debug layer: its messages into the log, while NFRUX records or not
+        {
+            ID3D12InfoQueue1* q = nullptr;
+            if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D12InfoQueue1), reinterpret_cast<void**>(&q))))
+            {
+                for (auto s : {D3D12_MESSAGE_SEVERITY_CORRUPTION, D3D12_MESSAGE_SEVERITY_ERROR, D3D12_MESSAGE_SEVERITY_WARNING}) q->SetBreakOnSeverity(s, FALSE);
+                DWORD cookie = 0;
+                const HRESULT hr = q->RegisterMessageCallback([](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY s, D3D12_MESSAGE_ID id, LPCSTR text, void*) {
+                    static std::atomic<int> n[2048];
+                    if (s <= D3D12_MESSAGE_SEVERITY_WARNING && uint32_t(id) < 2048 && n[id]++ < 6) Log("D3D12 %s %d%s: %s", s <= D3D12_MESSAGE_SEVERITY_ERROR ? "error" : "warning", int(id), t_recording ? " (in NFRUX)" : "", text);
+                }, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+                Log("D3D12 messages are logged (%08lx)", hr);
+                q->Release();
+            }
+            else Log("no D3D12 debug layer on the host's device");
+        }
 }
 std::unique_ptr<Device> CreateNriD3D12Device(ID3D12Device* device)
 {

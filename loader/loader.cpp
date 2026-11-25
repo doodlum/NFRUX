@@ -41,8 +41,17 @@ static bool IsOurs(const NgxHandle* h) { std::lock_guard<std::mutex> k(g_hm); re
 template <class T> static NgxResult Keep(NgxResult r, T** h) { if (r == kNgxSuccess) { std::lock_guard<std::mutex> k(g_hm); g_handles.insert(*h); } L("feature 11: %x", r); return r; }
 
 // --- D3D12
+namespace nfrux { void LogD3D12Messages(ID3D12Device* device); }
 static NgxResult __cdecl Create12(ID3D12GraphicsCommandList* c, int f, NgxParameter* p, NgxHandle** h)
 {
+    if (f == kFeatureFrameGeneration && getenv("NFRUX_TEST_PASSTHROUGH"))  // the control: NVIDIA's own feature, the debug layer's messages logged
+    {
+        ID3D12Device* d = nullptr;
+        c->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&d));
+        nfrux::LogD3D12Messages(d);
+        d->Release();
+        return Real<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature")(c, f, p, h);
+    }
     if (auto o = f == kFeatureFrameGeneration ? Ours<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature") : nullptr) return Keep(o(c, f, p, h), h);
     return Real<decltype(&Create12)>("NVSDK_NGX_D3D12_CreateFeature")(c, f, p, h);
 }
@@ -313,6 +322,35 @@ static const std::map<std::string, void*> kWrap = {
     {"NVSDK_NGX_D3D12_EvaluateFeature_C", (void*)Eval12C}, {"NVSDK_NGX_VULKAN_EvaluateFeature_C", (void*)EvalVkC}, {"NVSDK_NGX_VULKAN_GetFeatureRequirements", (void*)ReqVk}, {"NVSDK_NGX_VULKAN_Init_Ext", (void*)InitVkE},
     {"NVSDK_NGX_D3D12_Shutdown", (void*)Shut12}, {"NVSDK_NGX_D3D12_Shutdown1", (void*)Shut12D}, {"NVSDK_NGX_VULKAN_Shutdown", (void*)ShutVk}, {"NVSDK_NGX_VULKAN_Shutdown1", (void*)ShutVkD}};
 
+// --- Streamline's tags (D3D12). DLSS-G's inputs reach the feature in the state they were tagged with, and Streamline does not transition them;
+// RENDER_TARGET and others are not legal on the compute list they are read on. Such tags are passed on as valid only now: Streamline copies them
+// at once, on the game's own list, and the copies' state is known. (sl_core_types.h: BaseStructure is next, 16-byte type, version.)
+struct SlResource { void* next; uint32_t type[4]; size_t version; char kind; void *native, *memory, *view; uint32_t state; };
+struct SlTag { void* next; uint32_t type[4]; size_t version; SlResource* resource; uint32_t buffer; int lifecycle; uint32_t extent[4]; };
+static_assert(sizeof(SlTag) == 64);
+static std::vector<SlTag> Tags(const SlTag* t, uint32_t n, void* list)
+{
+    std::vector<SlTag> o;
+    if (!t || !n || n > 64 || !list || g_featureDevice) return o;
+    for (uint32_t i = 0; i < n; ++i) if (t[i].type[0] != 0x4c6a5aad) return o;
+    o.assign(t, t + n);
+    for (SlTag& x : o)
+        for (uint32_t b : {0u, 1u, 2u, 23u, 50u, 54u, 69u})  // depth, vectors, HUD-less, UI, distortion, no-warp, UI alpha
+            if (x.buffer == b && x.lifecycle == 1 && x.resource && x.resource->native && x.resource->state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE && x.resource->state != UINT32_MAX)
+            {
+                static uint32_t said = 0;
+                if (!(said >> (b % 32) & 1)) said |= 1u << (b % 32), L("tag %u in state 0x%x: copied when tagged", b, x.resource->state);
+                x.lifecycle = 0;
+            }
+    return o;
+}
+using SlSetTag = int (*)(const void*, const SlTag*, uint32_t, void*);
+using SlSetTagForFrame = int (*)(const void*, const void*, const SlTag*, uint32_t, void*);
+static SlSetTag g_setTag;
+static SlSetTagForFrame g_setTagForFrame;
+static int SetTag(const void* v, const SlTag* t, uint32_t n, void* list) { const auto o = Tags(t, n, list); return g_setTag(v, o.empty() ? t : o.data(), n, list); }
+static int SetTagForFrame(const void* f, const void* v, const SlTag* t, uint32_t n, void* list) { const auto o = Tags(t, n, list); return g_setTagForFrame(f, v, o.empty() ? t : o.data(), n, list); }
+
 static FARPROC WINAPI HookGPA(HMODULE m, LPCSTR n)
 {
     FARPROC r = GetProcAddress(m, n);
@@ -323,6 +361,11 @@ static FARPROC WINAPI HookGPA(HMODULE m, LPCSTR n)
         L("GetProcAddress %s %s -> %p", path, n, r);
         auto it = kWrap.find(n);
         if (core && r && it != kWrap.end()) { g_real[n] = (void*)r; return (FARPROC)it->second; }
+    }
+    if (HIWORD(n) && r && !strncmp(n, "slSetTag", 8) && m == GetModuleHandleA("sl.interposer.dll"))
+    {
+        if (!strcmp(n, "slSetTag")) { g_setTag = (SlSetTag)r; return (FARPROC)SetTag; }
+        if (!strcmp(n, "slSetTagForFrame")) { g_setTagForFrame = (SlSetTagForFrame)r; return (FARPROC)SetTagForFrame; }
     }
     if (HIWORD(n) && r && m == GetModuleHandleA("vulkan-1.dll"))
     {
@@ -347,6 +390,15 @@ static void Patch(HMODULE m)
             if (IMAGE_SNAP_BY_ORDINAL(o->u1.Ordinal)) continue;
             const char* n = ((IMAGE_IMPORT_BY_NAME*)(base + o->u1.AddressOfData))->Name; void* h = nullptr;
             if (!strcmp(n, "GetProcAddress")) h = (void*)HookGPA; else if (!strcmp(n, "LoadLibraryExW")) h = (void*)HookLLX;
+            else if (!strncmp(n, "slSetTag", 8))
+            {
+                if (auto* sl = GetModuleHandleA("sl.interposer.dll"))
+                    if (void* real = (void*)GetProcAddress(sl, n))
+                    {
+                        if (!strcmp(n, "slSetTag")) g_setTag = (SlSetTag)real, h = (void*)SetTag;
+                        else if (!strcmp(n, "slSetTagForFrame")) g_setTagForFrame = (SlSetTagForFrame)real, h = (void*)SetTagForFrame;
+                    }
+            }
             if (h) { DWORD old; if (VirtualProtect(&t->u1.Function, 8, PAGE_READWRITE, &old)) { t->u1.Function = (ULONGLONG)h; VirtualProtect(&t->u1.Function, 8, old, &old); } }
         }
     }

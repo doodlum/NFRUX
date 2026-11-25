@@ -86,11 +86,11 @@ struct Api
     virtual TexP Create(Fmt f, uint32_t w, uint32_t h, bool output) = 0;
     virtual void Upload(Tex& t, const Bytes& b) = 0;
     virtual Bytes Read(Tex& t) = 0;
-    virtual void Bind(Params& p, const char* n, Tex* t) = 0;
+    virtual void Bind(NgxParameter& p, const char* n, Tex* t) = 0;
     virtual void BindWord(Params& p, const char* n) = 0;  // a 4-byte host buffer the feature writes
     virtual uint32_t ReadWord() = 0;
-    virtual NgxHandle* CreateFeature(Params& p) = 0;
-    virtual NgxResult Evaluate(NgxHandle* h, Params& p) = 0;  // recorded, submitted, waited for
+    virtual NgxHandle* CreateFeature(NgxParameter& p) = 0;
+    virtual NgxResult Evaluate(NgxHandle* h, NgxParameter& p) = 0;  // recorded, submitted, waited for
     bool evaluateC = false;  // through EvaluateFeature_C
     virtual NgxResult Release(NgxHandle* h) = 0;
     virtual void Shutdown() = 0;
@@ -121,6 +121,7 @@ struct Api
 struct Tex12 : Tex { ComPtr<ID3D12Resource> r; D3D12_RESOURCE_STATES home = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; };
 struct Api12 : Api
 {
+    bool core = false;  // the driver's NGX core, not a feature DLL
     ComPtr<ID3D12Device> d;
     ComPtr<ID3D12CommandQueue> q;
     ComPtr<ID3D12CommandAllocator> al;
@@ -173,12 +174,17 @@ struct Api12 : Api
             printf("  D3D12 debug layer on%s\n", atoi(getenv("NFRUX_D3D12_DEBUG")) > 1 ? ", GPU validation on" : "");
         }
         FindAdapter(d->GetAdapterLuid());
-        D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COMPUTE};
+        const auto type = core || getenv("NFRUX_TEST_DIRECT") ? D3D12_COMMAND_LIST_TYPE_DIRECT : D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        D3D12_COMMAND_QUEUE_DESC qd = {type};
         d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
-        d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&al));
-        d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, al.Get(), nullptr, IID_PPV_ARGS(&cl)), cl->Close();
+        d->CreateCommandAllocator(type, IID_PPV_ARGS(&al));
+        d->CreateCommandList(0, type, al.Get(), nullptr, IID_PPV_ARGS(&cl)), cl->Close();
         d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-        return Fn<NgxResult (*)(unsigned long long, const wchar_t*, ID3D12Device*, int, const void*)>("NVSDK_NGX_D3D12_Init_Ext")(0, L".", d.Get(), 0x15, nullptr) == kNgxSuccess;
+        static const wchar_t* path[] = {L"C:\\dev\\nfrux-ref\\dl\\streamline\\sdk\\bin\\x64"};
+        struct { const wchar_t* const* paths; unsigned n; void* internal; void* log; int level; bool noOther; } common = {path, 1};
+        const NgxResult r = Fn<NgxResult (*)(unsigned long long, const wchar_t*, ID3D12Device*, int, const void*)>("NVSDK_NGX_D3D12_Init_Ext")(core ? 231313132 : 0, L".", d.Get(), 0x15, core ? &common : nullptr);
+        if (r != kNgxSuccess) printf("  Init_Ext: %08x\n", r);
+        return r == kNgxSuccess;
     }
     void Begin() { al->Reset(), cl->Reset(al.Get(), nullptr); }
     void End()
@@ -213,6 +219,7 @@ struct Api12 : Api
         D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, output && f == F_RGBA8S ? DXGI_FORMAT_R8G8B8A8_TYPELESS : output && f == F_BGRA8S ? DXGI_FORMAT_B8G8R8A8_TYPELESS : kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
                                  output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         if (output) t->home = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        if (!output && getenv("NFRUX_TEST_WRONG_STATE")) t->home = D3D12_RESOURCE_STATE_COPY_SOURCE;  // the layers' control: must be reported
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, t->home, nullptr, IID_PPV_ARGS(&t->r));
         return t;
     }
@@ -252,7 +259,7 @@ struct Api12 : Api
         rb->Unmap(0, nullptr);
         return o;
     }
-    void Bind(Params& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<Tex12*>(t)->r.Get() : static_cast<ID3D12Resource*>(nullptr)); }
+    void Bind(NgxParameter& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<Tex12*>(t)->r.Get() : static_cast<ID3D12Resource*>(nullptr)); }
     ComPtr<ID3D12Resource> word;
     void BindWord(Params& p, const char* n) override
     {
@@ -262,7 +269,7 @@ struct Api12 : Api
             D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
             d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&word));
             D3D12_RESOURCE_BARRIER b = {};
-            b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+            b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST};
             Begin(), cl->ResourceBarrier(1, &b), End();
         }
         p.Set(n, word.Get());
@@ -271,7 +278,7 @@ struct Api12 : Api
     {
         auto rb = Buffer(D3D12_HEAP_TYPE_READBACK, 256);
         D3D12_RESOURCE_BARRIER b = {};
-        b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        b.Transition = {word.Get(), 0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE};
         Begin(), cl->ResourceBarrier(1, &b), cl->CopyResource(rb.Get(), word.Get()), std::swap(b.Transition.StateBefore, b.Transition.StateAfter), cl->ResourceBarrier(1, &b), End();
         uint32_t* p;
         rb->Map(0, nullptr, reinterpret_cast<void**>(&p));
@@ -279,15 +286,16 @@ struct Api12 : Api
         rb->Unmap(0, nullptr);
         return v;
     }
-    NgxHandle* CreateFeature(Params& p) override
+    NgxHandle* CreateFeature(NgxParameter& p) override
     {
         NgxHandle* h = nullptr;
         Begin();
-        Fn<NgxResult (*)(ID3D12GraphicsCommandList*, int, NgxParameter*, NgxHandle**)>("NVSDK_NGX_D3D12_CreateFeature")(cl.Get(), kFeatureFrameGeneration, &p, &h);
+        const NgxResult r = Fn<NgxResult (*)(ID3D12GraphicsCommandList*, int, NgxParameter*, NgxHandle**)>("NVSDK_NGX_D3D12_CreateFeature")(cl.Get(), kFeatureFrameGeneration, &p, &h);
+        if (r != kNgxSuccess) printf("  CreateFeature: %08x\n", r);
         End();
         return h;
     }
-    NgxResult Evaluate(NgxHandle* h, Params& p) override
+    NgxResult Evaluate(NgxHandle* h, NgxParameter& p) override
     {
         Begin();
         const NgxResult r = Fn<NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_D3D12_EvaluateFeature_C" : "NVSDK_NGX_D3D12_EvaluateFeature")(cl.Get(), h, &p, nullptr);
@@ -484,8 +492,8 @@ struct ApiV : Api
     uint32_t ReadWord() override { return *wordMap; }
     void Upload(Tex& t, const Bytes& b) override { Copy(t, nullptr, &b); }
     Bytes Read(Tex& t) override { Bytes o; Copy(t, &o, nullptr); return o; }
-    void Bind(Params& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<void*>(&static_cast<TexV*>(t)->res) : nullptr); }
-    NgxHandle* CreateFeature(Params& p) override
+    void Bind(NgxParameter& p, const char* n, Tex* t) override { p.Set(n, t ? static_cast<void*>(&static_cast<TexV*>(t)->res) : nullptr); }
+    NgxHandle* CreateFeature(NgxParameter& p) override
     {
         NgxHandle* h = nullptr;
         Begin();
@@ -493,7 +501,7 @@ struct ApiV : Api
         End();
         return h;
     }
-    NgxResult Evaluate(NgxHandle* h, Params& p) override
+    NgxResult Evaluate(NgxHandle* h, NgxParameter& p) override
     {
         Begin();
         const NgxResult r = Fn<NgxResult (*)(VkCommandBuffer, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_VULKAN_EvaluateFeature_C" : "NVSDK_NGX_VULKAN_EvaluateFeature")(cb, h, &p, nullptr);
@@ -1131,6 +1139,81 @@ static void Soak(Api& a, uint32_t n)
     a.Release(h);
 }
 
+// --replay DIR FIRST COUNT GEN OUT: recorded frames (NFRUX_DUMP) through whatever DLL was given; the generated frames are written to OUT.
+static bool Replay(Api12& a, const std::string& dir, int first, int count, uint32_t gen, const std::string& to)
+{
+    auto file = [&](const char* n, int f, uint32_t w, uint32_t h, uint32_t bytes) {
+        Bytes b(size_t(w) * h * bytes);
+        FILE* q = fopen((dir + "\\" + n + "_" + std::to_string(w) + "x" + std::to_string(h) + "_f" + std::to_string(f) + "_k1.bin").c_str(), "rb");
+        if (!q || fread(b.data(), 1, b.size(), q) != b.size()) printf("  recording: %s %d missing\n", n, f), exit(2);
+        fclose(q);
+        return b;
+    };
+    Params own;
+    NgxParameter* core = nullptr;
+    if (a.core) printf("  capability parameters: %08x\n", a.Fn<NgxResult (*)(NgxParameter**)>("NVSDK_NGX_D3D12_GetCapabilityParameters")(&core));
+    if (a.core && !core) return false;
+    if (core) { int av = -1; unsigned mj = 0, mn = 0, need = 0, res = 0; core->Get("FrameGeneration.Available", &av), core->Get("FrameGeneration.NeedsUpdatedDriver", &need), core->Get("FrameGeneration.FeatureInitResult", &res); printf("  available %d needs driver %u init %08x\n", av, need, res); }
+    NgxParameter& p = core ? *core : own;
+    TexP back, hud, depth, mv, out, real;
+    NgxHandle* h = nullptr;
+    for (int i = 0; i < count; ++i)
+    {
+        const int f = first + i;
+        FILE* q = fopen((dir + "\\params_f" + std::to_string(f) + ".txt").c_str(), "r");
+        uint32_t w, ht, dw, dh, mw, mh, fmt, n;
+        float s[2], j[2], zn, zf, fov;
+        static float clip[16], inv[16], proj[16], unproj[16];
+        int inverted, reset, ortho;
+        if (!q || fscanf(q, "%u %u %u %u %u %u %u", &w, &ht, &dw, &dh, &mw, &mh, &fmt) != 7 || fscanf(q, "%f %f %f %f %f %f %f %d %d %d %u", &s[0], &s[1], &j[0], &j[1], &zn, &zf, &fov, &inverted, &reset, &ortho, &n) != 11)
+            return printf("  params %d missing\n", f), false;
+        for (float& x : clip) if (fscanf(q, "%f", &x) != 1) return false;
+        fclose(q);
+        auto invert = [](const float* m, float* o) {
+            double a4[4][8] = {};
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) a4[r][c] = m[r * 4 + c], a4[r][4 + c] = r == c;
+            for (int k = 0; k < 4; ++k)
+            {
+                int pv = k;
+                for (int r = k + 1; r < 4; ++r) if (fabs(a4[r][k]) > fabs(a4[pv][k])) pv = r;
+                std::swap(a4[k], a4[pv]);
+                const double d = a4[k][k];
+                for (double& x : a4[k]) x /= d;
+                for (int r = 0; r < 4; ++r) if (r != k) { const double g = a4[r][k]; for (int c = 0; c < 8; ++c) a4[r][c] -= g * a4[k][c]; }
+            }
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) o[r * 4 + c] = float(a4[r][4 + c]);
+        };
+        const float t = 1 / tanf(fov / 2), z0 = inverted ? -zn / (zf - zn) : zf / (zf - zn), z1 = inverted ? zf * zn / (zf - zn) : -zf * zn / (zf - zn);
+        const float pr[16] = {t * ht / w, 0, 0, 0, 0, t, 0, 0, 0, 0, z0, 1, 0, 0, z1, 0};
+        memcpy(proj, pr, sizeof(pr)), invert(proj, unproj), invert(clip, inv);
+        if (!h)
+        {
+            back = a.Create(F_BGRA8, w, ht, false), hud = a.Create(F_BGRA8, w, ht, false), depth = a.Create(F_R32F, dw, dh, false), mv = a.Create(F_RG16F, mw, mh, false), out = a.Create(F_BGRA8, w, ht, true), real = a.Create(F_BGRA8, w, ht, true);
+            p.Set("CreationNodeMask", 1u), p.Set("VisibilityNodeMask", 1u), p.Set("Width", w), p.Set("Height", ht), p.Set("DLSSG.Width", w), p.Set("DLSSG.Height", ht), p.Set("DLSSG.BackbufferFormat", 87u), p.Set("DLSSG.InternalWidth", dw), p.Set("DLSSG.InternalHeight", dh), p.Set("DLSSG.DynamicResolution", 0u);
+            p.Set("DLSSG.CmdQueue", static_cast<void*>(a.q.Get())), p.Set("DLSSG.CmdAlloc", static_cast<void*>(a.al.Get())), p.Set("DLSSG.IsRecording", 1u), p.Set("DLSSG.EnableOFA", 1u);
+            p.Set("DLSSG.MultiFrameCount", gen), p.Set("DLSSG.MultiFrameCountMax", gen);
+            h = a.CreateFeature(p);
+            if (!h) return puts("  feature not created"), false;
+        }
+        a.Upload(*back, file("back", f, w, ht, 4)), a.Upload(*hud, file("hudless", f, w, ht, 4)), a.Upload(*depth, file("depth", f, dw, dh, 4)), a.Upload(*mv, file("motion", f, mw, mh, 4));
+        a.Bind(p, "DLSSG.Backbuffer", back.get()), a.Bind(p, "DLSSG.HUDLess", hud.get()), a.Bind(p, "DLSSG.Depth", depth.get()), a.Bind(p, "DLSSG.MVecs", mv.get()), a.Bind(p, "DLSSG.OutputInterpolated", out.get()), a.Bind(p, "DLSSG.OutputReal", real.get());
+        p.Set("DLSSG.CameraViewToClip", static_cast<void*>(proj)), p.Set("DLSSG.ClipToCameraView", static_cast<void*>(unproj)), p.Set("DLSSG.ClipToPrevClip", static_cast<void*>(clip)), p.Set("DLSSG.PrevClipToClip", static_cast<void*>(inv));
+        p.Set("DLSSG.JitterOffsetX", j[0]), p.Set("DLSSG.JitterOffsetY", j[1]), p.Set("DLSSG.MvecScaleX", s[0]), p.Set("DLSSG.MvecScaleY", s[1]), p.Set("DLSSG.CameraNear", zn), p.Set("DLSSG.CameraFar", zf), p.Set("DLSSG.CameraFOV", fov), p.Set("DLSSG.CameraAspectRatio", float(w) / ht);
+        p.Set("DLSSG.CameraUpX", 0.0f), p.Set("DLSSG.CameraUpY", 1.0f), p.Set("DLSSG.CameraUpZ", 0.0f), p.Set("DLSSG.CameraRightX", 1.0f), p.Set("DLSSG.CameraRightY", 0.0f), p.Set("DLSSG.CameraRightZ", 0.0f), p.Set("DLSSG.CameraFwdX", 0.0f), p.Set("DLSSG.CameraFwdY", 0.0f), p.Set("DLSSG.CameraFwdZ", 1.0f);
+        for (const char* c : {"DLSSG.CameraPosX", "DLSSG.CameraPosY", "DLSSG.CameraPosZ", "DLSSG.CameraPinholeOffsetX", "DLSSG.CameraPinholeOffsetY"}) p.Set(c, 0.0f);
+        p.Set("DLSSG.DepthInverted", inverted), p.Set("DLSSG.CameraMotionIncluded", 1), p.Set("DLSSG.ColorBuffersHDR", 0), p.Set("DLSSG.OrthoProjection", ortho), p.Set("DLSSG.NotRenderingGameFrames", 0), p.Set("DLSSG.Reset", int(i == 0));
+        for (uint32_t k = 1; k <= gen; ++k)
+        {
+            p.Set("DLSSG.MultiFrameIndex", k);
+            const NgxResult r = a.Evaluate(h, p);
+            if (r != kNgxSuccess) printf("  frame %d: %08x\n", f, r);
+            const Bytes b = a.Read(*out);
+            if (FILE* o = fopen((to + "\\f" + std::to_string(f) + "_k" + std::to_string(k) + ".bin").c_str(), "wb")) fwrite(b.data(), 1, b.size(), o), fclose(o);
+        }
+    }
+    a.Release(h);
+    return puts("  replayed"), true;
+}
 static void Vram(Api& a)
 {
     for (auto [w, h] : {std::pair<uint32_t, uint32_t>{1920, 1080}, std::pair<uint32_t, uint32_t>{2560, 1440}, std::pair<uint32_t, uint32_t>{3840, 2160}})
@@ -1158,14 +1241,24 @@ int main(int argc, char** argv)
     if (!dll) return printf("cannot load %s\n", argv[1]), 2;
     bool minimal = false;
     uint32_t soak = 0;
+    int replay = 0;
     std::vector<std::string> which;
     for (int i = 2; i < argc; ++i)
     {
         const std::string s = argv[i];
         if (s == "--minimal") minimal = true;
+        else if (s == "--replay") { replay = i; i += 5; }
         else if (s == "--vram") soak = ~0u;
         else if (s == "--soak") soak = uint32_t(atoi(argv[++i]));
         else which.push_back(s);
+    }
+    if (replay)
+    {
+        Api12 a;
+        a.dll = dll, a.core = strstr(argv[1], "_nvngx.dll") != nullptr;
+        if (!a.Init()) return puts("  device failed"), 2;
+        const bool ok = Replay(a, argv[replay + 1], atoi(argv[replay + 2]), atoi(argv[replay + 3]), uint32_t(atoi(argv[replay + 4])), argv[replay + 5]);
+        fflush(stdout), TerminateProcess(GetCurrentProcess(), ok ? 0 : 1);
     }
     if (which.empty()) which = {"d3d12", "vulkan"};
     std::vector<std::unique_ptr<Api>> apis;  // all alive together
