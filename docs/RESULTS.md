@@ -470,3 +470,7 @@ presented 1x: Streamline created the feature and never evaluated it (no interpol
 
 CUDA on Vulkan in the sample (789ba49, 1280x701, 2500 rendered frames, window focus sampled every 0.4 s and held throughout): through the loader 4x 651 fps (583 with fp16 earlier); OptiScaler 0.9.5 2x 395 fps
 (380 with fp16). Both chose "CUDA kernels, int8 tensor cores (Vulkan)", passed the self-check, exited 0 and left no marker. One start each; the sample under validation with CUDA was not run.
+
+Weights changed from v14 to the early v1 fine-tune (2026-11-25). On the halved sample recording at 2x (28 frames, shipped build, D3D12 replay, LPIPS lower is better): v1 27.12 dB, LPIPS 0.0972; v14 27.33 dB, 0.1092; Arm v2 27.04 dB, 0.0929.
+PyTorch, test_new, few pairs, LPIPS v1 / v14 / Arm: 2x .0553 / .0598 / .0544; 3x .0400 / .0436 / .0410; 4x .0482 / .0506 / .0473; 6x .0414 / .0446 / .0433. PSNR preferred v14 because it rewards mixing candidates.
+With v1: parity D3D12 against Vulkan 102 dB worst of 14 frames, ML conformance exact on both APIs, NGX harness 158 checks, A3 D3D12 within 0.1 dB of PyTorch on average at 2x-6x (2 pairs a clip). Earlier A3/A14 figures in this file are v14's.

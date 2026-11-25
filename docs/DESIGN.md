@@ -42,7 +42,7 @@ experiments/ measured and not used: DirectML, optical flow hardware; the CUDA la
 | NGX ABI | earlier NGX work | MIT |
 | Loader | ours | MIT |
 | Tests | `tests/` (A1 from the SDK's runtime test; the rest ours); the sample's scripting patch is kept outside the repository (A4) | MIT |
-| Weights | `nfru_mfg_v14_int8` (ngsdk fork 38cfb23), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
+| Weights | `nfru_mfg_v1_int8` (the early fine-tune; v14 was softer at 2x by LPIPS and by eye, 2026-11-25, RESULTS.md), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
 | NVAPI, CUDA functions | declared by us for the few entry points used, loaded dynamically | checked in M0, in THIRD_PARTY.md |
 | OptiScaler, dlssg-to-fsr3 | GPL-3.0: interface facts only | - |
 
@@ -61,7 +61,7 @@ scattered game vectors: measured no gain), optical flow once, reduction to the m
 tensor, network, inpainting, composite. A batch runs stage by stage.
 
 The graph is v14: channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0. All quantisation constants are
-`nfru_mfg_v14_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v14: params 0.0621184 / 54, gate 0.00392156 / -128; v2's are not used).
+`nfru_mfg_v1_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v1: params 0.2640706 / 89, gate 0.00392156 / -128; v2's are not used).
 
 Flow at more than 1080 display rows: the SDK's colour reduction pass (01) gets an entry point and the flow, hints, flow scale
 and `_OfInputSizeRcp` use the reduced size (aspect kept, 1080 rows), as the SDK does. Sizes to 8K.
@@ -344,7 +344,7 @@ RGB10A2; normal and inverted depth; odd sizes.
 | A1 | `ml_conformance_d3d12`, `ml_conformance_vulkan`: each rung vs CPU reference graph outputs; sizes 64x64, 744x464, 960x544 on D3D12; random seeds, all -128, all 127, alternating, and on Vulkan inputs with the signs of the first layer's weights; the 2^24 bound (D2); the tensor-core names | 0 differing bytes |
 | A2a | `parity --strict`, strict build: synthetic scenes (1080p, 4K, 8K, ultra-wide, odd; RGBA8, BGRA8, RGB10A2; both depths) and 64-frame recordings, 2x / 4x / 6x; exit code | 0 differing bytes in every output and intermediate |
 | A2b | `parity`, shipped build, the same | PSNR >= 60 dB, >= 99.9% of values within 1 code, <= 0.01% off by more than 3 (RGB10A2 by 10-bit code); exit code |
-| A3 | `tests/quality_reference.py`: port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips, 8-bit colour and half-float vectors for both) | PSNR against the true frames within 0.2 dB of torch per multiplier |
+| A3 | `tests/quality_reference.py`: port with v1 int8 vs the torch v1 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg\qat1\last.pt`, same clips, 8-bit colour and half-float vectors for both) | PSNR against the true frames within 0.2 dB of torch per multiplier |
 | A4 | Sample, D3D12 and Vulkan, scripting patch: 2x and the maximum granted, 1920x1080, 5 min each on release DLLs; 60 s with D3D12 debug layer + GPU validation / Vulkan validation + sync | no crash; 0 messages naming NFRUX objects or thrown inside its recordings; `numFramesActuallyPresented` = n + 1 for >= 95% of states logged; OutputReal written every evaluate; dumped generated frames lie between neighbours (mean luma distance to both <= distance between them + 2 codes, >= 99% of frames) |
 | A5 | Sample with fixed timestep, scripted camera, DLSS off: dump 64 frames on both APIs (HUD-less colour); replay each dump on both APIs | replay meets A2a (strict) and A2b (shipped); live: generated PSNR between the APIs no more than 1 dB below their inputs' PSNR (the absolute 35 dB of earlier revisions is dropped: the sample's own renderers differ by 31.4 dB, so it measured them, not NFRUX); image pairs kept |
 | A6 | Route a (release 0.9.5, ini lines recorded) with the sample, D3D12 and Vulkan; route b on Vulkan | a: DLL loaded, >= 1000 evaluates, 2x presented, per API; b: more than 2x presented |
