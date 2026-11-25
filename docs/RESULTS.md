@@ -279,7 +279,7 @@ Commit 80c9418 unless said. Strict: `build-strict` (NFRUX_STRICT_MATH=ON). Shipp
 | A1 | D3D12 int32, dot4 and CUDA exact at 64x64 (23 cases), 744x464 and 960x544 (5 each); Vulkan cooperative matrix (int8; fp16 and bf16 too), dot4 and scalar exact at its sizes (SPIR-V 1.5 kernels) |
 | A2a | Strict, 30 cases (10 sizes / formats x 2x, 4x, 6x; 8 frames; RGBA16F included): 0 bytes in every output and intermediate, exit 0 |
 | A2b | Shipped, the same 30: worst 86.3 dB, exit 0. The limits caught a real one: above 1080 rows pass 01 rounds from an exact half and fused math picked another texel (63 dB, 0.013% over 3 codes); the reduction passes are strict in every build since |
-| A3, A14 | see below (the reference run) |
+| A3, A14 | Met: table "A3, A14 final" at the end |
 | A5 | 64 recorded frames an API (66 dumped, frame 1 skipped by the sample's counter), HUD-less 1280x701, DLSS off: strict 0 bytes at 2x, 4x, 6x on both recordings; shipped at least 75.5 dB, at most 0.0002% over 1 code; no drift (the worst frame is not late: the limit holds in every frame) |
 | A7 | Six rungs forced: harness 61 of 61 each. Self-check faults and crash marker as earlier |
 | A9, A10 | Harness 124 checks (61 an API and 2 between): strict 55 of 55 outputs byte-identical; shipped all within 96 dB. New: sRGB images (RGBA8 and BGRA8; stored values equal to UNORM's), jittered vectors, release while another feature evaluates, device destroyed and made again (D3D12: 0 references left), both APIs at once on two threads. Khronos validation + synchronisation: 0 messages (1.3 host and minimal 1.2 host), through device destruction. Soak 2000 an API: video memory (DXGI, the process's, read on both) and handles flat |
@@ -309,3 +309,21 @@ thread while vkLatencySleepNV uses it on another; that race is the likely cause,
 
 A7 again after the marker change: two kills, third start on dot4 (file name with the driver's time), cleared, CUDA back; a failed self-check keeps the marker.
 Harness at eedcb52 (strict and shipped): 124 checks, 0 failed; strict 55 of 55 identical.
+
+## A3, A14 final
+
+Shipped build, D3D12, `tests/reference.py` run on the binary of 293ca58 (later commits change no shader this path runs: 720p from 540p uses no reduction
+pass, and no pass, constant or kernel else was edited). 35 sequences of test_new + test_bal, up to 4 pairs each, PSNR dB, 8-bit colour and half-float
+vectors for every method; network outputs rounded to 8 bits (the blend is not).
+
+| | frames | NFRUX | PyTorch, same network | Arm v2 as released | Arm v2 with the timestep prior | blend |
+|---|---|---|---|---|---|---|
+| 2x | 68 | 35.72 | 35.71 | 35.24 | 35.24 | 26.46 |
+| 3x | 144 | 37.35 | 37.39 | 36.81 | 36.92 | 30.40 |
+| 4x | 96 | 39.16 | 39.17 | 38.71 | 38.80 | 29.94 |
+| 5x | 144 | 34.13 | 34.11 | 33.53 | 33.71 | 25.85 |
+| 6x | 180 | 34.13 | 34.10 | 33.33 | 33.56 | 25.57 |
+
+A3: within 0.04 dB at every multiplier (limit 0.2); the worst single frame against PyTorch is -0.50 / -1.93 / -0.32 / -0.29 / -0.50 dB (2x-6x), the 3x one among
+near-static frames above 45 dB (the pairs under 45 dB average +0.02 there). A14: above Arm's, both ways, at every multiplier. The Vulkan repeat of this run
+was still going when this was written.
