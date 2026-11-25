@@ -117,7 +117,7 @@ During Evaluate -> back buffer, Success, interpolator disabled for that size, lo
 - the build fails if a pass SPIR-V declares Float16, Int16, Int8, 8/16-bit storage or any group operation;
 - contraction: CMake option `NFRUX_STRICT_MATH`. ON (the proof build): the SPIR-V is post-processed to put `NoContraction` on every float
   arithmetic result before both consumers and DXIL is built with `-Gis`; the two APIs must then give the same bytes. OFF (the shipped
-  build): compilers may fuse; judged by A2's limits.
+  build): compilers may fuse, except in the reduction passes (01-03), which round to a texel, often from an exact half, and are strict in every build; judged by A2's limits.
 - opaque operations (matrix products, dot, mix, fma, length, normalize) are written out; the build refuses a pass that has one, as neither
   switch fixes how a driver fuses inside them. Denormals: no pass relies on them; both APIs' defaults (D3D flush allowed) are covered by the A2 budget;
 - remaining expected differences: division, exp, sqrt, texture filtering rounding. A discrete flip (block-match tie, 0.07 UI
@@ -166,7 +166,7 @@ else is optional and needs to be *enabled*. Source of truth:
   exports) and through vkGetInstanceProcAddr / vkGetDeviceProcAddr, whose returned pointer for that name it wraps. It records the enabled
   extensions and features and appends, when supported per `vkGetPhysicalDeviceFeatures2`: shaderStorageImageExtendedFormats,
   cooperativeMatrix, vulkanMemoryModel (+ DeviceScope), shaderInt8, storageBuffer8BitAccess, shaderIntegerDotProduct
-  and their extensions. It also wraps vkDestroyDevice (what is on the device is destroyed first). Merge rule: work on a deep copy of the pNext chain; a feature that belongs to an aggregate
+  and their extensions. It also wraps vkDestroyDevice (what is on the device is destroyed first). Merge rule: known structures of the pNext chain are copied, unknown ones kept in place (their pNext is changed for the call and put back); a feature that belongs to an aggregate
   present in the chain (VkPhysicalDeviceVulkan11/12/13Features, VkPhysicalDeviceFeatures2) is set in that copy; its individual struct
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the
@@ -223,7 +223,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
    and no machine-wide setting may be changed.
    Mechanism: `loader` as a `dbghelp.dll` proxy (sl.interposer.dll imports it; `version.dll` / `winmm.dll` for hosts
    that do not) in the game folder hooks
-   `LoadLibraryExW/A/W` and `GetProcAddress` by import-table patching of the modules loaded at attach (enumerated) and later ones through
+   `LoadLibraryExW` and `GetProcAddress` by import-table patching of the modules loaded at attach (enumerated) and later ones through
    LdrRegisterDllNotification (in-process only; Streamline loads its over-the-air plugins from ProgramData). When the core is loaded, the returned exports of interest are wrapped:
    Vulkan Init* (note device), Shutdown* (NFRUX first, then the core), GetCapabilityParameters / GetParameters (add the section 4 capability values),
    D3D12 GetFeatureRequirements (feature 11 supported), CreateFeature / EvaluateFeature / ReleaseFeature. Not wrapped: AllocateParameters, extension
@@ -240,9 +240,9 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
    If import patching misses a call, MinHook inline hooks are the second attempt. If both fail: R1 standalone is reported as not
    met, R4 runs through OptiScaler, and it is reported; it is not silently substituted.
 
-**D7. Self-check.** One 64 x 64 hashed tensor made by a compute pass, expected bytes from the CPU reference at the first Evaluate, same code as the real network.
-Recorded at the first Evaluate, read back under the completion token; outputs stay the back buffer until it passes. "Not complete" is not "mismatch"; on mismatch the prebuilt lower rung
-takes over (made then, not prebuilt). Fault injection (`NFRUX_TEST_BAD_CHECK=N` fails the first N checks) is tested.
+**D7. Self-check.** One 64 x 64 hashed tensor made by a compute pass, expected bytes from the CPU reference, both made on a worker started at the first Evaluate; same code as the real network.
+Recorded when the worker is done, read back under the completion token; outputs stay the back buffer until it passes. "Not complete" is not "mismatch"; on mismatch the next lower rung
+is made and checked; after the last one NFRUX shows the back buffer. Fault injection (`NFRUX_TEST_BAD_CHECK=N` fails the first N checks) is tested.
 
 **D8. UI.** Decky's rules (DLSS-G's): HUD-less + UI alpha / UI layer, difference test, no HUD-less, no-warp, subrects, menu detection,
 distortion. HUD-less in another format than the back buffer is converted to the back buffer's value range when both are the same
@@ -301,8 +301,8 @@ RGB10A2, RGBA16F; normal and inverted depth; odd sizes.
 | # | Test (`tests/`) | Pass |
 |---|---|---|
 | A1 | `ml_conformance_d3d12`, `ml_conformance_vulkan`: each rung vs CPU reference graph outputs; sizes 64x64, 744x464, 960x544 on D3D12; random seeds, and all -128, all 127, alternating on D3D12 | 0 differing bytes |
-| A2a | `parity --strict`, strict build: synthetic scenes (1080p, 4K, 8K, ultra-wide, odd; RGBA8, BGRA8, RGB10A2; both depths) and 64-frame recordings, 2x / 4x / 6x; exit code | 0 differing bytes in every output and intermediate (RGBA16F: outputs >= 110 dB, reported) |
-| A2b | `parity`, shipped build, the same | PSNR >= 60 dB, >= 99.9% of values within 1 code, <= 0.01% off by more than 3; exit code |
+| A2a | `parity --strict`, strict build: synthetic scenes (1080p, 4K, 8K, ultra-wide, odd; RGBA8, BGRA8, RGB10A2; both depths) and 64-frame recordings, 2x / 4x / 6x; exit code | 0 differing bytes in every output and intermediate |
+| A2b | `parity`, shipped build, the same | PSNR >= 60 dB, >= 99.9% of values within 1 code, <= 0.01% off by more than 3 (RGB10A2 by 10-bit code, RGBA16F by value with the scene's peak as 255 codes); exit code |
 | A3 | `tests/reference.py`: port with v14 int8 vs the torch v14 int8 pipeline (`eval_mfg` pipeline, `C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt`, same clips, 8-bit colour and half-float vectors for both) | PSNR against the true frames within 0.2 dB of torch per multiplier |
 | A4 | Sample, D3D12 and Vulkan, scripting patch: 2x and the maximum granted, 1920x1080, 5 min each on release DLLs; 60 s with D3D12 debug layer + GPU validation / Vulkan validation + sync | no crash; 0 messages naming NFRUX objects or thrown inside its recordings; `numFramesActuallyPresented` = n + 1 for >= 95% of states logged; OutputReal written every evaluate; dumped generated frames lie between neighbours (mean luma distance to both <= distance between them + 2 codes, >= 99% of frames) |
 | A5 | Sample with fixed timestep, scripted camera, DLSS off: dump 64 frames on both APIs (HUD-less colour); replay each dump on both APIs | replay meets A2a (strict) and A2b (shipped); live: generated PSNR between the APIs no more than 1 dB below their inputs' PSNR (the absolute 35 dB of earlier revisions is dropped: the sample's own renderers differ by 31.4 dB, so it measured them, not NFRUX); image pairs kept |

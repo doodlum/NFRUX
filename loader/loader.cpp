@@ -20,6 +20,7 @@ static void L(const char* f, ...) { std::lock_guard<std::mutex> k(g_m); if (!g_l
 
 static std::map<std::string, void*> g_real;
 static std::set<void*> g_handles;
+static bool g_usedNfrux;
 
 template <class F> static F Real(const char* n) { return reinterpret_cast<F>(g_real[n]); }
 
@@ -37,6 +38,7 @@ static HMODULE Nfrux()
             if (char* s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "NFRUX\\nvngx_dlssg.dll");
         }
         HMODULE x = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        g_usedNfrux = x != nullptr;
         L("%s -> %p (%lu)", path, x, x ? 0 : GetLastError());
         return x;
     }();
@@ -198,7 +200,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         fmm->vulkanMemoryModel |= s12.vulkanMemoryModel, fmm->vulkanMemoryModelDeviceScope |= s12.vulkanMemoryModelDeviceScope;
         f8->shaderInt8 |= s12.shaderInt8, f8s->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess;
     }
-    if (f13) f13->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, f13->subgroupSizeControl |= s13.subgroupSizeControl, f13->computeFullSubgroups |= s13.computeFullSubgroups, f13->synchronization2 |= s13.synchronization2;
+    if (f13) f13->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, f13->subgroupSizeControl |= s13.subgroupSizeControl, f13->computeFullSubgroups |= s13.computeFullSubgroups;
     else { if (!fdot) chain(fdot = &dot); fdot->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct; }
     if (cmS.cooperativeMatrix)
     {
@@ -232,15 +234,16 @@ static PFN_vkDestroyDevice g_destroyDevice;
 static void VKAPI_CALL DestroyDevice(VkDevice d, const VkAllocationCallbacks* a)
 {
     L("vkDestroyDevice %p", d);
-    if (GetModuleHandleA("nvngx_dlssg.dll")) if (auto f = Ours<void(__cdecl*)(VkDevice)>("NFRUX_DropVulkanDevice")) f(d);
+    if (g_usedNfrux) if (auto f = Ours<void(__cdecl*)(VkDevice)>("NFRUX_DropVulkanDevice")) f(d);
     if (g_featureDevice == d) g_featureDevice = VK_NULL_HANDLE;
-    g_destroyDevice(d, a);
+    g_destroyDevice(d, a);  // vulkan-1's, which goes to this device's driver
 }
+static void Trampoline() { if (!g_destroyDevice) g_destroyDevice = (PFN_vkDestroyDevice)GetProcAddress(GetModuleHandleA("vulkan-1.dll"), "vkDestroyDevice"); }
 static PFN_vkGetDeviceProcAddr g_gdpa;
 static PFN_vkVoidFunction VKAPI_CALL HookGdpa(VkDevice d, const char* n)
 {
     PFN_vkVoidFunction f = g_gdpa(d, n);
-    if (f && n && !strcmp(n, "vkDestroyDevice")) { if (!g_destroyDevice) g_destroyDevice = (PFN_vkDestroyDevice)f; return (PFN_vkVoidFunction)DestroyDevice; }
+    if (f && n && !strcmp(n, "vkDestroyDevice")) { Trampoline(); return (PFN_vkVoidFunction)DestroyDevice; }
     return f;
 }
 static PFN_vkGetInstanceProcAddr g_gipa;
@@ -248,7 +251,7 @@ static PFN_vkVoidFunction VKAPI_CALL HookGipa(VkInstance i, const char* n)
 {
     PFN_vkVoidFunction f = g_gipa(i, n);
     if (f && n && !strcmp(n, "vkCreateDevice")) { if (!g_createDevice) g_createDevice = (PFN_vkCreateDevice)f; return (PFN_vkVoidFunction)CreateDevice; }
-    if (f && n && !strcmp(n, "vkDestroyDevice")) { if (!g_destroyDevice) g_destroyDevice = (PFN_vkDestroyDevice)f; return (PFN_vkVoidFunction)DestroyDevice; }
+    if (f && n && !strcmp(n, "vkDestroyDevice")) { Trampoline(); return (PFN_vkVoidFunction)DestroyDevice; }
     if (f && n && !strcmp(n, "vkGetDeviceProcAddr")) { if (!g_gdpa) g_gdpa = (PFN_vkGetDeviceProcAddr)f; return (PFN_vkVoidFunction)HookGdpa; }
     return f;
 }

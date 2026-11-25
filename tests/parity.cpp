@@ -497,7 +497,7 @@ int main(int argc, char** argv)
                     d += x != 0, d1 += x > 1, d3 += x > 3, e += double(x) * x;
                 }
             const double psnr = 10 * log10(255.0 * 255.0 / std::max(1e-9, e / std::max<size_t>(1, v.size())));
-            if (n.rfind("frame", 0) == 0) ++frames, total += v.size(), off1 += d1, off3 += d3, worst = std::min(worst, psnr);
+            if (n.rfind("frame", 0) == 0) ++frames, total += g.format == 2 ? v.size() / 4 * 3 : g.format == 3 ? v.size() / 2 : v.size(), off1 += d1, off3 += d3, worst = std::min(worst, psnr);
             anyDiff += d;
             if (n.rfind("frame", 0) != 0) printf("  %-14s %9zu bytes, %zu differ (%.4f%%)\n", n.c_str(), v.size(), d, 100.0 * d / std::max<size_t>(1, v.size()));
         }

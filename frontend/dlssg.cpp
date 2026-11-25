@@ -75,6 +75,11 @@ NgxResult Add(void* host, bool vulkan, NgxHandle** out)
     g_features[id] = std::move(f);
     return kNgxSuccess;
 }
+// Destroyed after the lock; what the GPU still uses after 2 s is leaked.
+struct Dead : std::vector<std::shared_ptr<FrameGenerator>>
+{
+    ~Dead() { for (auto& f : *this) if (f && f.use_count() == 1 && !f->Idle()) Log("still in use after 2 s: leaked"), new std::shared_ptr<FrameGenerator>(f); }
+};
 Feature* Find(const NgxHandle* h)
 {
     if (!h) return nullptr;
@@ -154,17 +159,18 @@ NgxResult Eval(void* cmd, const NgxHandle* h, NgxParameter* p)
         if (!f || !p || !cmd) return f ? kNgxInvalidParameter : kNgxFeatureNotFound;
         fg = f->fg, vk = f->vulkan;
     }
-    return fg->Evaluate(cmd, Read(p, vk)) ? kNgxSuccess : kNgxInvalidParameter;
+    try { return fg->Evaluate(cmd, Read(p, vk)) ? kNgxSuccess : kNgxInvalidParameter; }
+    catch (const std::exception& x) { return Log("evaluate: %s", x.what()), kNgxPlatformError; }
 }
 NgxResult Release(NgxHandle* h)
 {
-    std::shared_ptr<FrameGenerator> dead;  // destroyed after the lock
+    Dead dead;
     std::lock_guard<std::mutex> lock(g_mutex);
     Feature* f = Find(h);
     if (!f) return kNgxFeatureNotFound;
     // Kept warm for the next create, except on a Vulkan device whose end nobody reports (no loader): its address may come back.
-    if (f->vulkan && !g_vkKnown) dead = f->fg;
-    else dead = std::exchange(g_warm[f->host], f->fg);
+    if (f->vulkan && !g_vkKnown) dead.push_back(f->fg);
+    else dead.push_back(std::exchange(g_warm[f->host], f->fg));
     g_features.erase(h->Id);
     Log("feature released");
     return kNgxSuccess;
@@ -193,10 +199,7 @@ void SetVk(VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcA
 // Of one API (and device, when given): the other API's features stay.
 void Drop(bool vulkan, void* host)
 {
-    struct Dead : std::vector<std::shared_ptr<FrameGenerator>>  // destroyed after the lock; what the GPU still uses is leaked
-    {
-        ~Dead() { for (auto& f : *this) if (!f->Idle()) Log("still in use after 2 s: leaked"), new std::shared_ptr<FrameGenerator>(f); }
-    } dead;
+    Dead dead;
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto it = g_features.begin(); it != g_features.end();)
         if (it->second->vulkan == vulkan && (!host || it->second->host == host)) { dead.push_back(it->second->fg), it = g_features.erase(it); } else ++it;

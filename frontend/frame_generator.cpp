@@ -481,7 +481,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         for (auto& [n, v] : dumps)
             if (FILE* f = fopen((std::string(Env("NFRUX_DUMP_DIR") ? Env("NFRUX_DUMP_DIR") : ".") + "\\" + n).c_str(), "wb")) fwrite(v->data(), 1, v->size(), f), fclose(f);
         dumps.clear();
-    }    m_retired.erase(std::remove_if(m_retired.begin(), m_retired.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_retired.end());
+    }    m_retired.erase(std::remove_if(m_retired.begin(), m_retired.end(), [&](auto& r) { return m_evaluations - r.second > 256 && (!r.first->making.valid() || r.first->making.wait_for(std::chrono::seconds(0)) == std::future_status::ready); }), m_retired.end());
     m_oldCuts.erase(std::remove_if(m_oldCuts.begin(), m_oldCuts.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_oldCuts.end());
     if (!m_dev.BeginFrame(commands))
         return false;  // nothing can be recorded (32 recordings unfinished after 2 s)
