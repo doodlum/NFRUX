@@ -124,7 +124,7 @@ public:
     virtual void Clear(const Texture& t, float value) = 0;
     virtual void Fill(const Buffer& b, uint32_t value) = 0;
     virtual void RunNetworks(Network* const* nets, uint32_t count) = 0;
-    // For tests: a texture's texels into host memory, tightly packed, once the frame has completed.
+    // A texture's texels into host memory, tightly packed: filled at a BeginFrame or WaitIdle after the frame has completed.
     virtual void ReadBack(const Texture& t, std::shared_ptr<std::vector<uint8_t>> out) = 0;
     virtual void Mark(const char* label) = 0;  // profiling
     // GPU time (microseconds) per label of the last profiled frame, when profiling is on.

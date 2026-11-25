@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -75,7 +76,7 @@ static Frame Make(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, float t)
 }
 
 using Results = std::map<std::string, std::vector<uint8_t>>;
-struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; int format = 0; bool inverted = false; } g;  // format: 0 rgba8, 1 bgra8, 2 rgb10a2, 3 rgba16f (scRGB)
+struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; int format = 0; bool inverted = false, bench = false; } g;  // format: 0 rgba8, 1 bgra8, 2 rgb10a2, 3 rgba16f (scRGB)
 static uint32_t ColorBytes() { return g.format == 3 ? 8 : 4; }
 static void Encode(Frame& f)
 {
@@ -192,6 +193,27 @@ static bool Run(Device& dev, const ExternalImage* im, const std::function<void(c
         });
         dev.WaitIdle();
         for (auto& [n, v] : got) out[n] = *v;
+    }
+    if (g.bench)
+    {
+        // GPU time a frame: 16 frames in one submission (so the clocks are up), its recording time taken off; median of 30.
+        std::vector<double> ms;
+        auto now = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        FrameInputs fi = Inputs(im, false);
+        for (int r = 0; r < 40; ++r)
+        {
+            double rec = 0;
+            const double t0 = now();
+            submit([&](void* cmd) {
+                const double a = now();
+                for (int j = 0; j < 16; ++j) { dev.BeginFrame(cmd); ip->Dispatch(fi, g.gen, g.gen); dev.EndFrame(); }
+                rec = now() - a;
+                return true;
+            });
+            if (r >= 10) ms.push_back((now() - t0 - rec) / 16);
+        }
+        std::sort(ms.begin(), ms.end());
+        printf("  %.3f ms a rendered frame (all %u generated), %.3f fastest\n", ms[ms.size() / 2], g.gen, ms[0]);
     }
     ip.reset();
     return ok;
@@ -405,6 +427,7 @@ int main(int argc, char** argv)
         else if (a == "--format") g.format = atoi(argv[++i]);
         else if (a == "--first") g_first = uint32_t(atoi(argv[++i]));  // before --replay
         else if (a == "--replay") { Frame x; g_replay = argv[++i]; if (!Load(0, x, true)) return puts("no recording"), 1; }
+        else if (a == "--bench") g.bench = true;
         else if (a == "--inverted") g.inverted = true;
         else if (a == "--dump") g.dump = argv[++i];
         else which.push_back(a);

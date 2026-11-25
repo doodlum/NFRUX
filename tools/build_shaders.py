@@ -1,7 +1,7 @@
 """Compiles NFRUX's shaders once from GLSL: SPIR-V for Vulkan, and that SPIR-V through SPIRV-Cross and DXC to DXIL for
 D3D12, so both APIs run the same code. Writes one C++ header with every pass, its DXIL and its D3D12 bindings.
 
-    python build_shaders.py CORE_DIR OUT_DIR
+    python build_shaders.py CORE_DIR OUT_DIR [STRICT]   STRICT 1: no compiler may fuse or reorder (both APIs give the same bytes)
 SPDX-License-Identifier: MIT
 """
 import concurrent.futures as cf
@@ -65,6 +65,9 @@ for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
     passes.append((n, s, d, INV, 60))
 for n, f in [("kCropR32f", "r32f"), ("kCropRg16f", "rg16f")]:
     passes.append((n, "shaders/frontend/crop", fmt(f), "NFRUX_UNUSED", 60))
+passes += [("kPrepare", "shaders/frontend/prepare", [], "NFRUX_UNUSED", 60), ("kMenu", "shaders/frontend/menu", [], "NFRUX_UNUSED", 60)]
+for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
+    passes.append((f"kCompose{suffix}", "shaders/frontend/compose", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("R11", "r11f_g11f_b10f"), ("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kFiPostprocess{suffix}", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f), INV, 60))
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
@@ -76,6 +79,7 @@ def run(cmd):
         raise RuntimeError(" ".join(cmd[:1] + cmd[-3:]) + "\n" + r.stdout[-2000:] + r.stderr[-2000:])
 
 
+RELAXED = len(sys.argv) < 4 or sys.argv[3] not in ("1", "ON")
 FLOAT_OPS = {127, 129, 131, 133, 136, 140, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
 
 
@@ -96,7 +100,7 @@ def precise(path, name):
         if op in FLOAT_OPS:
             ops.append(w[i + 2])
         i += n
-    add = [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
+    add = [] if RELAXED else [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
     w[first:first] = add
     import struct
     open(path, "wb").write(struct.pack(f"<{len(w)}I", *w))
@@ -121,7 +125,7 @@ def build(job):
             h = h.replace(".InterlockedMin(", ".InterlockedMin64(")
         open(b + ".hlsl", "w").write(h)
     run([XCROSS, b + ".spv", "--reflect", "--output", b + ".json"])
-    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", "-Gis",
+    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED else ["-Gis"]),
          *(["-enable-16bit-types"] if sm >= 62 else []), b + ".hlsl", "-Fo", b + ".dxil"])
     refl = json.load(open(b + ".json"))
     hl = open(b + ".hlsl").read()

@@ -119,7 +119,10 @@ EvalInputs Read(NgxParameter* p, bool vk)
     EvalInputs in;
     in.back = image("DLSSG.Backbuffer"), in.output = image("DLSSG.OutputInterpolated"), in.outputReal = image("DLSSG.OutputReal");
     in.hudless = image("DLSSG.HUDLess"), in.ui = image("DLSSG.UI"), in.uiAlpha = image("DLSSG.UIAlpha"), in.noWarp = image("DLSSG.NoWarp");
-    in.depth = image("DLSSG.Depth"), in.motion = image("DLSSG.MVecs");
+    in.depth = image("DLSSG.Depth"), in.motion = image("DLSSG.MVecs"), in.distortion = image("DLSSG.BidirectionalDistortionField");
+    in.distortionRect = GetRect(p, "BidirectionalDistortionField"), in.menuDetection = Int(p, "DLSSG.MenuDetectionEnabled") != 0;
+    if (Int(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision"))
+        in.distortionScale = Float(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale", 1), in.distortionBias = Float(p, "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias");
     in.backRect = GetRect(p, "Backbuffer"), in.hudlessRect = GetRect(p, "HUDLess"), in.uiRect = GetRect(p, "UI"), in.uiAlphaRect = GetRect(p, "UIAlpha");
     in.noWarpRect = GetRect(p, "NoWarp"), in.depthRect = GetRect(p, "Depth"), in.motionRect = GetRect(p, "MVecs");
     in.mvScale[0] = Float(p, "DLSSG.MvecScaleX", 1), in.mvScale[1] = Float(p, "DLSSG.MvecScaleY", 1);

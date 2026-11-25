@@ -132,8 +132,9 @@ public:
     std::vector<const BufN*>             used;  // buffers touched by this recording
     struct Retired { std::vector<std::unique_ptr<TexN>> t; nri::CommandBuffer* cmd; uint32_t slot, value; };
     std::vector<Retired>    retired;
-    struct Read { nri::Buffer* buf; std::shared_ptr<std::vector<uint8_t>> out; uint32_t pitch, row, rows; };
+    struct Read { nri::Buffer* buf; std::shared_ptr<std::vector<uint8_t>> out; uint32_t pitch, row, rows, slot, value; uint64_t size; };
     std::vector<Read>       reads;
+    std::vector<std::pair<uint64_t, nri::Buffer*>> freeReads;  // small ones, kept
 
     ~DevN() override
     {
@@ -145,6 +146,8 @@ public:
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
         for (auto* x : {constants, tokenUp, tokenBack, ones}) if (x) n.DestroyBuffer(x);
         for (auto* x : old) n.DestroyBuffer(x);
+        for (auto& x : reads) n.DestroyBuffer(x.buf);
+        for (auto& x : freeReads) n.DestroyBuffer(x.second);
         if (dev) nri::nriDestroyDevice(dev);
     }
     const Caps& caps() const override { return c; }
@@ -378,6 +381,19 @@ public:
     {
         for (auto it = retired.begin(); it != retired.end();)
             if (Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
+        for (auto it = reads.begin(); it != reads.end();)
+            if (Done(it->slot, it->value)) { Finish(*it); it = reads.erase(it); } else ++it;
+    }
+    void Finish(Read& r)
+    {
+        if (auto* p = static_cast<uint8_t*>(n.MapBuffer(*r.buf, 0, nri::WHOLE_SIZE)))
+        {
+            r.out->resize(size_t(r.row) * r.rows);
+            for (uint32_t y = 0; y < r.rows; ++y) memcpy(r.out->data() + size_t(y) * r.row, p + size_t(y) * r.pitch, r.row);
+            n.UnmapBuffer(*r.buf);
+        }
+        if (r.size <= 4096 && freeReads.size() < 16) freeReads.push_back({r.size, r.buf});
+        else n.DestroyBuffer(r.buf);
     }
     int         cudaState = 0;  // 0 not tried, 1 in use, -1 not
     uint32_t    finished = 0;
@@ -615,7 +631,10 @@ public:
     {
         auto& a = static_cast<const TexN&>(t);
         const uint32_t row = t.width * TexelSize(t.format), pitch = (row + 255) & ~255u;
-        Read r = {Committed(uint64_t(pitch) * t.height, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE), out, pitch, row, t.height};
+        Read r = {nullptr, out, pitch, row, t.height, slot, slotValue[slot], uint64_t(pitch) * t.height};
+        for (auto it = freeReads.begin(); it != freeReads.end(); ++it)
+            if (it->first == r.size) { r.buf = it->second, freeReads.erase(it); break; }
+        if (!r.buf) r.buf = Committed(r.size, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE);
         if (!r.buf) return;
         To(a, kSrc), Flush();
         nri::TextureDataLayoutDesc l = {0, pitch, pitch * t.height};
@@ -635,17 +654,6 @@ public:
             if (busy) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (busy) Log("work still in flight after 2 s%s", Lost() ? " (device removed)" : "");
-        for (auto& r : reads)
-        {
-            if (auto* p = static_cast<uint8_t*>(n.MapBuffer(*r.buf, 0, nri::WHOLE_SIZE)))
-            {
-                r.out->resize(size_t(r.row) * r.rows);
-                for (uint32_t y = 0; y < r.rows; ++y) memcpy(r.out->data() + size_t(y) * r.row, p + size_t(y) * r.pitch, r.row);
-                n.UnmapBuffer(*r.buf);
-            }
-            n.DestroyBuffer(r.buf);
-        }
-        reads.clear();
         Poll();
     }
 };

@@ -13,6 +13,8 @@ struct FrameInputs
     ExternalImage uiSource;  // the frame with its UI, or none
     ExternalImage uiAlpha, noWarp, depth, motion;
     const Texture *depthTexture = nullptr, *motionTexture = nullptr;  // instead of depth / motion: already cut to the rendered region
+    const Texture* colorTexture = nullptr;  // instead of color, of Settings::colorLike's format
+    bool          scrgb = false;  // linear HDR: the UI difference test compresses its values
     uint32_t      uiKind = 0;  // 0 difference test, 2/3 UI alpha red / alpha over HUD-less, 4/5 without HUD-less
     bool          reset  = false;
     float         jitter[2] = {}, mvScale[2] = {1, 1};  // mvScale: to display pixels

@@ -66,6 +66,13 @@ bool QuadAny(bool b)
 }
 #endif
 
+// The difference test's values: scRGB (0x2000) compressed, the rest as they are.
+FFX_MIN16_F3 UiLevel(FFX_MIN16_F3 c)
+{
+    const FFX_MIN16_F3 p = max(c, FFX_MIN16_F3(0.0f));
+    return ScRgb() ? p / (FFX_MIN16_F(1.0f) + p) : c;
+}
+
 void postprocess(int32_t2 output_pixel)
 {
     //-------------------------------------------------------------------------
@@ -205,7 +212,7 @@ void postprocess(int32_t2 output_pixel)
             {
                 const int32_t2 q = min(block + int32_t2(i % FFX_FRAMEINTERPOLATION_UI_BLOCK, i / FFX_FRAMEINTERPOLATION_UI_BLOCK),
                                        displaySize - 1);
-                const FFX_MIN16_F3 d   = abs(LoadUiSource(q).rgb - LoadCurrentBackbuffer(q));
+                const FFX_MIN16_F3 d   = abs(UiLevel(LoadUiSource(q).rgb) - UiLevel(LoadCurrentBackbuffer(q)));
                 isUi = isUi || max(d.r, max(d.g, d.b)) > FFX_MIN16_F(0.07f);
             }
 #endif

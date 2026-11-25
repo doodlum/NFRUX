@@ -378,7 +378,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     if (!MakeOuts(count, nullptr))
         return false;
     const bool needsAlpha = in.uiKind >= 2 && in.uiKind <= 5;
-    const Texture *pc = dev.Wrap(in.color, false), *pd = in.depthTexture ? in.depthTexture : dev.Wrap(in.depth, false), *pm = in.motionTexture ? in.motionTexture : dev.Wrap(in.motion, false);
+    const Texture *pc = in.colorTexture ? in.colorTexture : dev.Wrap(in.color, false), *pd = in.depthTexture ? in.depthTexture : dev.Wrap(in.depth, false), *pm = in.motionTexture ? in.motionTexture : dev.Wrap(in.motion, false);
     const Texture *ps = in.uiSource ? dev.Wrap(in.uiSource, false) : pc, *pa = needsAlpha && in.uiAlpha ? dev.Wrap(in.uiAlpha, false) : ps;
     const Texture *pn = in.noWarp ? dev.Wrap(in.noWarp, false) : ps;
     if (!pc || !pd || !pm || !ps || !pa || !pn)
@@ -412,7 +412,8 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     k._Reset = reset ? 1 : 0;
     const bool down = allInput || colourDown, byteLane = false;
     const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) |
-                             (byteLane ? 0x800u : 0u) | (s.swapRB ? 0x1000u : 0u);
+                             (byteLane ? 0x800u : 0u) | (s.swapRB ? 0x1000u : 0u) |
+                             (in.scrgb ? 0x2000u : 0u);
 
     if (!Flow(in, color, depth, mv, reset))
         return false;

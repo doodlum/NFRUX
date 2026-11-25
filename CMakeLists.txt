@@ -6,10 +6,11 @@ add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 add_link_options(/DEBUG /OPT:REF)
 add_compile_options(/Zi /MP /EHsc /wd4244 /wd4267)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+option(NFRUX_STRICT_MATH "No fused or reordered shader arithmetic: D3D12 and Vulkan give the same bytes (the proof build). Off: the shipped build" OFF)
 set(GEN ${CMAKE_BINARY_DIR}/shaders)
 file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/ml/*.hlsl)
 add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN} ${NFRUX_STRICT_MATH}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
 add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
 set(NRI_DIR "${CMAKE_SOURCE_DIR}/third_party/NRI" CACHE PATH "NRI, from tools/build_nri.ps1")
@@ -37,5 +38,7 @@ target_link_libraries(nvngx_dlssg nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{
 set_target_properties(nvngx_dlssg PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/NFRUX)
 target_link_options(nvngx_dlssg PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:vulkan-1.dll)
 target_link_libraries(nvngx_dlssg delayimp)
+add_executable(ngx_harness tests/ngx_harness.cpp)
+target_link_libraries(ngx_harness nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 add_executable(cuda_spike tests/cuda_spike.cpp)
 target_link_libraries(cuda_spike d3d12 dxgi dxguid)
