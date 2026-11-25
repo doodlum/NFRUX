@@ -402,3 +402,4 @@ without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The lo
 - A8 video memory, MB (display; depth half-size), the same at 2x, 4x and 6x: D3D12 CUDA 340 / 417 / 598, D3D12 dot4 291 / 368 / 549, Vulkan 258 / 312 / 432 (1080p / 1440p / 4K). It is the process's growth.
 - Sample, 1200 frames at 1920x1080, D3D12 CUDA: 2x 315 fps, 4x 558, 6x 694. OptiScaler 0.9.5 with this DLL: Vulkan 2x (288 fps); D3D12 CUDA 2x in 4 of 5 starts (378-403 fps); one start presented 1x for its whole
   length with the feature created; the cause is not shown (no focus line in the log). An earlier start in dot4 was 2x.
+- The 1x OptiScaler start on D3D12 did not come back: 12 further starts (6 under the first one's conditions, window focus sampled every 0.4 s and held), 2x in all 12. Cause still not shown.
