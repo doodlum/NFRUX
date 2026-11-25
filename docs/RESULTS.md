@@ -385,7 +385,7 @@ Guide gaps that remain, on purpose: MvecInvalidValue, ClipToLensClip, 4x4 UI blo
 
 The two D3D12 runs were on dot4, not CUDA: the failure-injection test before them had left the crash marker set (by design), found afterwards. CUDA in the sample: the short runs below and the older CUDA
 long runs (293ca58). Exit code 0 each. Runs with interruptions, same day: Vulkan on 2ac5a8e 2x 331 of 362 and 6x 200 of 207, the rest at 1x, Streamline's log saying "window not focused" in both; D3D12 on 5a2b8c8
-2x 367 of 400 and 6x 118 of 321, cause not shown (the log was overwritten). Further long runs were skipped (2026-11-25). Not met of A4: the D3D12 debug layer.
+2x 367 of 400 and 6x 118 of 321, cause not shown (the log was overwritten). Further long runs were skipped (2026-11-25). The D3D12 debug layer: the last section.
 
 ## db5dc31 (after the last review's two points)
 
@@ -404,31 +404,34 @@ without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The lo
   length with the feature created; the cause is not shown (no focus line in the log). An earlier start in dot4 was 2x.
 - The 1x OptiScaler start on D3D12 did not come back: 12 further starts (6 under the first one's conditions, window focus sampled every 0.4 s and held), 2x in all 12. Cause still not shown.
 
-# Debug layers, and NFRUX beside DLSS-G (2026-11-25)
+# Debug layers, and NFRUX beside DLSS-G (2026-11-25; 93cff40, shipped build, release Streamline 2.14.16, unless said)
 
-D3D12 debug layer (Graphics Tools; `tools\run_d3d12_debug.ps1`). Control: a harness with a wrong input state gives 1,094 messages. Harness, right states: 0 on COMPUTE and on DIRECT lists
-(CUDA; dot4 and scalar on COMPUTE), 0 with GPU-based validation (CUDA, dot4). The sample with `-debug`, messages logged by NFRUX (`NFRUX_TEST_D3D12_MESSAGES`): 0 errors in six runs (2x, 4x, 6x, two each).
-The sample found what the harness had not, all fixed:
-- the disable word is in COPY_DEST, not UNORDERED_ACCESS (error 527);
-- tagged inputs are not transitioned by Streamline (errors 538, 527): DESIGN section 4, States;
-- the self-check's readback buffer was released when the completion token was seen, before the host's list had ended (error 921, corruption; the run then stopped with a fence timeout). It may be the
-  cause of the one bad OptiScaler start; not shown;
-- on DIRECT lists NRI's shader-resource state is 0xC0 and the host's 0x40 (568 messages in the harness before the fix, and in the sample when Streamline's list type changes).
-NVIDIA's own DLSS-G gives 0 errors too; its kernels are launched outside the layer's sight, so that does not show its states.
+D3D12 debug layer (Graphics Tools; `tools\run_d3d12_debug.ps1` runs the default harness; the others by `NFRUX_TEST_DIRECT`, `NFRUX_ML`, `NFRUX_TEST_INPUT_STATE`, `NFRUX_TEST_WRONG_STATE`).
+Counted: corruption, error and warning messages.
+- Control (inputs in a wrong state, not told): 1,094 messages. Inputs only; no control for outputs or the disable word.
+- Harness, 78 checks: 0 messages on COMPUTE lists with inputs in NON_PIXEL, COMMON, COPY_SOURCE; on DIRECT lists in NON_PIXEL, COMMON, 0xC0. (States the harness cannot create or upload in: not run.)
+  Earlier the same day, before the fixes below (2ac5a8e or later): dot4 and scalar, and GPU-based validation on CUDA and dot4: 0 messages.
+- Sample `-debug` (messages logged by NFRUX, at most six an id): 4x 79 s, 2x 13 s, 6x 18 s: no error; one warning (a fence wait for zero, id 1424, also with NVIDIA's DLSS-G), and live objects at exit
+  (also with NVIDIA's).
+- Not run: GPU-based validation in the sample; the long runs since these changes (skipped).
 
-Vulkan (Khronos + synchronisation) in the sample, 1500 frames: 4x and 2x give eight classes of message; NVIDIA's DLSS-G (2x) gives all eight and eight more. The read-after-write, leak, layout and semaphore ones
-name the sample's or Streamline's objects; none names NFRUX.
+Found by the sample and not by the harness (which waits after every evaluate and keeps the guide's states), fixed: the disable word is in COPY_DEST (527); tagged inputs are not transitioned (538, 527); the self-check's
+readback buffer was released when the completion token was seen, before the host's list had ended (921, corruption; that run stopped with a fence timeout; it may or may not be the one bad OptiScaler start);
+NRI's shader-resource state on DIRECT lists is 0xC0 and the host's 0x40 (568 messages in the harness). NVIDIA's own DLSS-G gives no errors either, but its kernels are launched outside the layer's sight.
 
-After the fixes: harness 158 checks, 0 failed (strict 63 of 63 identical; minimal Vulkan host under validation 78 of 78); parity 1080p BGRA8 4x and 4K RGB10A2 2x: strict 0 bytes, shipped 97.6 dB or better; soak 1000 flat; OptiScaler
-2x on both APIs (395, 284 fps). The sample's long runs predate them.
+Vulkan, Khronos + synchronisation in the sample, 4x, 1500 frames: 64 messages (limited repeats). By function: draws and ray tracing, graphics pipeline creation, present / acquire / latency calls on several threads,
+Streamline's present semaphore, device destruction (five live objects, as with NVIDIA's DLSS-G; those named are ImGui's), and vkCmdCopyImage from GBufferDepth to Streamline's depth copy. None is in a dispatch, the only
+shader work NFRUX records, and the copies name only those images. (NFRUX's own objects were given names for this run; that the names took effect is not shown.) NVIDIA's DLSS-G (2x) gives every class of
+message NFRUX's earlier runs did.
 
-NFRUX and NVIDIA's DLSS-G (Streamline SDK's DLL through the driver's NGX core), 2x, the same inputs (`ngx_harness --replay`): a 60-frame sample recording with every second frame removed
-(vectors and matrices chained, `halve_recording.py`), the removed frames the truth; 28 frames, right of the UI, 1280x701. The scene is noisy ray tracing, so about 27 dB is near what any can reach.
+NFRUX and NVIDIA's DLSS-G (Streamline SDK's DLL through the driver's NGX core, on a DIRECT list; the others on COMPUTE), 2x, the same inputs (`ngx_harness --replay`): a 60-frame sample recording with every
+second frame removed (vectors chained by nearest pixel, matrices multiplied; `halve_recording.py`), the removed frames the truth; 28 frames, right of the UI, 1280x701. `compare_providers.py`:
 
 | | dB | SSIM | worst frame dB | opaque UI, mean difference from the frame (codes) |
 |---|---|---|---|---|
 | NFRUX | 27.33 | 0.840 | 25.84 | 0.00 |
 | DLSS-G | 27.12 | 0.831 | 25.87 | 1.72 |
-| blend | 22.85 | 0.499 | 22.25 | - |
+| blend | 22.85 | 0.499 | 22.25 | 1.13 |
 
-One recording, one scene, one GPU: differences of 0.2 dB are not a ranking. The UI column is the previous code (no change since touches it). Picture: `build\compare.png` (not in the repository).
+One recording, one scene (noisy ray tracing), one GPU: 0.2 dB is not a ranking, and whether about 27 dB is a ceiling there was not measured. The UI in the recording is one opaque-ish panel that
+changes little; opaque means over 90 codes from the HUD-less picture. Picture: `build\compare.png` (not in the repository).

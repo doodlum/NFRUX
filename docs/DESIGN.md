@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 8, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
+Status: revision 9, under review: what the debug layer found (revision 8 was agreed by all three reviewers; docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -113,9 +113,17 @@ PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.
 States (DLSS-FG Programming Guide): D3D12 inputs arrive and leave in NON_PIXEL_SHADER_RESOURCE, outputs in UNORDERED_ACCESS. Vulkan outputs GENERAL; inputs
 GENERAL, or SHADER_READ_ONLY_OPTIMAL when the NGX resource is not read-write (RTX Remix). Streamline (debug layer, 2026-11-25)
 follows that for the back buffer and outputs only: the disable word is in COPY_DEST, and tagged inputs are in the state the game left them, its copies of tags valid only
-now in COPY_DEST. Those copies are known by their debug name; other tags whose state is not NON_PIXEL_SHADER_RESOURCE are handed on by the loader as valid only now, so that
-Streamline copies them on the game's own list (RENDER_TARGET is not legal on the compute list they are read on). The OptiScaler route has no such hook: there the guide's state is assumed.
-Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
+now in COPY_DEST. Seen in Streamline_Sample with the release Streamline 2.14.16 DLLs of the SDK; its guide asks that a tag's state be right when Streamline uses it. Therefore:
+- the loader wraps slSetTag / slSetTagForFrame (imports and GetProcAddress) and, once NFRUX's D3D12 feature exists, hands each valid-until-present tag's declared state to the feature
+  (`NFRUX_NoteState`, by resource). Nothing is changed in the call;
+- the feature transitions such an input from that state and back where its list can name the state; an input whose state contains NON_PIXEL_SHADER_RESOURCE is read as it is;
+- only a tag a COMPUTE list cannot use (RENDER_TARGET, DEPTH_WRITE, pixel-only; a colour, which is also copied from, with any pixel or attachment bit) is passed on as valid only now, so that Streamline
+  copies it on the game's list. Streamline then takes the declared state as the one there: an assumption, right in the sample, wrong for a game whose present-time state differs from its state at the
+  call. Cost: one copy a tag and frame, not measured. No command list given: used as it is;
+- Streamline's copies are in COPY_DEST, known by their debug name ("clone.tagVolatile", present in the release sl.common.dll 2.14.16). Another Streamline that does not set the name: read in the wrong declared
+  state, as before this rule. eValidUntilEvaluate tags and D3D11 hosts are left alone; Streamline 1's slSetTag arguments are told apart (its second argument is a small number).
+On the OptiScaler route nothing hands the states over: the guide's state is assumed, which is known to be wrong for tags in other states (section 7).
+Diagnosis switches in the DLL, off unless set: NFRUX_TEST_D3D12_MESSAGES (the debug layer's messages and barriers into the log), NFRUX_TEST_PASSTHROUGH, NFRUX_TEST_ABSENT, NFRUX_TEST_NAMES.Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
 (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
@@ -144,7 +152,7 @@ prior as softmax weights instead of logarithms (within rounding), 02 / 03 / 01 a
 port Arm's ML Emulation Layer, which the branch runs through VK_ARM_data_graph_optical_flow.
 
 **D1b. NRI.** (Adopted 2026-11-25.) rhi.h has one implementation, on NVIDIA's NRI (MIT), commit 993db1a, built by
-`tools/build_nri.ps1` with D3D11, Agility SDK, NVAPI, AGS and NVTX off (its wrapped-device teardown crashed with them; which one was not
+`tools/build_nri.ps1` (which changes one thing: a shader resource's state on DIRECT lists, 0x40) with D3D11, Agility SDK, NVAPI, AGS and NVTX off (its wrapped-device teardown crashed with them; which one was not
 established). It wraps the host's device, command buffer and images. The native D3D12 backend that existed was bit-identical and no faster in
 the sample (564 against 572 fps at 4x) and was deleted; that removes an independent implementation, so correctness evidence is A3 and A14
 (outside references), and the validation runs, and A3 is required before M5's exit. Ours, on native handles: state tracking, descriptor recycling,
@@ -314,7 +322,7 @@ M1-M3 do not depend on M0a.
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
 | Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
-| (Closed 2026-11-25: Graphics Tools installed, results in RESULTS.) The D3D12 debug layer could not run here (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
+| OptiScaler route (R2), D3D12: tagged inputs in another state than the guide's are read without a transition. On NVIDIA no fault was seen (2x, sample); others not tested | known; only a host that gives the states can fix it |
 
 ## 8. Acceptance
 
