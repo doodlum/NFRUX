@@ -407,7 +407,8 @@ without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The lo
 # Debug layers, and NFRUX beside DLSS-G (2026-11-25; 93cff40, shipped build, release Streamline 2.14.16, unless said)
 
 D3D12 debug layer (Graphics Tools; `tools\run_d3d12_debug.ps1` runs the default harness; the others by `NFRUX_TEST_DIRECT`, `NFRUX_ML`, `NFRUX_TEST_INPUT_STATE`, `NFRUX_TEST_WRONG_STATE`).
-Counted: corruption, error and warning messages.
+Counted: corruption, error and warning messages. Streamline plugins loaded: production 2.14.16 (over the air, C:\ProgramData\NVIDIA\NGX\models\sl_common_0\versions\134672; its sl.common is byte-identical to the SDK's release one and
+holds the clone name).
 - Control (inputs in a wrong state, not told): 1,094 messages. Inputs only; no control for outputs or the disable word.
 - Harness, 78 checks: 0 messages on COMPUTE lists with inputs in NON_PIXEL, COMMON, COPY_SOURCE; on DIRECT lists in NON_PIXEL, COMMON, 0xC0. (States the harness cannot create or upload in: not run.)
   Earlier the same day, before the fixes below (2ac5a8e or later): dot4 and scalar, and GPU-based validation on CUDA and dot4: 0 messages.
