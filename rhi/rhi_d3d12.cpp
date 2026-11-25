@@ -19,7 +19,7 @@ namespace nfrux
 {
 namespace
 {
-constexpr uint32_t kSlots = 16, kDescriptors = 4096, kUpload = 512 * 1024;
+constexpr uint32_t kSlots = 32, kDescriptors = 4096, kUpload = 512 * 1024;
 constexpr D3D12_RESOURCE_STATES kSrv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, kUav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
 DXGI_FORMAT Dxgi(Format f)

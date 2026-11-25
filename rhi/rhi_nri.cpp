@@ -25,7 +25,7 @@ namespace nfrux
 {
 namespace
 {
-constexpr uint32_t kSlots = 8, kSets = 160, kConstants = 512, kConstantStride = 512;
+constexpr uint32_t kSlots = 32, kSets = 160, kConstants = 512, kConstantStride = 512;
 #define NRI_OK(x) ((x) == nri::Result::SUCCESS)
 
 nri::Format ToNri(Format f)
