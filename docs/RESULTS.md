@@ -204,4 +204,68 @@ on Vulkan without NFRUX having been loaded. No newer OptiScaler release exists.
 
 - SM 6.9 cooperative vectors: dropped. The inbox runtime reports SM 6.8; the retail Agility SDK (1.620.2) has SM 6.9 and 6.10 but no
   cooperative-vector interface in d3d12.h, and NFRUX cannot choose the host's D3D12 core. On NVIDIA GPUs of those generations CUDA is the rung.
-- DirectML: see the table at the end (measured on an idle GPU).
+- DirectML integer convolution (idle RTX 4070, 372x232x16, 3x3, 16 out): exact (0 of 1,380,864 sums wrong) in four layouts; 198-204 us, 45 us in
+  the best (NHWC, weights owned by DirectML), for one layer's sums without our rescale. The whole 22-layer network is 445 us on dot4 and 173 us
+  on CUDA. Dropped.
+
+## The reference is the nfru-mfg branch (2026-11-25): audit and what it found
+
+Every shared header and shader was diffed against `ngsdk-steamdeck` `nfru-mfg` (38cfb23). Found and fixed:
+
+| Divergence (from DeckyUpscaler) | Effect |
+|---|---|
+| The composite lacked the timestep prior the network is trained with | up to 1.4 dB lost at t = 1/6 and 5/6 |
+| Above 1080 rows the flow ran at full size (pass 01 missing) | 4K 4x: 3.2 -> 2.65 ms on D3D12 |
+| The flow hint had the game's vectors scattered over the camera motion | no gain (+-0.03 dB); removed with its 64-bit atomics |
+| Reduced lanes RGBA8 for RGB10A2, RGBA16F for R11G11B10F | now the colour's own format |
+| Jittered motion vectors not handled | `DLSSG.MvecJittered` through the SDK's jitter cancellation |
+
+Earlier parity results in this file (D3D12 against Vulkan) were unaffected by these: both APIs ran the same wrong composite. That is what A3 is for.
+
+## A3, A14: quality against true frames (final code, D3D12, shipped build; `tests/reference.py`, 2026-11-25)
+
+Held-out sets test_new + test_bal (35 sequences, 4 pairs each where they exist), PSNR in dB, mean over generated frames; 8-bit colour and
+half-float vectors for every method, outputs rounded to 8 bits.
+
+| | frames | NFRUX | PyTorch, same network | Arm NFRU v2 (with the prior off, as released) | linear blend |
+|---|---|---|---|---|---|
+| 2x | 68 | 35.72 | 35.71 | 35.24 | 26.46 |
+| 3x | 144 | 37.35 | 37.39 | 36.92 | 30.40 |
+| 4x | 96 | 39.16 | 39.17 | 38.80 | 29.94 |
+| 5x | 144 | 34.13 | 34.11 | 33.71 | 25.85 |
+| 6x | 180 | 34.13 | 34.10 | 33.56 | 25.57 |
+
+A3 met (within 0.04 dB; limit 0.2). A14 met (above Arm's at every multiplier). Before the prior fix NFRUX was 33.61 at 6x.
+
+## A12: optical flow hardware (offline, VK_NV_optical_flow, RTX 4070)
+
+70 held-out pairs, same network and pipeline (PyTorch), only the flow differs, dB: block match / hardware (slow level) / no flow:
+3x 40.26 / 39.61 / 39.07, 4x 40.17 / 40.22 / 39.44, 5x 34.93 / 34.82 / 33.71, 6x 34.23 / 33.89 / 33.04. Medium level within 0.06 of slow.
+(Here the block match is the gym's, without hints; no hints were given to the hardware either.)
+Cost, idle: hardware 0.85 / 0.51 / 0.44 ms at 720p and 1.77 / 0.98 / 0.68 ms at 1080p (slow / medium / fast; wall clock, 8 back to back, its own
+engine); the block match 0.12-0.16 ms at 720p, 0.19-0.20 at 1080p, 0.19-0.21 at 4K of shader time (with and without it). Not delivered.
+
+## A8: cost (idle RTX 4070, shipped build, RGBA8; D3D12 CUDA / Vulkan cooperative matrix, ms a rendered frame for all generated frames)
+
+| display (render) | 2x | 4x | 6x |
+|---|---|---|---|
+| 1080p | 0.78 / 1.06 | 1.76 / 2.31 | 2.69 / 3.59 |
+| 1440p (1706x960) | 0.87 / 1.13 | 1.96 / 2.57 | 3.04 / 4.02 |
+| 4K (1080p) | 1.16 / 1.48 | 2.65 / 3.29 | 4.15 / 5.14 |
+
+Default rung at 1080p 2x: under the 2.5 ms limit. Method: 16 frames a submission, recording time removed, median of 30, not timestamps. VRAM and
+the other rungs are not in this table.
+
+## Sample with the final code (4000 rendered frames each, 1280x701, worker-thread creation)
+
+Presented fps near the end: D3D12 2x 429, 4x 675, 6x 804; Vulkan 2x 385, 4x 544 and 553, 6x 651. One earlier Vulkan 4x run had dropped to
+multiplier 1 at its end; the cause is not shown (DLSS-G stops without window focus); two reruns stayed at 4x in all 33 log lines. The 5-minute runs
+above predate the audit's changes.
+
+Sizes beyond 4K and odd ones, strict, D3D12 against Vulkan: 5120x1440, 3440x1440, 7680x4320, 800x600 from 400x300, 1281x701 from 641x351: 0 bytes
+different.
+
+## A11
+
+nvngx_dlssg.dll links no graphics DLL directly (d3d12 and dxgi are delay-loaded; vulkan-1 is loaded by name); no shared-handle call in the sources or
+imports. It needs the VC++ 2015-2022 runtime.

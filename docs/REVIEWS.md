@@ -29,3 +29,7 @@ Architecture and code accuracy agreed on revision 2; revision 3 changed only wha
 | 5 | readiness and tests | AGREE | 0 |
 
 Revision 5 at commit 61d7e69 is the agreed design; the edits after it are the reviewers' own text corrections.
+
+Revision 6 (after M0d, A12, A3 and two decisions): strict / relaxed math (D1); the nfru-mfg branch as the reference (D1); optical flow
+hardware dropped with numbers (D4); cooperative vectors and DirectML dropped (D3); scatter removed; pass 01 in; D7 as built; MvecJittered; A3 as
+run; sizes to 8K.

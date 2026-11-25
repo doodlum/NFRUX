@@ -185,7 +185,7 @@ bool Interpolator::Impl::Create(std::string* error)
     auto fail = [&](const char* m) { if (error) *error = m; return false; };
     display = {s.displayWidth, s.displayHeight};
     render  = {s.renderWidth, s.renderHeight};
-    if (!display.width || !display.height || !render.width || !render.height || display.width > 3840 || display.height > 2160)
+    if (!display.width || !display.height || !render.width || !render.height || display.width > 8192 || display.height > 4320)
         return fail("unsupported size");
     const double aspect = double(display.width) / double(display.height);
     ofInput = display.height > 1080 ? Dims{RoundPositive(1080 * aspect), 1080} : display;  // the SDK's resolution plan
@@ -324,7 +324,8 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
         const Bind b[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, color), Bind::Tex(2, p1)};
         if (!pyramidP->Dispatch(b, 3, Groups(d.width), Groups(d.height))) return false;
     }
-    if (pyramidValid && !reset)
+    static const bool noFlow = EnvFlag("NFRUX_TEST_NO_FLOW", false);  // cost measurement: the hints as the flow
+    if (pyramidValid && !reset && !noFlow)
     {
         dev.CopyTexture(*flow, *flowHint);
         for (int32_t l = 5; l >= 2; --l)
