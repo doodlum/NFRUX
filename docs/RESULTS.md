@@ -137,3 +137,71 @@ played through D3D12 and Vulkan (`parity --first 2 --replay DIR --frames 6 --gen
   generated frames each). The synthetic cases still are too (1080p, 4K, inverted depth, RGB10A2; 2x and 6x).
 
 Not covered: HDR recordings, render size below display size from a real recording, other GPUs.
+
+## Strict and relaxed math (decision, 2026-11-25)
+
+"Slight differences are ok if the compiler is trying to optimise the code"; "prove exactness, then drop for when actually using the mod".
+CMake option `NFRUX_STRICT_MATH` (OFF, the shipped build; ON, the proof build: NoContraction on every float result, DXC `-Gis`).
+
+| RTX 4070, one generated frame | strict | relaxed |
+|---|---|---|
+| D3D12 1080p, ms a rendered frame | 0.80 / 0.80 | 0.80 / 0.80 |
+| D3D12 4K from 1080p | 1.63 / 1.62 | 1.62 / 1.57 |
+| Vulkan 1080p | 1.09 / 1.07 | 1.08 / 1.04 |
+| Vulkan 4K from 1080p | 1.98 / 1.98 | 1.99 / 1.93 |
+| D3D12 against Vulkan, sample recording (2x, 6x) | 0 bytes | 76.8 dB, 0.00009% of bytes off by more than 1, none by more than 3 |
+
+(16 frames a submission, recording time taken off, median of 30, two runs.) Strict costs 0 to about 2-3%, which is near the runs' own spread.
+
+## A9, A10: NGX harness (`tests/ngx_harness.cpp`, the real DLL, its NGX exports, 2026-11-25)
+
+53 checks an API, all pass on D3D12 and Vulkan, strict and relaxed: HUD-less difference test, UI alpha, UI layer, both without HUD-less, no-warp mask,
+colour subrects, HUD-less in RGB10A2 / BGRA8, outputs BGRA8 / RGB10A2 / RGBA16F, the scRGB difference test, distortion fields (zero, shifting; 2x and
+5x), menu detection, reset with HUD-less, NotRendering, missing inputs, indices out of order and past five, changes of count / format / size, two
+features, release, release twice, evaluate after release, create again. Between the APIs: strict 49 of 49 outputs byte-identical; relaxed 40 of 49,
+the rest 103 dB or better. Depth and motion subrects: only checked to evaluate. PQ UI values are not checked separately.
+
+- Soak, 2000 evaluates each API: video memory and handles flat.
+- Minimal Vulkan 1.2 host (only shaderStorageImageExtendedFormats): all checks, byte-identical to D3D12, no validation message.
+- Found and fixed by it: members outliving their device (crash when a second feature was released); the network kernels were SPIR-V 1.6 (not valid on
+  a 1.2 device).
+
+## Validation (A4's part)
+
+- Harness, Khronos validation with synchronisation validation: 0 messages (host on 1.3, and the minimal 1.2 one). The layer is known active: it
+  reported the SPIR-V 1.6 kernels before their fix.
+- Streamline_Sample on Vulkan, 4x 3000 and 6x 5000 rendered frames, with a control run without frame generation: one message concerned NFRUX (an image
+  view destroyed while Streamline's command buffer formally counted as pending). Fixed (kept 16 recordings longer), gone in the second run. All
+  others are the sample's or Streamline's; none names a NFRUX object or a dispatch.
+- D3D12 debug layer: **not run.** Graphics Tools is not installed (elevated, decision). Agility SDK packages 1.614-1.620 were tried
+  app-local, also by device factory: the core loads (1.618 on) but the runtime refuses its layers (DXGI_ERROR_SDK_COMPONENT_MISSING). NRI's own
+  validation on D3D12: 0 messages. (On Vulkan NRI's validation objects to wrapped host images and ends the run; not used there.)
+
+## A4, long runs with the current code (2026-11-25, 1280x701, release Streamline DLLs, worker-thread creation not yet in)
+
+| API | multiplier | seconds | generated |
+|---|---|---|---|
+| D3D12 | 2x | 339 | 66,000 of 66,000 logged |
+| D3D12 | 6x | 323 | 221,990 of 222,000 |
+| Vulkan | 2x | 287 | 56,998 of 57,000 |
+| Vulkan | 6x | 266 | 155,990 of 156,000 |
+
+Exit code 0 each. The Vulkan runs are short of 300 s; builds and tests used the machine meanwhile.
+
+## A7, D7: rungs, self-check, crash marker
+
+- Every rung forced (D3D12 CUDA, dot4, int32; Vulkan cooperative matrix, dot4, scalar), each with 64-bit and 32-bit scatter: 12 of 12 harness runs pass.
+- Self-check: passes; with `NFRUX_TEST_BAD_CHECK=1 / 2 / 3` it goes to dot4, to int32, to no frame generation.
+- Crash marker: the process killed twice while the marker was set; the third start used dot4 and said so; deleting the file brought CUDA back.
+
+## A6, 0.9.5 again with the current DLL
+
+D3D12 2x: 3500 frames, 2990 of 3000 generated (439 fps). Vulkan 2x: 2874 of 3000 (315 fps, integer network: the host's features are unknown there;
+the first frames are the worker thread's). Above 2x: that slot offers 2x only (Streamline refuses 4x); the sample then ends with an access violation,
+on Vulkan without NFRUX having been loaded. No newer OptiScaler release exists.
+
+## M0d
+
+- SM 6.9 cooperative vectors: dropped. The inbox runtime reports SM 6.8; the retail Agility SDK (1.620.2) has SM 6.9 and 6.10 but no
+  cooperative-vector interface in d3d12.h, and NFRUX cannot choose the host's D3D12 core. On NVIDIA GPUs of those generations CUDA is the rung.
+- DirectML: see the table at the end (measured on an idle GPU).
