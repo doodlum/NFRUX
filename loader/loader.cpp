@@ -120,7 +120,7 @@ static NgxResult __cdecl Shut12D(ID3D12Device* d) { L("D3D12 Shutdown1"); if (au
 static NgxResult __cdecl ShutVk() { L("Vulkan Shutdown"); if (auto o = Ours<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")) o(); return Real<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")(); }
 static NgxResult __cdecl ShutVkD(VkDevice d) { L("Vulkan Shutdown1"); if (auto o = Ours<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")) o(d); return Real<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")(d); }
 // --- vkCreateDevice: what the game enables, plus what NFRUX's fast paths want (DESIGN D3).
-#include "../core/ml/vulkan_network.h"
+#include "../core/ml/cuda_vulkan.h"
 static PFN_vkCreateDevice g_createDevice;
 static uint32_t           g_ml;
 static VkDevice           g_featureDevice;
@@ -143,7 +143,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     VkPhysicalDeviceFeatures2* f2 = nullptr; VkPhysicalDeviceVulkan12Features* f12 = nullptr; VkPhysicalDeviceVulkan13Features* f13 = nullptr;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR* fcm = nullptr; VkPhysicalDeviceVulkanMemoryModelFeatures* fmm = nullptr; VkPhysicalDeviceShaderFloat16Int8Features* f8 = nullptr;
     VkPhysicalDevice8BitStorageFeatures* f8s = nullptr; VkPhysicalDeviceShaderIntegerDotProductFeatures* fdot = nullptr;
-    VkPhysicalDeviceVulkan11Features* f11 = nullptr; VkPhysicalDevice16BitStorageFeatures* f16s = nullptr; VkPhysicalDeviceSubgroupSizeControlFeatures* fsg = nullptr;
+    VkPhysicalDeviceVulkan11Features* f11 = nullptr; VkPhysicalDevice16BitStorageFeatures* f16s = nullptr; VkPhysicalDeviceSubgroupSizeControlFeatures* fsg = nullptr; VkPhysicalDeviceBufferDeviceAddressFeatures* fba = nullptr;
     auto size = [](VkStructureType t) -> size_t {
         switch (t)
         {
@@ -155,6 +155,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: return sizeof(VkPhysicalDeviceShaderFloat16Int8Features);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: return sizeof(VkPhysicalDevice8BitStorageFeatures);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: return sizeof(VkPhysicalDeviceShaderIntegerDotProductFeatures);
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: return sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: return sizeof(VkPhysicalDeviceVulkan11Features);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: return sizeof(VkPhysicalDevice16BitStorageFeatures);
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: return sizeof(VkPhysicalDeviceSubgroupSizeControlFeatures);
@@ -186,6 +187,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: f8 = (VkPhysicalDeviceShaderFloat16Int8Features*)use; break;
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: f8s = (VkPhysicalDevice8BitStorageFeatures*)use; break;
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: fdot = (VkPhysicalDeviceShaderIntegerDotProductFeatures*)use; break;
+            case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: fba = (VkPhysicalDeviceBufferDeviceAddressFeatures*)use; break;
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: f11 = (VkPhysicalDeviceVulkan11Features*)use; break;
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: f16s = (VkPhysicalDevice16BitStorageFeatures*)use; break;
             default: fsg = (VkPhysicalDeviceSubgroupSizeControlFeatures*)use; break;
@@ -260,6 +262,15 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (float16 && f11) f11->storageBuffer16BitAccess = VK_TRUE;
         else if (float16) { if (!f16s) chain(f16s = &st16); f16s->storageBuffer16BitAccess = VK_TRUE; }
     }
+    // CUDA kernels (NVIDIA): the launch extension and buffer addresses.
+    VkPhysicalDeviceBufferDeviceAddressFeatures ba = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    const bool cuda = s12.bufferDeviceAddress && device(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+    if (cuda)
+    {
+        if (!has(VK_NVX_BINARY_IMPORT_EXTENSION_NAME)) ext.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+        if (f12) f12->bufferDeviceAddress = VK_TRUE;
+        else { if (!fba) chain(fba = &ba); fba->bufferDeviceAddress = VK_TRUE; }
+    }
     c.enabledExtensionCount = uint32_t(ext.size()), c.ppEnabledExtensionNames = ext.data();
     VkResult r = g_createDevice(pd, &c, a, out);
     for (size_t i = patches.size(); i--;) patches[i].at->pNext = patches[i].old;
@@ -275,6 +286,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (s12.vulkanMemoryModel) ml |= FEATURE_VULKAN_MEMORY_MODEL;
         if (s13.subgroupSizeControl && s13.computeFullSubgroups) ml |= FEATURE_SUBGROUP_SIZE_CONTROL;
         if (cmS.cooperativeMatrix) ml |= FEATURE_COOPERATIVE_MATRIX;
+        if (cuda) ml |= nfrux::kFeatureCudaLaunch;
         if (float16) ml |= FEATURE_SHADER_FLOAT16 | FEATURE_STORAGE_BUFFER_16BIT;
     }
     g_ml = ml;

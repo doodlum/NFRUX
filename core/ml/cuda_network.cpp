@@ -404,7 +404,7 @@ CudaGraph::~CudaGraph()
     if (Nv().destroyModule && m_module) Nv().destroyModule(m_device.Get(), m_module);
 }
 
-void CudaGraph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch)
+void CudaGraph::Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs, const D3D12_GPU_VIRTUAL_ADDRESS* inputs, ID3D12Resource* const* const* outputs, uint32_t count, uint32_t outputPitch)
 {
     auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER x = {};
@@ -412,37 +412,56 @@ void CudaGraph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRES
         return x;
     };
     std::vector<D3D12_RESOURCE_BARRIER> b;
-    if (!m_uploaded)
+    for (uint32_t i = 0; i < count; ++i)
     {
-        list->CopyResource(m_constants.Get(), m_upload.Get());
-        b.push_back(transition(m_constants.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
-        m_uploaded = true;
+        CudaGraph& g = *graphs[i];
+        if (!g.m_uploaded)
+        {
+            list->CopyResource(g.m_constants.Get(), g.m_upload.Get());
+            b.push_back(transition(g.m_constants.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+            g.m_uploaded = true;
+        }
+        for (auto& t : g.m_tensors) b.push_back(transition(t.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     }
-    for (auto& t : m_tensors) b.push_back(transition(t.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     list->ResourceBarrier(UINT(b.size()), b.data());
-    const uint64_t    base = m_constants->GetGPUVirtualAddress();
-    std::vector<bool> dirty(m_tensors.size(), false);
-    auto va = [&](int32_t t) { return t >= 0 ? m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? input : outputs[-2 - t]->GetGPUVirtualAddress(); };
-    for (const Layer& l : m_layers)
+    std::vector<bool> dirty(graphs[0]->m_tensors.size(), false);
+#pragma pack(push, 4)
+    struct Params { uint64_t s0, s1, w, p, d; uint32_t row; };
+#pragma pack(pop)
+    std::vector<Params> params(count);
+    std::vector<Launch> launches(count);
+    for (size_t li = 0; li < graphs[0]->m_layers.size(); ++li)
     {
         b.clear();
-        for (int32_t t : {l.src[0], l.src[1], l.dst})
+        const Layer& first = graphs[0]->m_layers[li];
+        for (int32_t t : {first.src[0], first.src[1], first.dst})
             if (t >= 0 && dirty[t])
             {
-                D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV};
-                u.UAV.pResource = m_tensors[t].Get();
-                b.push_back(u), dirty[t] = false;
+                dirty[t] = false;
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV};
+                    u.UAV.pResource = graphs[i]->m_tensors[t].Get();
+                    b.push_back(u);
+                }
             }
         if (!b.empty()) list->ResourceBarrier(UINT(b.size()), b.data());
-#pragma pack(push, 4)
-        struct { uint64_t s0, s1, w, p, d; uint32_t row; } params = {va(l.src[0]), va(l.src[1]), base + l.weights, base + l.params, va(l.dst), outputPitch};
-#pragma pack(pop)
-        const Launch k = {l.fn, {l.grid[0], l.grid[1], 1}, {128, 1, 1}, 0, &params, 44};
-        Nv().launch(list, &k, 1);
-        if (l.dst >= 0) dirty[l.dst] = true;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            CudaGraph& g = *graphs[i];
+            const Layer& l = g.m_layers[li];
+            const uint64_t base = g.m_constants->GetGPUVirtualAddress();
+            auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? inputs[i] : outputs[i][-2 - t]->GetGPUVirtualAddress(); };
+            params[i] = {va(l.src[0]), va(l.src[1]), base + l.weights, base + l.params, va(l.dst), outputPitch};
+            launches[i] = {l.fn, {l.grid[0], l.grid[1], 1}, {128, 1, 1}, 0, &params[i], 44};
+        }
+        // Not as one chain: the launches of a chain run one after another.
+        for (uint32_t i = 0; i < count; ++i) Nv().launch(list, &launches[i], 1);
+        if (first.dst >= 0) dirty[first.dst] = true;
     }
     b.clear();
-    for (auto& t : m_tensors) b.push_back(transition(t.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON));
+    for (uint32_t i = 0; i < count; ++i)
+        for (auto& t : graphs[i]->m_tensors) b.push_back(transition(t.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON));
     list->ResourceBarrier(UINT(b.size()), b.data());
 }
 }  // namespace nfrux

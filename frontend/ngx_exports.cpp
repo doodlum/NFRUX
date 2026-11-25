@@ -1,5 +1,6 @@
 // nvngx_dlssg.dll: the NGX entry points of frame generation (feature 11) for D3D12 and Vulkan. SPDX-License-Identifier: MIT
 #include "marker.h"
+#include "ml/cuda_vulkan.h"
 #include "frame_generator.h"
 
 #include "../core/log.h"
@@ -63,6 +64,7 @@ std::unique_ptr<Device> DeviceForVk()
         h.marker = m;
         std::vector<const char*> ext;
         h.mlFeatures = ffx_ml::QueryDeviceFeatures(h.instance, h.physicalDevice, h.gipa, &ext);
+        if (CudaVulkanGraph::Supported(h.device, h.gdpa)) h.mlFeatures |= kFeatureCudaLaunch;  // Streamline enables the extension; buffer addresses are assumed with it
         Log("Vulkan: the GPU's features are used whether or not the game enabled them (NFRUX_VK_ASSUME_FEATURES=0: not)");
     }
     return CreateNriVulkanDevice(h);

@@ -2,7 +2,7 @@
 //   parity [--size WxH] [--render WxH] [--frames N] [--gen N] [--dump DIR] [backend ...]   backends: d3d12 vulkan
 // SPDX-License-Identifier: MIT
 #include "../core/interpolator.h"
-#include "../core/ml/vulkan_network.h"
+#include "../core/ml/cuda_vulkan.h"
 #include "rhi_nri.h"
 
 #include <d3d12.h>
@@ -305,7 +305,8 @@ static bool RunVulkan(Results& out)
     VkPhysicalDevice pd;
     vkEnumeratePhysicalDevices(inst, &n, &pd);
     std::vector<const char*> ext;
-    const uint32_t ml = ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
+    uint32_t ml = ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
+    ml |= AddCudaExtension(pd, ext);
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceShaderBfloat16FeaturesKHR bf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR, &cm};
     VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &bf};

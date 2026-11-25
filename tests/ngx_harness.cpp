@@ -2,7 +2,7 @@
 // pixels, on each API and between them.
 //   ngx_harness DLL [--minimal] [--soak N] [d3d12|vulkan]     NFRUX_VK_VALIDATION=1, NFRUX_D3D12_DEBUG=1
 // SPDX-License-Identifier: MIT
-#include "../core/ml/vulkan_network.h"
+#include "../core/ml/cuda_vulkan.h"
 #include "../loader/ngx.h"
 
 #include <d3d12.h>
@@ -368,7 +368,8 @@ struct ApiV : Api
         LUID luid;
         memcpy(&luid, idp.deviceLUID, sizeof(luid)), FindAdapter(luid);
         std::vector<const char*> ext;
-        const uint32_t ml = minimal ? 0 : ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
+        uint32_t ml = minimal ? 0 : ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
+        if (!minimal) ml |= nfrux::AddCudaExtension(pd, ext);
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderBfloat16FeaturesKHR bf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR, &cm};
         VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &bf};

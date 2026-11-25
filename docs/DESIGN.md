@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md); since then one change by decision (fast Vulkan network by default on NVIDIA under OptiScaler, D3), not reviewed. Nothing under "Acceptance" counts as done until its
+Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md); since then one change by decision (fast Vulkan network by default on NVIDIA under OptiScaler, D3) and CUDA kernels on Vulkan with batches interleaved (D3), not reviewed. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -181,7 +181,7 @@ params / gate textures on every path (paths that write images directly are an op
 
 | | 1st | 2nd | floor |
 |---|---|---|---|
-| Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | cooperative matrix: fp16 then int8 on NVIDIA, int8 then fp16 elsewhere (exact, D2) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
+| Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | NVIDIA: CUDA kernels (VK_NVX_binary_import, the same as D3D12's), then cooperative matrix fp16, int8; elsewhere int8, fp16 (exact, D2) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 
@@ -213,6 +213,10 @@ the GPU it is, on the worker thread, with a short-lived context matched by LUID 
 fast here as sm_80's m16n8k16, so there is one form. GTX 16 (and T400 to T1200, MX450) reports sm_75 without tensor cores and is told apart by name, whole words (one that begins with RTX, T4, T4G; a table test in `ml_conformance_d3d12`); GTX 10 and 16 use dot4, the
 same hardware instruction CUDA would. Cubins are kept in memory only. NVAPI `CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` by public interface id
 launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS.
+
+On Vulkan the same kernels are launched by vkCmdCuLaunchKernelNVX (`core/ml/cuda_vulkan.cpp`): buffers by address, a full memory barrier where a layer reads what the last wrote. The loader enables the extension and
+bufferDeviceAddress; Streamline enables the extension itself, so on the OptiScaler route its presence is asked (the function's address) and buffer addresses are assumed with it. Same marker and self-check. A batch's networks run a
+layer at a time on both APIs (independent launches between barriers).
 
 AMD and Intel matrix hardware is reached through Vulkan cooperative matrices: any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
 the size can be required, else the driver's own. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to

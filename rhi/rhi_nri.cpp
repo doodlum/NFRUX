@@ -2,7 +2,7 @@
 // descriptor recycling and completion tokens are here; the network goes through native handles. SPDX-License-Identifier: MIT
 #include "rhi_nri.h"
 
-#include "cuda_network.h"
+#include "cuda_vulkan.h"
 #include "d3d12_network.h"
 #include "log.h"
 #include "marker.h"
@@ -101,6 +101,14 @@ struct PassN : Pass
 };
 struct NetN : Network
 {
+    std::unique_ptr<CudaVulkanGraph> cudaVk;
+    CudaVulkanGraph::Buffer          cudaBuf[3];  // input, outputs: with addresses
+    ~NetN() override
+    {
+        if (!cudaVk) return;
+        in.reset(), out[0].reset(), out[1].reset();
+        for (auto& b : cudaBuf) cudaVk->Destroy(b);
+    }
     std::unique_ptr<D3D12Graph>    d3d;
     std::unique_ptr<CudaGraph>     cuda;
     std::unique_ptr<ffx_ml::Graph> vk;
@@ -153,7 +161,7 @@ public:
         if (markBack) n.DestroyBuffer(markBack);
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear(), scratch.clear();
-        if (cudaState == 1 && !Lost()) MarkerOk(Rung());
+        if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : Rung());
         if (!vk.marker.empty()) MarkerOk(vk.marker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
@@ -285,6 +293,19 @@ public:
         v.type = nri::BufferView::STORAGE_BYTE_ADDRESS_BUFFER;
         return NRI_OK(n.CreateBufferView(v, b->uav)) ? std::move(b) : nullptr;
     }
+    std::unique_ptr<BufN> WrapBuf(const CudaVulkanGraph::Buffer& x, uint64_t size)
+    {
+        auto b = std::make_unique<BufN>();
+        b->dev = this, b->size = (size + 15) & ~15ull;
+        nri::BufferVKDesc d = {};
+        d.vkBuffer = uint64_t(x.buffer), d.size = b->size, d.structureStride = 4;
+        if (!x.buffer || !NRI_OK(nvk.CreateBufferVK(*dev, d, b->buf))) return nullptr;
+        nri::BufferViewDesc v = {};
+        v.buffer = b->buf, v.type = nri::BufferView::BYTE_ADDRESS_BUFFER, v.size = b->size;
+        if (!NRI_OK(n.CreateBufferView(v, b->srv))) return nullptr;
+        v.type = nri::BufferView::STORAGE_BYTE_ADDRESS_BUFFER;
+        return NRI_OK(n.CreateBufferView(v, b->uav)) ? std::move(b) : nullptr;
+    }
     std::unique_ptr<Texture> CreateTexture(Format f, uint32_t w, uint32_t h, bool) override
     {
         auto t = MakeTex(ToNri(f), w, h, true);
@@ -380,6 +401,8 @@ public:
     }
 
     std::mutex making;
+    bool        vkCuda = false;  // Vulkan: the last network made runs CUDA kernels
+    std::string cudaMarker;
     bool lastFloat = false, noFloats = false;  // float cooperative matrices: the last made, refused
     int rung = -1, topRung = 0;  // 0 cooperative matrices / CUDA, 1 dot4, 2 integers: the last made, the highest allowed
     bool DropRung() override
@@ -387,6 +410,7 @@ public:
         std::lock_guard<std::mutex> lock(making);
         if (rung < 0 || rung >= 2) return false;
         if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
+        if (isVk && rung == 0 && vkCuda) { cudaState = -1, vkCuda = false, cudaMarker.clear(); return true; }  // its marker stays; cooperative matrices next
         if (isVk) vk.marker.clear();
         if (isVk && rung == 0 && lastFloat && !noFloats) { noFloats = true; return true; }  // the int8 matrices next, if there are any
         topRung = rung + 1;
@@ -415,8 +439,25 @@ public:
                 else if (m == "coopmat_bf16") path = ffx_ml::Path::CoopMat, type = ffx_ml::MatType::Bf16;
                 else if (m == "dot4") path = ffx_ml::Path::Dot4;
                 else if (m == "scalar") path = ffx_ml::Path::Scalar;
+                else if (m == "cuda") {}
                 else { if (error) *error = "NFRUX_ML: unknown path"; return nullptr; }
             }
+            // CUDA kernels first where they can be launched (NVIDIA tensor cores): the same as on D3D12.
+            const bool forced = ml && !strcmp(ml, "cuda") && !topRung && cudaState >= 0;
+            if (forced || (!ml && !topRung && !noFloats && cudaState >= 0 && c.vendorId == uint32_t(nri::Vendor::NVIDIA) && (vk.mlFeatures & kFeatureCudaLaunch)))
+            {
+                std::string why;
+                if (cudaState == 0)
+                {
+                    char b[48];
+                    snprintf(b, sizeof(b), "vulkan_cuda_%04x", c.deviceId);
+                    cudaMarker = b, cudaState = forced || MarkerBegin(cudaMarker) ? 1 : -1;
+                }
+                if (cudaState > 0) net->cudaVk = CudaVulkanGraph::Create(dc, DescribeModel(w, h), &why);
+                if (!net->cudaVk && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(cudaMarker), cudaState = -1;
+                if (forced && !net->cudaVk) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
+            }
+            if (ml && !strcmp(ml, "cuda") && !net->cudaVk && cudaState < 0 && !topRung && rung < 0) { if (error) *error = "NFRUX_ML=cuda: unavailable"; return nullptr; }
             ffx_ml::Selection sel = ffx_ml::SelectPath(dc, path, type);
             if (topRung == 1) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
             if (topRung == 2 || (topRung == 1 && sel.path != ffx_ml::Path::Dot4)) sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
@@ -429,9 +470,18 @@ public:
             rung = sel.path == ffx_ml::Path::CoopMat ? 0 : sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
             sel.rescaleFloat = false;  // exact
             if (path != ffx_ml::Path::Auto && !topRung && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
-            net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
-            if (!net->vk) return nullptr;
-            what = sel.Describe();
+            if (net->cudaVk)
+            {
+                lastFloat = false, rung = 0, what = "CUDA kernels, int8 tensor cores (Vulkan)";
+                for (uint32_t i = 0; i < 2; ++i) net->order[i] = net->cudaVk->outputBinding(i) == mb.params ? 0 : 1;
+            }
+            else
+            {
+                net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
+                if (!net->vk) return nullptr;
+                what = sel.Describe();
+            }
+            vkCuda = net->cudaVk != nullptr;
         }
         else
         {
@@ -453,11 +503,16 @@ public:
             for (uint32_t i = 0; i < 2; ++i) net->order[i] = (net->cuda ? net->cuda->outputBinding(i) : net->d3d->outputBinding(i)) == mb.params ? 0 : 1;
         }
         net->pitch = isVk ? w / 2 * 4 : (w / 2 * 4 + 255) & ~255u;
-        net->in    = MakeBuf(uint64_t(w) * h * kInputChannels);
+        auto make = [&](uint32_t i, uint64_t size) {
+            if (!net->cudaVk) return MakeBuf(size);
+            net->cudaBuf[i] = net->cudaVk->MakeBuffer(size, false);
+            return WrapBuf(net->cudaBuf[i], size);
+        };
+        net->in    = make(0, uint64_t(w) * h * kInputChannels);
         bool ok = net->in != nullptr;
         for (uint32_t i = 0; i < 2; ++i)
         {
-            net->out[i] = MakeBuf(uint64_t(net->pitch) * (h / 2));
+            net->out[i] = make(1 + i, uint64_t(net->pitch) * (h / 2));
             net->tex[i] = MakeTex(nri::Format::RGBA8_SNORM, w / 2, h / 2, false);
             ok = ok && net->out[i] && net->tex[i];
             if (ok) net->tex[i]->format = Format::RGBA8Snorm;
@@ -523,7 +578,7 @@ public:
     {
         Poll();
         // Recordings from well after the network first ran have completed (those before it say nothing).
-        if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(Rung());
+        if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : Rung());
         if (!vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
         nativeCmd = commands, t_recording = true;
         if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));
@@ -742,6 +797,24 @@ public:
         Flush();
         if (isVk)
         {
+            std::vector<CudaVulkanGraph*> cg;
+            std::vector<uint64_t>         ci;
+            std::vector<std::array<uint64_t, 2>> co;
+            uint32_t pitch = 0;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                auto& x = static_cast<NetN&>(*nets[i]);
+                if (!x.cudaVk) continue;
+                cg.push_back(x.cudaVk.get()), ci.push_back(x.cudaBuf[0].address), co.push_back({x.cudaBuf[1 + x.order[0]].address, x.cudaBuf[1 + x.order[1]].address}), pitch = x.pitch;
+            }
+            if (!cg.empty()) CudaVulkanGraph::Record(static_cast<VkCommandBuffer>(nativeCmd), cg.data(), ci.data(), reinterpret_cast<const uint64_t(*)[2]>(co.data()), uint32_t(cg.size()), pitch);
+            std::vector<Network*> rest;
+            for (uint32_t i = 0; i < count; ++i) if (!static_cast<NetN&>(*nets[i]).cudaVk) rest.push_back(nets[i]);
+            const uint32_t all = count;
+            Network* const* allNets = nets;
+            nets = rest.data(), count = uint32_t(rest.size());
+            if (count)
+            {
             const ModelBindings mb = GetModelBindings();
             std::vector<std::array<ffx_ml::ExternalTensor, 3>> t(count);
             std::vector<ffx_ml::Graph*> g(count);
@@ -756,16 +829,34 @@ public:
             }
             if (count == 1) g[0]->Record(static_cast<VkCommandBuffer>(nativeCmd), sets[0], 3);
             else ffx_ml::Graph::RecordInterleaved(static_cast<VkCommandBuffer>(nativeCmd), g.data(), sets.data(), counts.data(), count);
+            }
+            nets = allNets, count = all;
         }
         else
+        {
+            std::vector<CudaGraph*> cg;
+            std::vector<D3D12_GPU_VIRTUAL_ADDRESS> ci;
+            std::vector<std::array<ID3D12Resource*, 2>> co;
+            uint32_t pitch = 0;
             for (uint32_t i = 0; i < count; ++i)
             {
                 auto& x = static_cast<NetN&>(*nets[i]);
+                if (!x.cuda) continue;
+                auto r = [&](const BufN& f) { return reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(f.buf)); };
+                cg.push_back(x.cuda.get()), ci.push_back(r(*x.in)->GetGPUVirtualAddress()), co.push_back({r(*x.out[x.order[0]]), r(*x.out[x.order[1]])}), pitch = x.pitch;
+            }
+            std::vector<ID3D12Resource* const*> op;
+            for (auto& o : co) op.push_back(o.data());
+            if (!cg.empty()) CudaGraph::Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), cg.data(), ci.data(), op.data(), uint32_t(cg.size()), pitch);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                auto& x = static_cast<NetN&>(*nets[i]);
+                if (x.cuda) continue;
                 auto  r = [&](const BufN& f) { return reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(f.buf)); };
                 ID3D12Resource* o[2] = {r(*x.out[x.order[0]]), r(*x.out[x.order[1]])};
-                if (x.cuda) x.cuda->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
-                else x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
+                x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
             }
+        }
         for (uint32_t i = 0; i < count; ++i)
             for (uint32_t k = 0; k < 2; ++k)
             {

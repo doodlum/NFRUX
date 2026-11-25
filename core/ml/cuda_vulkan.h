@@ -6,6 +6,18 @@
 
 namespace nfrux
 {
+// With ffx_ml's feature bits: VK_NVX_binary_import and bufferDeviceAddress are enabled on the device.
+constexpr uint32_t kFeatureCudaLaunch = 1u << 30;
+// For hosts that make the device (tests): the extension added when the GPU has it; kFeatureCudaLaunch or 0. bufferDeviceAddress is the caller's.
+inline uint32_t AddCudaExtension(VkPhysicalDevice pd, std::vector<const char*>& ext)
+{
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> all(n);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, all.data());
+    for (auto& x : all) if (!strcmp(x.extensionName, VK_NVX_BINARY_IMPORT_EXTENSION_NAME)) return ext.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME), kFeatureCudaLaunch;
+    return 0;
+}
 class CudaVulkanGraph
 {
 public:

@@ -448,3 +448,17 @@ A start killed early leaves the count at one; the next full run clears it. Harne
 D3D12 with that OptiScaler build (d6b02459), sample 1280x701, 4x, 500 frames, 4 starts each: with LogLevel=0 (trace, LogToFile=true) all run: NFRUX 664-679 fps. With LogLevel=5 all 8 starts end
 in the access violation; with LogLevel=2 and no file NFRUX's four do, and the other provider's four fail too (two of them may be this session's kills). So the crash depends on OptiScaler's own timing or logging, whichever provider is
 selected; the cause is not found. 2x and 6x with LogLevel=0, one start each, 700 frames (a87945a's build): 427 and 805 fps, exit 0.
+
+# CUDA kernels on Vulkan, batches interleaved (2026-11-25, RTX 4070)
+
+Conformance: exact on five inputs at 744x464 and 992x544. GPU time a network: 744x464 0.183 ms (three interleaved 0.118 each) against fp16 cooperative matrix 0.26; 992x544 0.229 (0.189) against 0.37-0.38 (0.36 interleaved).
+(The interleaved figure has three networks writing one output buffer with the same bytes.)
+`ngx_harness --time` (submitted and waited for, medians, ms a rendered frame, 1280x701):
+
+| | 2x | 4x | 6x |
+|---|---|---|---|
+| Vulkan before / after | 1.13 / 0.98 | 2.53 / 2.08 | 3.98 / 3.19 |
+| D3D12 before / after | 0.81 / 0.81 | 2.07 / 1.85 | 3.26 / 2.92 |
+
+Harness 158 checks, strict 63 of 63 identical; Vulkan validation and D3D12 debug layer 0 messages; every rung forced 78 of 78; injected failures go CUDA, fp16, int8, dot4, scalar; soak 1000 flat; replays 6x and 4K: strict 0 bytes.
+Not run: the loader's new extension and the OptiScaler route in the sample (no windows opened).

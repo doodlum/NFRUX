@@ -36,7 +36,13 @@ public:
     static std::unique_ptr<CudaGraph> Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error);
     ~CudaGraph();
     // Input and outputs in UNORDERED_ACCESS. Outputs: four channels a pixel, outputPitch bytes a row (as given to Create's caller).
-    void     Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch);
+    // Several of one model, a layer at a time (independent launches between barriers).
+    static void Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs, const D3D12_GPU_VIRTUAL_ADDRESS* inputs, ID3D12Resource* const* const* outputs, uint32_t count, uint32_t outputPitch);
+    void Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch)
+    {
+        CudaGraph* self = this;
+        Record(list, &self, &input, &outputs, 1, outputPitch);
+    }
     uint32_t outputBinding(uint32_t i) const { return m_outputBindings[i]; }
 
 private:
