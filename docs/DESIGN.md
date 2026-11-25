@@ -164,7 +164,7 @@ after v192, the reason for the pin) makes it treat every optional 1.1+ feature (
 ...) as absent; `minorVersion` is always given as 2 and no extensions are listed, whatever the GPU reports, as the host's own choice is not known. Below
 1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" is an assumption on both routes; the ones our call set uses are
 shaderStorageImageExtendedFormats, which the loader adds. No queue family is given to NRI (it would ask for a queue the host may not have made; NFRUX never submits through it). On the OptiScaler route the
-assumptions are exactly (a) 1.2, (b) shaderStorageImageExtendedFormats, logged at creation. A minimal-host test is A10.
+assumptions are (a) 1.2, (b) shaderStorageImageExtendedFormats, and on NVIDIA (c) the optional features of D3, all logged at creation. A minimal-host test is A10.
 Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8, fp16 or bf16: the float forms hold every int8 value and
 x - zero point exactly, and their float32 sums are the same integers while every partial sum is below 2^24. The bound (per output channel, max
@@ -221,11 +221,11 @@ layer at a time on both APIs (independent launches between barriers).
 AMD and Intel matrix hardware is reached through Vulkan cooperative matrices: any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
 the size can be required, else the driver's own. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to
 them (no cooperative vectors in the retail runtime; AMD's and Intel's are device-creation or vendor-driver extensions), so dot4.
-Crash safety for CUDA (the one rung that depends on vendor-specific launches): before the first use in a process an "attempts" file, named by device,
-adapter and driver file time, is counted up; it is removed when ten recordings have completed, or on an orderly end, and kept after a failed
-self-check or a device removal. At two, the rung is not used (one line in the log, `NFRUX_IGNORE_MARKERS`). No folder: not used. A device loss in the
-game's process cannot be recovered and is not claimed to be. The cooperative-matrix and dot4 rungs are plain API use and have only the self-check.
-
+Crash safety, for what depends on vendor-specific launches (CUDA on both APIs) or on features the game may not have enabled (the NVIDIA default on the OptiScaler route): before the first use in a process an "attempts" file, named by
+device and driver file time, is counted up; it is removed when 40 recordings have completed since the network first ran at its real size (the 64-wide self-check does not count), or on an orderly end, and kept after a failed
+self-check or a device removal. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder: not used. Both markers can be pending at once; a game closed twice in its
+first seconds has the same effect. Tested with a process that ends at the first real run. A device loss in the game's process cannot be recovered and is not claimed to be. A network made in place of one that could not be created at
+the real size has not been self-checked itself (the rung was: 64 wide). Where the features are known enabled, the cooperative-matrix and dot4 rungs are plain API use and have only the self-check.
 **D4. Optical flow.** The compute block match the network was trained with, everywhere. NVIDIA's optical flow hardware was measured (A12,
 offline, VK_NV_optical_flow, same network, 70 held-out pairs): 0.65 dB worse at 3x, 0.11 at 5x, 0.34 at 6x, 0.05 better at 4x. Idle RTX 4070: it takes
 0.44 to 0.85 ms at 720p and 0.68 to 1.77 ms at 1080p (its three levels, its own engine); the block match costs 0.12 to 0.2 ms of shader time. It fails this section's earlier rule (within 0.05 dB), so it is not delivered, not even opt-in: it would also need the command

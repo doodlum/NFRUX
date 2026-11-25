@@ -590,6 +590,45 @@ namespace
             total += want.size();
             ctx.Destroy(rb);
         }
+        // Three networks a layer at a time, each its own input and outputs, each against its own reference.
+        if (time)
+        {
+            std::vector<std::unique_ptr<nfrux::CudaVulkanGraph>> g3;
+            std::vector<nfrux::CudaVulkanGraph::Buffer> bi(3), bo(6);
+            std::vector<std::map<uint32_t, std::vector<int8_t>>> want(3);
+            nfrux::CudaVulkanGraph* p3[3];
+            uint64_t a3[3], o3[3][2];
+            std::vector<Buffer> ups;
+            for (int k = 0; k < 3; ++k)
+            {
+                g3.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error));
+                if (!g3.back()) return printf("  CUDA on Vulkan, three: %s\n", error.c_str()), false;
+                p3[k] = g3.back().get();
+                auto ins = inputs;
+                for (auto& [b, v] : ins) { std::mt19937 r(77 + k); for (auto& x : v) x = int8_t(r()); }
+                if (!ffx_ml::RunReference(model.desc, ins, want[k], &error)) return false;
+                bi[k] = g->MakeBuffer(up.size, false), a3[k] = bi[k].address;
+                for (int i = 0; i < 2; ++i) bo[k * 2 + i] = g->MakeBuffer(want[k].at(g->outputBinding(i)).size(), false), o3[k][i] = bo[k * 2 + i].address;
+                ups.push_back(ctx.CreateBuffer(up.size));
+                memcpy(ups.back().mapped, ins.begin()->second.data(), up.size);
+            }
+            submit([&] { for (int k = 0; k < 3; ++k) { VkBufferCopy c = {0, 0, up.size}; vkCmdCopyBuffer(cmd, ups[k].buffer, bi[k].buffer, 1, &c); } nfrux::CudaVulkanGraph::Record(cmd, p3, a3, o3, 3, pitch); });
+            size_t bad3 = 0, all3 = 0;
+            for (int k = 0; k < 6; ++k)
+            {
+                const auto& w = want[k / 2].at(g->outputBinding(k % 2));
+                Buffer rb = ctx.CreateBuffer(w.size());
+                submit([&] { VkBufferCopy c = {0, 0, w.size()}; vkCmdCopyBuffer(cmd, bo[k].buffer, rb.buffer, 1, &c); });
+                for (size_t b = 0; b < w.size(); ++b) bad3 += static_cast<int8_t*>(rb.mapped)[b] != w[b];
+                all3 += w.size();
+                ctx.Destroy(rb);
+            }
+            printf("  CUDA kernels on Vulkan, three inputs interleaved %12s %s  mismatches %zu/%zu\n", "", bad3 ? "FAIL  " : "EXACT ", bad3, all3);
+            bad += bad3;
+            for (auto& b : bi) g->Destroy(b);
+            for (auto& b : bo) g->Destroy(b);
+            for (auto& b : ups) ctx.Destroy(b);
+        }
         double ms1 = 0, ms3 = 0;
         if (time)
         {

@@ -449,10 +449,11 @@ D3D12 with that OptiScaler build (d6b02459), sample 1280x701, 4x, 500 frames, 4 
 in the access violation; with LogLevel=2 and no file NFRUX's four do, and the other provider's four fail too (two of them may be this session's kills). So the crash depends on OptiScaler's own timing or logging, whichever provider is
 selected; the cause is not found. 2x and 6x with LogLevel=0, one start each, 700 frames (a87945a's build): 427 and 805 fps, exit 0.
 
-# CUDA kernels on Vulkan, batches interleaved (2026-11-25, RTX 4070)
+# CUDA kernels on Vulkan, batches interleaved (2026-11-25, RTX 4070; cd6be72, shipped build unless said; "before" is 69c8586)
 
 Conformance: exact on five inputs at 744x464 and 992x544. GPU time a network: 744x464 0.183 ms (three interleaved 0.118 each) against fp16 cooperative matrix 0.26; 992x544 0.229 (0.189) against 0.37-0.38 (0.36 interleaved).
-(The interleaved figure has three networks writing one output buffer with the same bytes.)
+(The timed interleaved figure has three networks writing one output buffer. Exactness of interleaving: three networks with three inputs and their own outputs on Vulkan, 0 of 2,071,296 bytes against their references; and strict
+6x batches at 720p, CUDA against the integer network, every output and intermediate identical on D3D12 and on Vulkan.)
 `ngx_harness --time` (submitted and waited for, medians, ms a rendered frame, 1280x701):
 
 | | 2x | 4x | 6x |
@@ -460,5 +461,9 @@ Conformance: exact on five inputs at 744x464 and 992x544. GPU time a network: 74
 | Vulkan before / after | 1.13 / 0.98 | 2.53 / 2.08 | 3.98 / 3.19 |
 | D3D12 before / after | 0.81 / 0.81 | 2.07 / 1.85 | 3.26 / 2.92 |
 
-Harness 158 checks, strict 63 of 63 identical; Vulkan validation and D3D12 debug layer 0 messages; every rung forced 78 of 78; injected failures go CUDA, fp16, int8, dot4, scalar; soak 1000 flat; replays 6x and 4K: strict 0 bytes.
+Wall time with a submission and a wait for each evaluate, machine otherwise idle.
+Harness 158 checks with CUDA on both APIs, strict 63 of 63 identical; Vulkan validation and D3D12 debug layer 0 messages (they see the launches, not the memory the kernels touch: exactness is what supports those); every rung forced 78 of 78; injected failures go CUDA, fp16, int8, dot4, scalar; soak 1000 flat; replays 6x and 4K: strict 0 bytes.
 Not run: the loader's new extension and the OptiScaler route in the sample (no windows opened).
+
+After the review: the markers wait for the real size. A process ended at the first full-size run, twice: the third start uses fp16 cooperative matrix (Vulkan) / dot4 (D3D12), said in the log. Two sample launches on Vulkan (loader; OptiScaler)
+presented 1x: Streamline created the feature and never evaluated it (no interpolation line in its log); focus is the likely cause, not shown. So the sample has not exercised CUDA on Vulkan.

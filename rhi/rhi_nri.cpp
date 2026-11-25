@@ -114,6 +114,7 @@ struct NetN : Network
     std::unique_ptr<ffx_ml::Graph> vk;
     std::unique_ptr<BufN>          in, out[2];  // params, gate
     std::unique_ptr<TexN>          tex[2];
+    uint32_t                       width = 0;  // the input's; the self-check's is 64
     uint32_t                       pitch = 0, order[2] = {0, 1};  // D3D12: which of out[] the graph's output i is
 };
 
@@ -502,6 +503,7 @@ public:
             what = net->cuda ? "CUDA kernels, int8 tensor cores" : dot4 ? "shader model 6.4 packed dot product" : "shader model 6.0 integers";
             for (uint32_t i = 0; i < 2; ++i) net->order[i] = (net->cuda ? net->cuda->outputBinding(i) : net->d3d->outputBinding(i)) == mb.params ? 0 : 1;
         }
+        net->width = w;
         net->pitch = isVk ? w / 2 * 4 : (w / 2 * 4 + 255) & ~255u;
         auto make = [&](uint32_t i, uint64_t size) {
             if (!net->cudaVk) return MakeBuf(size);
@@ -787,7 +789,11 @@ public:
     }
     void RunNetworks(Network* const* nets, uint32_t count) override
     {
-        if (!ran) ran = true, firstRun = finished;
+        // The markers wait for the real size: the self-check's network is 64 wide, and a driver may take that and not the other.
+        bool real = false;
+        for (uint32_t i = 0; i < count; ++i) real = real || static_cast<NetN&>(*nets[i]).width > 64;
+        if (real && !ran) ran = true, firstRun = finished;
+        if (real && Env("NFRUX_TEST_DIE_AT_RUN")) TerminateProcess(GetCurrentProcess(), 99);  // as a driver crash would
         for (uint32_t i = 0; i < count; ++i)
         {
             auto& x = static_cast<NetN&>(*nets[i]);

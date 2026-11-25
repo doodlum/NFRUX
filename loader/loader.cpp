@@ -264,7 +264,7 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     }
     // CUDA kernels (NVIDIA): the launch extension and buffer addresses.
     VkPhysicalDeviceBufferDeviceAddressFeatures ba = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
-    const bool cuda = s12.bufferDeviceAddress && device(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+    const bool cuda = s12.bufferDeviceAddress && device(VK_NVX_BINARY_IMPORT_EXTENSION_NAME) && !has("VK_EXT_buffer_device_address");  // (the old extension and the core feature exclude each other)
     if (cuda)
     {
         if (!has(VK_NVX_BINARY_IMPORT_EXTENSION_NAME)) ext.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
