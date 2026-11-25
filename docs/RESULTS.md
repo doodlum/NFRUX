@@ -109,3 +109,14 @@ Time a network, 40 back to back, idle RTX 4070: 744x464 CUDA 0.155 ms, dot4 0.42
 
 In the sample at 1280x701 (900 frames, fps presented): 2x 384 -> 462, 4x 572 -> 736, 6x 623 -> 889. Parity with Vulkan unchanged (0 bytes; 6x 720p and
 4x 1080p from 720p RGB10A2). Crash markers (core/marker.cpp) guard the rung; their failure path has not been exercised.
+## A6 OptiScaler (2026-11-25, Streamline_Sample copy, no NFRUX loader)
+
+| OptiScaler | route | API | result |
+|---|---|---|---|
+| 0.9.5 release | `dlssg_to_fsr3_amd_is_better.dll` slot (FGInput / FGOutput=nukems) | D3D12 | 700 frames, 2x presented, CUDA network, 456 fps |
+| 0.9.5 release | same | Vulkan | 700 frames, 2x presented: 304 fps on the integer network (features unknown), 420 fps with NFRUX_VK_ASSUME_FEATURES=1 (cooperative matrix) |
+| a build with FGNvngxReplacement | `OptiScaler\custom\NFRUX\dlssg\nvngx_dlssg.dll`, FGNvngxReplacement=NFRUX | Vulkan | 900 frames, 2x and 4x presented |
+| same | same | D3D12 | loads NFRUX (5 generated frames at most), then the sample crashes in ntdll; it crashes the same way with FGInput=nofg, so without NFRUX in use: OptiScaler's build and this sample |
+
+Found: OptiScaler hands back its own handle object with NFRUX's id: features are now looked up by id.
+Not done: 1000 evaluates as A6 asks, the custom route on D3D12, multipliers above 2x on 0.9.5, an OptiScaler master build.

@@ -25,7 +25,7 @@ uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
 bool     g_vkAtomic64 = false, g_vkKnown = false;
 VkDevice g_vkDevice = VK_NULL_HANDLE;
 struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
-std::map<const NgxHandle*, std::unique_ptr<Feature>> g_features;
+std::map<unsigned, std::unique_ptr<Feature>> g_features;  // by id: callers may hand back their own handle object with it (OptiScaler)
 std::map<void*, std::shared_ptr<FrameGenerator>> g_warm;  // released features' generators, by host device, for the next create
 unsigned g_next = 0x4e460001;
 
@@ -67,14 +67,16 @@ NgxResult Add(void* host, bool vulkan, NgxHandle** out)
     else if (auto dev = vulkan ? DeviceForVk() : CreateNriD3D12Device(static_cast<ID3D12Device*>(host)))
         f->fg = std::make_shared<FrameGenerator>(std::move(dev), vulkan);
     else return kNgxPlatformError;
-    *out      = &f->handle;
+    *out      = new NgxHandle(f->handle);  // the caller's; never freed, as callers may read or write it after release
     Log("feature %x created (%s)", f->handle.Id, vulkan ? "Vulkan" : "D3D12");
-    g_features[&f->handle] = std::move(f);
+    const unsigned id = f->handle.Id;
+    g_features[id] = std::move(f);
     return kNgxSuccess;
 }
 Feature* Find(const NgxHandle* h)
 {
-    auto it = g_features.find(h);
+    if (!h) return nullptr;
+    auto it = g_features.find(h->Id);
     return it == g_features.end() ? nullptr : it->second.get();
 }
 
@@ -155,7 +157,7 @@ NgxResult Release(NgxHandle* h)
     Feature* f = Find(h);
     if (!f) return kNgxFeatureNotFound;
     g_warm[f->host] = f->fg;
-    g_features.erase(h);
+    g_features.erase(h->Id);
     Log("feature released");
     return kNgxSuccess;
 }
