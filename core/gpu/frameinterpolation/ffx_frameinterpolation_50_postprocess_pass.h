@@ -23,7 +23,7 @@ FFX_MIN16_F2 LoadMotionQMVD(int32_t2 pixel, out bool dynamic_oob_hole)
     FfxUInt32 packed = LoadWarpedMotionQDataTP1(pixel);
     dynamic_oob_hole = (packed == 0x7FFFFFFFu);
     float2 motion    = dqFloatMv(packed);
-    motion += mix(float2(0.0f), float2(0.001f), step(0.5f, float(packed)));
+    motion += float2(0.001f) * step(0.5f, float(packed));
     motion *= float2(1.0f) / float2(MvDepthLaneSize());
     return FFX_MIN16_F2(motion) * FFX_MIN16_F(!dynamic_oob_hole);
 }
@@ -33,7 +33,7 @@ FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor)
     // Subtract the max value to help reduce overflow issues
     FFX_MIN16_F4 stable_ten     = tensor - max4(tensor);
     FFX_MIN16_F4 e_ten          = exp2(stable_ten * 1.44269504088896340736f);
-    FFX_MIN16_F  sum            = dot(e_ten, FFX_MIN16_F4(1.0f));
+    FFX_MIN16_F  sum            = ((e_ten.x + e_ten.y) + e_ten.z) + e_ten.w;
     FFX_MIN16_F4 smax_activated = e_ten / (sum + HALF_MIN);
     return smax_activated;
 }

@@ -41,7 +41,7 @@ FFX_STATIC const FfxFloat32 fReconstructedDepthBilinearWeightThreshold = FFX_ARM
 
 FfxFloat32 RGBToLuma(FfxFloat32x3 fLinearRgb)
 {
-    return dot(fLinearRgb, FfxFloat32x3(0.2126f, 0.7152f, 0.0722f));
+    return (fLinearRgb.x * 0.2126f + fLinearRgb.y * 0.7152f) + fLinearRgb.z * 0.0722f;
 }
 
 FfxFloat32 LinearRec2020ToLuminance(FfxFloat32x3 linearRec2020RGB)

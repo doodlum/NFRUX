@@ -118,7 +118,7 @@ FFX_MIN16_F2 LoadMotionQMVD(int32_t2 pixel, out bool dynamic_oob_hole)
     FfxUInt32 packed = LoadWarpedMotionQDataTP1(pixel);
     dynamic_oob_hole = (packed == 0x7FFFFFFFu);
     float2 motion    = dqFloatMv(packed);
-    motion += mix(float2(0.0f), float2(0.001f), step(0.5f, float(packed)));
+    motion += float2(0.001f) * step(0.5f, float(packed));
     motion *= float2(1.0f) / float2(MvDepthLaneSize());
     return FFX_MIN16_F2(motion) * FFX_MIN16_F(!dynamic_oob_hole);
 }

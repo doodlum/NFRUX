@@ -71,7 +71,7 @@ Runs of 500-700 frames; no crash. Not the 5-minute, validation or 6x-Vulkan-on-t
 Same script on both APIs, frames paired by the rendered image (`tests/compare_sample.py`): the rendered (HUD-less) inputs of the two
 APIs match at 31.4 dB (the sample's renderers differ: ray-traced shadows, foliage, reflections), the generated frames outside the UI at
 34.6-34.8 dB, so the interpolation adds no difference of its own; visually matching. A5's bar of 35 dB is missed by 0.2-0.4 dB, with the
-"no more than 1 dB below the inputs" part met. The cross-replay part of A5 is not done.
+"no more than 1 dB below the inputs" part met. The cross-replay part of A5: see the end of this file.
 ## A2 formats and 4K (2026-11-25, after the NRI teardown fix)
 
 NRI built without Agility SDK, NVAPI, AGS, NVTX (its wrapped-device teardown crashed with them on). D3D12 (NRI) against Vulkan (NRI), 4x, 5 frames: RGB10A2, BGRA8, inverted depth, 4K from 1440p, 4K from 1080p RGB10A2: 0 bytes differ. RGBA16F scRGB (+ inverted, 1080p from 720p): PSNR >= 116 dB over the raw bytes, no byte off by more than 1.
@@ -120,3 +120,20 @@ In the sample at 1280x701 (900 frames, fps presented): 2x 384 -> 462, 4x 572 -> 
 
 Found: OptiScaler hands back its own handle object with NFRUX's id: features are now looked up by id.
 Not done: 1000 evaluates as A6 asks, the custom route on D3D12, multipliers above 2x on 0.9.5, an OptiScaler master build.
+
+## A5 cross-replay: the sample's real inputs through both APIs (2026-11-25, RTX 4070)
+
+Recorded on each API (`NFRUX_DUMP=300`, scripted camera): HUD-less colour, depth, motion vectors, matrices, 1280x701,
+frames 2-7 of each recording (frame 1 was skipped by the sample's frame number, frame 0 unused). Each recording is then
+played through D3D12 and Vulkan (`parity --first 2 --replay DIR --frames 6 --gen N`).
+
+- First run: **not** identical (78 dB, 0.06% of bytes off, at most 0.00004% by more than 1). The synthetic scenes hid it:
+  their camera matrices are too simple. First differing pass: the motion-vector hints. The cause is in the class "opaque
+  products" (matrix * vector, dot, mix, length): neither `precise` nor NoContraction fixes how a driver fuses inside them, and
+  the two APIs' compilers differ. (The hints pass was fixed and everything else in the class at the same time, so which
+  single operation caused each difference was not isolated.)
+- Fix: all of them written out, and `build_shaders.py` now refuses a pass that contains one.
+- After: **0 bytes different** in every intermediate and every generated frame, both recordings, 2x, 4x and 6x (5, 15, 25
+  generated frames each). The synthetic cases still are too (1080p, 4K, inverted depth, RGB10A2; 2x and 6x).
+
+Not covered: HDR recordings, render size below display size from a real recording, other GPUs.

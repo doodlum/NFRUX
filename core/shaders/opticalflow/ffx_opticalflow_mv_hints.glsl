@@ -38,7 +38,7 @@ FFX_MIN16_F2 CalculateCameraMotion(FfxFloat32x2 uv, FfxFloat32 depth, FfxFloat32
     // Calculate "camera motion vectors" based on camera motion via ViewProjection mat. Fails for animated objects
     FfxFloat32x2 uvT = FfxFloat32x2(uv.x, 1.0f - uv.y);
     FfxFloat32x4 clip = FfxFloat32x4(2.0f * uvT - 1.0f, depth, 1.0f);
-    FfxFloat32x4 reproj = MotionMat * clip;
+    FfxFloat32x4 reproj = FFX_TRANSFORM_VECTOR(MotionMat, clip);
     FfxFloat32x2 uvProj = ((reproj.xy / reproj.w) + 1.0f) * 0.5f;
 
     FFX_MIN16_F2 velocity = FFX_MIN16_F2(uvT - uvProj);

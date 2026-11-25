@@ -93,6 +93,30 @@ static void Encode(Frame& f)
 }
 
 static bool g_vulkan;
+// --replay DIR: the recorded frames of the sample (NFRUX_DUMP) instead of the synthetic ones.
+static std::string g_replay; static uint32_t g_first = 0;
+struct Rec { float mv[2], jitter[2], nearZ, farZ, fov, clip[16]; int inverted, reset, ortho; } g_rec;
+static bool Load(uint32_t i, Frame& f, bool sizes)
+{
+    i += g_first;
+    FILE* p = fopen((g_replay + "\\params_f" + std::to_string(i) + ".txt").c_str(), "r");
+    if (!p) return false;
+    uint32_t w, h, dw, dh, mw, mh, fmt, n;
+    bool ok = fscanf(p, "%u %u %u %u %u %u %u", &w, &h, &dw, &dh, &mw, &mh, &fmt) == 7 &&
+              fscanf(p, "%f %f %f %f %f %f %f %d %d %d %u", &g_rec.mv[0], &g_rec.mv[1], &g_rec.jitter[0], &g_rec.jitter[1], &g_rec.nearZ, &g_rec.farZ, &g_rec.fov, &g_rec.inverted, &g_rec.reset, &g_rec.ortho, &n) == 11;
+    for (float& x : g_rec.clip) ok = ok && fscanf(p, "%f", &x) == 1;
+    fclose(p);
+    if (!ok || dw != mw || dh != mh) return false;
+    if (sizes) { g.w = w, g.h = h, g.rw = dw, g.rh = dh, g.format = 1, g.inverted = g_rec.inverted != 0; return true; }
+    auto read = [&](const char* what, void* to, size_t bytes) {
+        FILE* q = fopen((g_replay + "\\" + what + "_" + std::to_string(w) + "x" + std::to_string(h) + "_f" + std::to_string(i) + "_k1.bin").c_str(), "rb");
+        const bool r = q && fread(to, 1, bytes, q) == bytes;
+        if (q) fclose(q);
+        return r;
+    };
+    f.color.resize(size_t(w) * h * 4), f.depth.resize(size_t(dw) * dh), f.motion.resize(size_t(dw) * dh * 2);
+    return read("hudless", f.color.data(), f.color.size()) && read("depth", f.depth.data(), f.depth.size() * 4) && read("motion", f.motion.data(), f.motion.size() * 2);
+}
 static FrameInputs Inputs(const ExternalImage* im, bool first)
 {
     FrameInputs in;
@@ -117,18 +141,45 @@ static Settings MakeSettings(const ExternalImage& color)
 static bool Run(Device& dev, const ExternalImage* im, const std::function<void(const Frame&)>& upload, const std::function<void(const std::function<bool(void*)>&)>& submit, Results& out)
 {
     std::string error;
+    float vp[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     auto ip = Interpolator::Create(dev, MakeSettings(im[0]), &error);
     if (!ip) return printf("  create failed: %s\n", error.c_str()), false;
     bool ok = true;
     for (uint32_t i = 0; i < g.frames; ++i)
     {
-        Frame src = Make(g.w, g.h, g.rw, g.rh, float(i));
-        Encode(src);
+        Frame src;
+        if (!g_replay.empty()) { if (!Load(i, src, false)) return printf("  recording: frame %u missing\n", i), false; }
+        else src = Make(g.w, g.h, g.rw, g.rh, float(i)), Encode(src);
         upload(src);
+        FrameInputs fi = Inputs(im, i == 0);
+        if (!g_replay.empty())
+        {
+            // VP chained from ClipToPrevClip as the front end does (column major, inverse of the recorded matrix times the last).
+            fi.mvScale[0] = g_rec.mv[0] * float(g.w) / float(g.rw), fi.mvScale[1] = g_rec.mv[1] * float(g.h) / float(g.rh);
+            fi.cameraNear = g_rec.nearZ, fi.cameraFar = g_rec.farZ, fi.fovY = g_rec.fov;
+            if (i)
+            {
+                double a[4][8] = {};
+                for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) a[r][c] = g_rec.clip[c * 4 + r], a[r][4 + c] = r == c;
+                for (int k = 0; k < 4; ++k)
+                {
+                    int pv = k;
+                    for (int r = k + 1; r < 4; ++r) if (fabs(a[r][k]) > fabs(a[pv][k])) pv = r;
+                    std::swap(a[k], a[pv]);
+                    const double d = a[k][k];
+                    for (double& x : a[k]) x /= d;
+                    for (int r = 0; r < 4; ++r) if (r != k) { const double q = a[r][k]; for (int c = 0; c < 8; ++c) a[r][c] -= q * a[k][c]; }
+                }
+                float n[16];
+                for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) { double s = 0; for (int k = 0; k < 4; ++k) s += a[r][4 + k] * vp[c * 4 + k]; n[c * 4 + r] = float(s); }
+                memcpy(vp, n, sizeof(vp));
+            }
+            memcpy(fi.viewProjection, vp, sizeof(vp));
+        }
         std::vector<std::pair<std::string, std::shared_ptr<std::vector<uint8_t>>>> got;
         submit([&](void* cmd) {
             if (!dev.BeginFrame(cmd)) return ok = false;
-            ok = ip->Dispatch(Inputs(im, i == 0), g.gen, g.gen) && ok;
+            ok = ip->Dispatch(fi, g.gen, g.gen) && ok;
             if (i)
             {
                 for (auto& [name, t] : ip->Intermediates())
@@ -352,6 +403,8 @@ int main(int argc, char** argv)
         else if (a == "--frames") g.frames = atoi(argv[++i]);
         else if (a == "--gen") g.gen = atoi(argv[++i]);
         else if (a == "--format") g.format = atoi(argv[++i]);
+        else if (a == "--first") g_first = uint32_t(atoi(argv[++i]));  // before --replay
+        else if (a == "--replay") { Frame x; g_replay = argv[++i]; if (!Load(0, x, true)) return puts("no recording"), 1; }
         else if (a == "--inverted") g.inverted = true;
         else if (a == "--dump") g.dump = argv[++i];
         else which.push_back(a);
@@ -369,7 +422,7 @@ int main(int argc, char** argv)
         double sum = 0;
         uint32_t cnt = 0;
         for (uint32_t i = 1; i < g.frames && ok; ++i)
-            for (uint32_t k = 0; k < g.gen; ++k)
+            for (uint32_t k = 0; k < g.gen && g_replay.empty(); ++k)
             {
                 const auto& o = r["frame" + std::to_string(i) + "_gen" + std::to_string(k)];
                 const Frame t = Make(g.w, g.h, 16, 16, float(i - 1) + float(k + 1) / float(g.gen + 1));

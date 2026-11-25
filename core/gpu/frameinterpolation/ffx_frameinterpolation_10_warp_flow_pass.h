@@ -50,7 +50,7 @@ float LoadDilatedDepthTap3x3(int32_t2 pos, int32_t2 offset, int32_t2 depth_size,
 #else
     float non_valid_depth = 1.0f;
 #endif
-    return mix(non_valid_depth, texelFetch(depth_texture, clamped_sample_pos, 0).x, valid_sample);
+    return non_valid_depth * (1.0f - valid_sample) + texelFetch(depth_texture, clamped_sample_pos, 0).x * valid_sample;
 }
 
 float LoadDilatedDepthTap3x3(int32_t2 pos, int32_t2 offset, int32_t2 depth_size, highp texture2D depth_texture)
@@ -188,7 +188,7 @@ half2 CalculateCameraMotion(float2 uv, float depth, mat4 MotionMat, out half mas
 
     float2 uvT    = float2(uv.x, 1.0f - uv.y);
     float4 clip   = float4(2.0f * uvT - 1.0f, depth, 1.0f);
-    float4 reproj = MotionMat * clip;
+    float4 reproj = FFX_TRANSFORM_VECTOR(MotionMat, clip);
 
     bool invalid = reproj.w <= 1e-6f || any(isnan(reproj)) || any(isinf(reproj));
     mask         = half(invalid);

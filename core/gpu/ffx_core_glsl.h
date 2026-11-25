@@ -121,7 +121,15 @@ precision highp int;
 /// A define for abstracting vector transformations between shading languages.
 ///
 /// @ingroup GLSLCore
-#define FFX_TRANSFORM_VECTOR(a, b) (a * b)
+// Written out: the fusing inside a matrix product is the driver's choice, and D3D12 and Vulkan choose differently.
+#define FFX_TRANSFORM_VECTOR(a, b) ((((a)[0] * (b).x + (a)[1] * (b).y) + (a)[2] * (b).z) + (a)[3] * (b).w)
+float nfruxLength(vec2 v) { return sqrt(v.x * v.x + v.y * v.y); }
+float nfruxLength(vec3 v) { return sqrt((v.x * v.x + v.y * v.y) + v.z * v.z); }
+#define length nfruxLength
+float nfruxDot(vec2 a, vec2 b) { return a.x * b.x + a.y * b.y; }
+float nfruxDot(vec3 a, vec3 b) { return (a.x * b.x + a.y * b.y) + a.z * b.z; }
+float nfruxDot(vec4 a, vec4 b) { return ((a.x * b.x + a.y * b.y) + a.z * b.z) + a.w * b.w; }
+#define dot nfruxDot
 
 /// A define for abstracting modulo operations between shading languages.
 ///
@@ -570,7 +578,7 @@ FfxUInt32 ffxBitfieldInsertMask(FfxUInt32 src, FfxUInt32 ins, FfxUInt32 bits)
 /// @ingroup GLSLCore
 FfxFloat32 ffxLerp(FfxFloat32 x, FfxFloat32 y, FfxFloat32 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -590,7 +598,7 @@ FfxFloat32 ffxLerp(FfxFloat32 x, FfxFloat32 y, FfxFloat32 t)
 /// @ingroup GLSLCore
 FfxFloat32x2 ffxLerp(FfxFloat32x2 x, FfxFloat32x2 y, FfxFloat32 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -610,7 +618,7 @@ FfxFloat32x2 ffxLerp(FfxFloat32x2 x, FfxFloat32x2 y, FfxFloat32 t)
 /// @ingroup GLSLCore
 FfxFloat32x2 ffxLerp(FfxFloat32x2 x, FfxFloat32x2 y, FfxFloat32x2 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -630,7 +638,7 @@ FfxFloat32x2 ffxLerp(FfxFloat32x2 x, FfxFloat32x2 y, FfxFloat32x2 t)
 /// @ingroup GLSLCore
 FfxFloat32x3 ffxLerp(FfxFloat32x3 x, FfxFloat32x3 y, FfxFloat32 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -650,7 +658,7 @@ FfxFloat32x3 ffxLerp(FfxFloat32x3 x, FfxFloat32x3 y, FfxFloat32 t)
 /// @ingroup GLSLCore
 FfxFloat32x3 ffxLerp(FfxFloat32x3 x, FfxFloat32x3 y, FfxFloat32x3 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -670,7 +678,7 @@ FfxFloat32x3 ffxLerp(FfxFloat32x3 x, FfxFloat32x3 y, FfxFloat32x3 t)
 /// @ingroup GLSLCore
 FfxFloat32x4 ffxLerp(FfxFloat32x4 x, FfxFloat32x4 y, FfxFloat32 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the linear interopation between two values.
@@ -690,7 +698,7 @@ FfxFloat32x4 ffxLerp(FfxFloat32x4 x, FfxFloat32x4 y, FfxFloat32 t)
 /// @ingroup GLSLCore
 FfxFloat32x4 ffxLerp(FfxFloat32x4 x, FfxFloat32x4 y, FfxFloat32x4 t)
 {
-    return mix(x, y, t);
+    return x * (1.0f - t) + y * t;
 }
 
 /// Compute the maximum of three values.

@@ -279,6 +279,19 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         if (in.index <= 1)
         {
             add("back", back);
+            if (in.depth && in.motion)  // in known formats, through the cut-out pass
+            {
+                const Rect dr = in.depthRect.w ? in.depthRect : Rect{0, 0, in.depth.width, in.depth.height}, mr = in.motionRect.w ? in.motionRect : Rect{0, 0, in.motion.width, in.motion.height};
+                if (const Texture* t = Crop(in.depth, dr, true)) add("depth", *t);
+                if (const Texture* t = Crop(in.motion, mr, false)) add("motion", *t);
+                if (FILE* pf = fopen((std::string(Env("NFRUX_DUMP_DIR") ? Env("NFRUX_DUMP_DIR") : ".") + "\\params_f" + std::to_string(rendered - dumpAt) + ".txt").c_str(), "w"))
+                {
+                    fprintf(pf, "%u %u %u %u %u %u %u\n", in.back.width, in.back.height, dr.w, dr.h, mr.w, mr.h, in.back.format);
+                    fprintf(pf, "%.9g %.9g %.9g %.9g %.9g %.9g %.9g %d %d %d %u\n", in.mvScale[0], in.mvScale[1], in.jitter[0], in.jitter[1], in.cameraNear, in.cameraFar, in.fovY, in.depthInverted, in.reset, in.ortho, in.count);
+                    for (float x : in.clipToPrevClip) fprintf(pf, "%.9g ", x);
+                    fclose(pf);
+                }
+            }
             if (in.hudless) add("hudless", *m_dev.Wrap(in.hudless, false));
         }
         add("gen", out);

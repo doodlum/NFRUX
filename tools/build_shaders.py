@@ -87,6 +87,8 @@ def precise(path, name):
         op, n = w[i] & 0xffff, w[i] >> 16
         if op == 17 and w[i + 1] in BANNED:
             raise RuntimeError(f"{name}: declares {BANNED[w[i + 1]]}")
+        if 143 <= op <= 148 or (op == 12 and w[i + 4] in (46, 50, 66, 67, 69)):  # products, mix, fma, length, normalize: each API's compiler fuses them its own way
+            raise RuntimeError(f"{name}: opaque operation {op, w[i + 4] if op == 12 else 0}; write it out")
         if op == 71 and w[i + 2] == 42:
             has.add(w[i + 1])
         if first is None and 19 <= op <= 39:  # the first type declaration: annotations end here
@@ -106,6 +108,7 @@ def build(job):
     b = os.path.join(out, n)
     run([GLSLANG, "-V", "--target-env", "vulkan1.1", "-S", "comp", *F32, *defs, f"-D{inv}={v}", "-Igpu", "-Igpu/opticalflow",
          "-Igpu/frameinterpolation", "-Ishaders/opticalflow", "-o", b + ".spv", src + ".glsl"])
+    run([tool("spirv-opt"), "--eliminate-dead-functions", b + ".spv", "-o", b + ".spv"])
     precise(b + ".spv", n)
     run([tool("spirv-val"), "--target-env", "vulkan1.1", b + ".spv"])
     run([XCROSS, b + ".spv", "--hlsl", "--shader-model", "62" if sm >= 62 else "60", *(["--hlsl-enable-16bit-types"] if sm >= 62 else []),
