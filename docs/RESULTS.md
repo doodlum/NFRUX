@@ -403,3 +403,32 @@ without the flag included. Sample, 900 frames at 1920x1080 4x: both APIs. The lo
 - Sample, 1200 frames at 1920x1080, D3D12 CUDA: 2x 315 fps, 4x 558, 6x 694. OptiScaler 0.9.5 with this DLL: Vulkan 2x (288 fps); D3D12 CUDA 2x in 4 of 5 starts (378-403 fps); one start presented 1x for its whole
   length with the feature created; the cause is not shown (no focus line in the log). An earlier start in dot4 was 2x.
 - The 1x OptiScaler start on D3D12 did not come back: 12 further starts (6 under the first one's conditions, window focus sampled every 0.4 s and held), 2x in all 12. Cause still not shown.
+
+# Debug layers, and NFRUX beside DLSS-G (2026-11-25)
+
+D3D12 debug layer (Graphics Tools; `tools\run_d3d12_debug.ps1`). Control: a harness with a wrong input state gives 1,094 messages. Harness, right states: 0 on COMPUTE and on DIRECT lists
+(CUDA; dot4 and scalar on COMPUTE), 0 with GPU-based validation (CUDA, dot4). The sample with `-debug`, messages logged by NFRUX (`NFRUX_TEST_D3D12_MESSAGES`): 0 errors in six runs (2x, 4x, 6x, two each).
+The sample found what the harness had not, all fixed:
+- the disable word is in COPY_DEST, not UNORDERED_ACCESS (error 527);
+- tagged inputs are not transitioned by Streamline (errors 538, 527): DESIGN section 4, States;
+- the self-check's readback buffer was released when the completion token was seen, before the host's list had ended (error 921, corruption; the run then stopped with a fence timeout). It may be the
+  cause of the one bad OptiScaler start; not shown;
+- on DIRECT lists NRI's shader-resource state is 0xC0 and the host's 0x40 (568 messages in the harness before the fix, and in the sample when Streamline's list type changes).
+NVIDIA's own DLSS-G gives 0 errors too; its kernels are launched outside the layer's sight, so that does not show its states.
+
+Vulkan (Khronos + synchronisation) in the sample, 1500 frames: 4x and 2x give eight classes of message; NVIDIA's DLSS-G (2x) gives all eight and eight more. The read-after-write, leak, layout and semaphore ones
+name the sample's or Streamline's objects; none names NFRUX.
+
+After the fixes: harness 158 checks, 0 failed (strict 63 of 63 identical; minimal Vulkan host under validation 78 of 78); parity 1080p BGRA8 4x and 4K RGB10A2 2x: strict 0 bytes, shipped 97.6 dB or better; soak 1000 flat; OptiScaler
+2x on both APIs (395, 284 fps). The sample's long runs predate them.
+
+NFRUX and NVIDIA's DLSS-G (Streamline SDK's DLL through the driver's NGX core), 2x, the same inputs (`ngx_harness --replay`): a 60-frame sample recording with every second frame removed
+(vectors and matrices chained, `halve_recording.py`), the removed frames the truth; 28 frames, right of the UI, 1280x701. The scene is noisy ray tracing, so about 27 dB is near what any can reach.
+
+| | dB | SSIM | worst frame dB | opaque UI, mean difference from the frame (codes) |
+|---|---|---|---|---|
+| NFRUX | 27.33 | 0.840 | 25.84 | 0.00 |
+| DLSS-G | 27.12 | 0.831 | 25.87 | 1.72 |
+| blend | 22.85 | 0.499 | 22.25 | - |
+
+One recording, one scene, one GPU: differences of 0.2 dB are not a ranking. The UI column is the previous code (no change since touches it). Picture: `build\compare.png` (not in the repository).

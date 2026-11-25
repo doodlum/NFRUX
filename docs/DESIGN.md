@@ -90,7 +90,7 @@ OutputInterpolated is always written too. A failure is returned only for a missi
 | *Subrect{BaseX,BaseY,Width,Height} per input; InputBackbuffer* preferred over the deprecated Backbuffer* | region | whole image (or the back buffer's, same size) |
 | OutputInterpolatedSubrect*, OutputRealSubrect* | where the region goes in the output | the region's own place |
 | EvalFlags bit 0 (UpdateOnlyInsideExtents) | only the region is written: several viewports, a feature each, on one back buffer | the whole image is written (the back buffer around the region, as strips that do not overlap it) |
-| OutputDisableInterpolation | a 4-byte word: 1 when this batch holds copies only (menu, not rendering, reset failures, not ready), else 0; written at k = 1. D3D12: in UNORDERED_ACCESS. Vulkan: NGX buffer resource with TRANSFER_DST usage; a host that maps it waits for the submission | not written |
+| OutputDisableInterpolation | a 4-byte word: 1 when this batch holds copies only (menu, not rendering, reset failures, not ready), else 0; written at k = 1. D3D12: in COPY_DEST. Vulkan: NGX buffer resource with TRANSFER_DST usage; a host that maps it waits for the submission | not written |
 | BackbufferFrameID | an id that is not the last or the last + 1 restarts the history | not used |
 | DynamicResolution, InternalWidth/Height | depth and vectors resampled (nearest) to one size, the given or half the colour's, so a changing region keeps the history | the region's size |
 | InvertXAxis, InvertYAxis | negate MvecScale | 0 |
@@ -111,8 +111,11 @@ PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.
 `NVSDK_NGX_*_EvaluateFeature_C` is exported beside `EvaluateFeature`.
 
 States (DLSS-FG Programming Guide): D3D12 inputs arrive and leave in NON_PIXEL_SHADER_RESOURCE, outputs in UNORDERED_ACCESS. Vulkan outputs GENERAL; inputs
-GENERAL, or SHADER_READ_ONLY_OPTIMAL when the NGX resource is not read-write (RTX Remix). (Streamline's images were seen in COMMON and accepted in either;
-the harness holds the guide's states.) Barriers use compute-legal states only
+GENERAL, or SHADER_READ_ONLY_OPTIMAL when the NGX resource is not read-write (RTX Remix). Streamline (debug layer, 2026-11-25)
+follows that for the back buffer and outputs only: the disable word is in COPY_DEST, and tagged inputs are in the state the game left them, its copies of tags valid only
+now in COPY_DEST. Those copies are known by their debug name; other tags whose state is not NON_PIXEL_SHADER_RESOURCE are handed on by the loader as valid only now, so that
+Streamline copies them on the game's own list (RENDER_TARGET is not legal on the compute list they are read on). The OptiScaler route has no such hook: there the guide's state is assumed.
+Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
 (NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
@@ -311,7 +314,7 @@ M1-M3 do not depend on M0a.
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
 | Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
-| The D3D12 debug layer cannot run here; a host that leaves its images in COMMON instead of the guide's states would only be seen by it (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
+| (Closed 2026-11-25: Graphics Tools installed, results in RESULTS.) The D3D12 debug layer could not run here (Graphics Tools needs elevation; Agility's layers are refused by this runtime) | A4 stays partly met until it is installed or accepts the gap in writing; NRI's validation is no replacement (it does not check wrapped images' states) |
 
 ## 8. Acceptance
 
