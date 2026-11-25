@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 using namespace nfrux;
 #define NFRUX_EXPORT extern "C" __declspec(dllexport) NgxResult __cdecl
@@ -25,8 +26,9 @@ uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
 bool     g_vkAtomic64 = false, g_vkKnown = false;
 VkDevice g_vkDevice = VK_NULL_HANDLE;
 struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
-std::map<unsigned, std::unique_ptr<Feature>> g_features;  // by id: callers may hand back their own handle object with it (OptiScaler)
-std::map<void*, std::shared_ptr<FrameGenerator>> g_warm;  // released features' generators, by host device, for the next create
+// Never destroyed: at process exit the devices may be gone already.
+auto& g_features = *new std::map<unsigned, std::unique_ptr<Feature>>;  // by id: callers may hand back their own handle object with it (OptiScaler)
+auto& g_warm = *new std::map<void*, std::shared_ptr<FrameGenerator>>;  // released features' generators, by host device, for the next create
 unsigned g_next = 0x4e460001;
 
 uint32_t MaxFrames()
@@ -156,10 +158,13 @@ NgxResult Eval(void* cmd, const NgxHandle* h, NgxParameter* p)
 }
 NgxResult Release(NgxHandle* h)
 {
+    std::shared_ptr<FrameGenerator> dead;  // destroyed after the lock
     std::lock_guard<std::mutex> lock(g_mutex);
     Feature* f = Find(h);
     if (!f) return kNgxFeatureNotFound;
-    g_warm[f->host] = f->fg;
+    // Kept warm for the next create, except on a Vulkan device whose end nobody reports (no loader): its address may come back.
+    if (f->vulkan && !g_vkKnown) dead = f->fg;
+    else dead = std::exchange(g_warm[f->host], f->fg);
     g_features.erase(h->Id);
     Log("feature released");
     return kNgxSuccess;
@@ -188,7 +193,10 @@ void SetVk(VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcA
 // Of one API (and device, when given): the other API's features stay.
 void Drop(bool vulkan, void* host)
 {
-    std::vector<std::shared_ptr<FrameGenerator>> dead;  // destroyed after the lock
+    struct Dead : std::vector<std::shared_ptr<FrameGenerator>>  // destroyed after the lock; what the GPU still uses is leaked
+    {
+        ~Dead() { for (auto& f : *this) if (!f->Idle()) Log("still in use after 2 s: leaked"), new std::shared_ptr<FrameGenerator>(f); }
+    } dead;
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto it = g_features.begin(); it != g_features.end();)
         if (it->second->vulkan == vulkan && (!host || it->second->host == host)) { dead.push_back(it->second->fg), it = g_features.erase(it); } else ++it;
@@ -245,6 +253,14 @@ NFRUX_EXPORT NVSDK_NGX_GetAPIVersion() { return 0x15; }
 NFRUX_EXPORT NVSDK_NGX_GetSnippetVersion() { return 0x00040000; }
 // The loader's record of what the game's Vulkan device has enabled.
 extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures, int atomic64) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkAtomic64 = atomic64 != 0, g_vkKnown = true; }
+// The loader saw vkDestroyDevice: everything on it goes first.
+extern "C" __declspec(dllexport) void __cdecl NFRUX_DropVulkanDevice(VkDevice d)
+{
+    Drop(true, d);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_vk.d == d) g_vk.d = VK_NULL_HANDLE;
+    if (g_vkDevice == d) g_vkDevice = VK_NULL_HANDLE, g_vkMl = 0, g_vkAtomic64 = false;
+}
 extern "C" __declspec(dllexport) uint32_t __cdecl NFRUX_MaxFrames() { return MaxFrames(); }
 
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }

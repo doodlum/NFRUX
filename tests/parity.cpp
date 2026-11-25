@@ -76,7 +76,7 @@ static Frame Make(uint32_t w, uint32_t h, uint32_t rw, uint32_t rh, float t)
 }
 
 using Results = std::map<std::string, std::vector<uint8_t>>;
-struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; int format = 0; bool inverted = false, bench = false; } g;  // format: 0 rgba8, 1 bgra8, 2 rgb10a2, 3 rgba16f (scRGB)
+struct Opt { uint32_t w = 1280, h = 720, rw = 1280, rh = 720, frames = 8, gen = 2; std::string dump; int format = 0; bool inverted = false, bench = false, strict = false; } g;  // format: 0 rgba8, 1 bgra8, 2 rgb10a2, 3 rgba16f (scRGB)
 static uint32_t ColorBytes() { return g.format == 3 ? 8 : 4; }
 static void Encode(Frame& f)
 {
@@ -428,6 +428,7 @@ int main(int argc, char** argv)
         else if (a == "--first") g_first = uint32_t(atoi(argv[++i]));  // before --replay
         else if (a == "--replay") { Frame x; g_replay = argv[++i]; if (!Load(0, x, true)) return puts("no recording"), 1; }
         else if (a == "--bench") g.bench = true;
+        else if (a == "--strict") g.strict = true;  // the proof build: not one byte
         else if (a == "--inverted") g.inverted = true;
         else if (a == "--dump") g.dump = argv[++i];
         else which.push_back(a);
@@ -463,7 +464,7 @@ int main(int argc, char** argv)
     for (size_t b = 1; b < all.size(); ++b)
     {
         printf("%s against %s\n", which[b].c_str(), which[0].c_str());
-        size_t frames = 0, total = 0, off1 = 0, off3 = 0;
+        size_t frames = 0, total = 0, off1 = 0, off3 = 0, anyDiff = 0;
         double worst = 1e9;
         for (auto& [n, v] : all[0])
         {
@@ -478,9 +479,13 @@ int main(int argc, char** argv)
             }
             const double psnr = 10 * log10(255.0 * 255.0 / std::max(1e-9, e / std::max<size_t>(1, v.size())));
             if (n.rfind("frame", 0) == 0) ++frames, total += v.size(), off1 += d1, off3 += d3, worst = std::min(worst, psnr);
-            else printf("  %-14s %9zu bytes, %zu differ (%.4f%%)\n", n.c_str(), v.size(), d, 100.0 * d / std::max<size_t>(1, v.size()));
+            anyDiff += d;
+            if (n.rfind("frame", 0) != 0) printf("  %-14s %9zu bytes, %zu differ (%.4f%%)\n", n.c_str(), v.size(), d, 100.0 * d / std::max<size_t>(1, v.size()));
         }
         printf("  %zu generated frames: worst PSNR %.2f dB, off by more than 1: %.5f%%, by more than 3: %.5f%%\n", frames, worst, 100.0 * off1 / std::max<size_t>(1, total), 100.0 * off3 / std::max<size_t>(1, total));
+        // A2: strict, 0 bytes in every output and intermediate; shipped, 60 dB, 99.9% within a code, at most 0.01% over three.
+        const bool fp = g.format == 3;  // bytes of halves: PSNR of the values is not computed here, only strict judges it
+        if (!frames || (g.strict ? anyDiff != 0 : !fp && (worst < 60 || off1 * 1000 > total || off3 * 10000 > total))) printf("  LIMIT MISSED\n"), ++bad;
     }
     return bad != 0;
 }

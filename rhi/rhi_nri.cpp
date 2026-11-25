@@ -18,9 +18,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <thread>
 
 namespace nfrux
@@ -139,7 +141,7 @@ public:
     ~DevN() override
     {
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
-        wrapped.clear(), retired.clear();
+        wrapped.clear(), retired.clear(), scratch.clear();
         if (cudaState == 1 && !Lost()) MarkerOk(Rung());
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
@@ -274,10 +276,51 @@ public:
         if (t) t->format = f;
         return t;
     }
+    uint32_t Code(const ExternalImage& e) const { return e.format || isVk ? e.format : uint32_t(static_cast<ID3D12Resource*>(e.handle)->GetDesc().Format); }
+    bool IsSrgb(const ExternalImage& e) const
+    {
+        const uint32_t f = Code(e);
+        return isVk ? f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB : f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    }
+    // Values as stored: sRGB and typeless as their UNORM / FLOAT sibling.
     nri::Format HostFormat(const ExternalImage& e)
     {
-        if (isVk) return nri::nriConvertVKFormatToNRI(e.format);
-        return nri::nriConvertDXGIFormatToNRI(e.format ? e.format : uint32_t(static_cast<ID3D12Resource*>(e.handle)->GetDesc().Format));
+        const uint32_t f = Code(e);
+        if (isVk)
+            return f == VK_FORMAT_R8G8B8A8_SRGB ? nri::Format::RGBA8_UNORM : f == VK_FORMAT_B8G8R8A8_SRGB ? nri::Format::BGRA8_UNORM : nri::nriConvertVKFormatToNRI(f);
+        switch (f)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: case DXGI_FORMAT_R8G8B8A8_TYPELESS: return nri::Format::RGBA8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8A8_TYPELESS: return nri::Format::BGRA8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return nri::Format::R10_G10_B10_A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return nri::Format::RGBA16_SFLOAT;
+        default: return nri::nriConvertDXGIFormatToNRI(f);
+        }
+    }
+    // sRGB images cannot always be viewed as UNORM (typed on D3D12, not MUTABLE on Vulkan): copied raw into one that is.
+    struct Scratch { std::unique_ptr<TexN> t; nri::Format f; uint32_t last; uint64_t of; };
+    std::vector<Scratch> scratch;
+    Texture* Stored(const ExternalImage& e)
+    {
+        for (auto& s : scratch) if (s.last == next && s.of == uint64_t(e.handle)) return s.t.get();
+        TexN* src = static_cast<TexN*>(Wrap(e, true));
+        if (!src) return nullptr;
+        const nri::Format f = HostFormat(e);
+        Scratch* use = nullptr;
+        for (auto& s : scratch) if (s.last != next && s.f == f && s.t->width == src->width && s.t->height == src->height) { use = &s; break; }
+        if (!use)
+        {
+            for (size_t i = 0; i < scratch.size();)  // not used for longer than anything can be in flight
+                if (next - scratch[i].last > 256) scratch.erase(scratch.begin() + i); else ++i;
+            auto t = MakeTex(f, src->width, src->height, false);
+            if (!t) return nullptr;
+            t->format = Format::Native;
+            scratch.push_back({std::move(t), f, 0, 0});
+            use = &scratch.back();
+        }
+        use->last = next, use->of = uint64_t(e.handle);
+        Copy(*src, 0, 0, *use->t, 0, 0, src->width, src->height);
+        return use->t.get();
     }
     std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& e, uint32_t w, uint32_t h) override
     {
@@ -320,15 +363,19 @@ public:
         return p;
     }
 
+    std::mutex making;
     int rung = -1, topRung = 0;  // 0 cooperative matrices / CUDA, 1 dot4, 2 integers: the last made, the highest allowed
     bool DropRung() override
     {
+        std::lock_guard<std::mutex> lock(making);
         if (rung < 0 || rung >= 2) return false;
+        if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
         topRung = rung + 1;
         return true;
     }
     std::unique_ptr<Network> CreateNetwork(uint32_t w, uint32_t h, std::string* error) override
     {
+        std::lock_guard<std::mutex> lock(making);  // worker threads
         auto net = std::make_unique<NetN>();
         const ModelBindings mb = GetModelBindings();
         const char* ml = Env("NFRUX_ML");
@@ -381,7 +428,9 @@ public:
         }
         if (!ok) { if (error) *error = "out of memory"; return nullptr; }
         net->input = net->in.get(), net->params = net->tex[0].get(), net->gate = net->tex[1].get();
+        static std::mutex logMutex;
         static std::string logged;
+        std::lock_guard<std::mutex> logLock(logMutex);
         if (logged != what) Log("network %ux%u: %s", w, h, what.c_str()), logged = what;
         return net;
     }
@@ -392,7 +441,7 @@ public:
     {
         for (auto it = retired.begin(); it != retired.end();)
             // Our work in the host's command buffer has finished, but the buffer may still count as pending (its tail, its fence): kept 16 recordings more.
-            if (next - it->value >= 16 && Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); it = retired.erase(it); } else ++it;
+            if (next - it->value >= 16 && Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); ++finished, it = retired.erase(it); } else ++it;
         for (auto it = reads.begin(); it != reads.end();)
             if (Done(it->slot, it->value)) { Finish(*it); it = reads.erase(it); } else ++it;
     }
@@ -407,8 +456,9 @@ public:
         if (r.size <= 4096 && freeReads.size() < 16) freeReads.push_back({r.size, r.buf});
         else n.DestroyBuffer(r.buf);
     }
-    int         cudaState = 0;  // 0 not tried, 1 in use, -1 not
+    std::atomic<int> cudaState = 0;  // 0 not tried, 1 in use, -1 not
     uint32_t    finished = 0;
+    bool        marked = false;
     std::string Rung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
     bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
@@ -433,7 +483,7 @@ public:
     bool BeginFrame(void* commands) override
     {
         Poll();
-        if (cudaState == 1 && next > 12 && ++finished == 10) MarkerOk(Rung());  // a dozen recordings on, ten more begun without trouble
+        if (cudaState == 1 && finished >= 10 && !marked) marked = true, MarkerOk(Rung());  // ten recordings completed
         nativeCmd = commands;
         if (isVk)
         {
@@ -487,8 +537,9 @@ public:
         wrapped.clear(), wrappedHome.clear();
         cmd = nullptr;
     }
-    Texture* Wrap(const ExternalImage& e, bool) override
+    Texture* Wrap(const ExternalImage& e, bool written) override
     {
+        if (!written && IsSrgb(e)) return Stored(e);
         for (auto& t : wrapped) if (t->native == uint64_t(e.handle)) return t.get();
         auto t = std::make_unique<TexN>();
         t->dev = this, t->native = uint64_t(e.handle), t->width = e.width, t->height = e.height, t->format = Format::Native;
@@ -510,7 +561,7 @@ public:
             if (!NRI_OK(nd3.CreateTextureD3D12(*dev, d, t->tex))) return nullptr;
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
-        if (!Views(*t, f, false)) return nullptr;
+        if (!IsSrgb(e) && !Views(*t, f, false)) return nullptr;
         const nri::AccessLayoutStage& home = isVk ? kHostVk : kHostD3D12;
         t->state = home;
         wrapped.push_back(std::move(t)), wrappedHome.push_back(home);
@@ -656,7 +707,7 @@ public:
         reads.push_back(r);
     }
     void Mark(const char*) override {}
-    void WaitIdle() override
+    bool WaitIdle() override
     {
         bool busy = true;
         for (int ms = 0; ms < 2000 && busy && !Lost(); ++ms)
@@ -667,6 +718,7 @@ public:
         }
         if (busy) Log("work still in flight after 2 s%s", Lost() ? " (device removed)" : "");
         Poll();
+        return !busy;
     }
 };
 

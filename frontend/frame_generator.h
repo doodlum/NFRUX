@@ -33,6 +33,7 @@ public:
     bool Evaluate(void* commands, const EvalInputs& in);
     bool vulkan() const { return m_vulkan; }
     void Restart() { m_restart = true; }
+    bool Idle() { return m_dev.WaitIdle(); }
 
 private:
     std::unique_ptr<Device> m_device;  // its own: recording state is never shared between features. First: destroyed last
@@ -57,7 +58,9 @@ private:
     std::shared_ptr<std::vector<uint8_t>> m_checkRead[2];
     std::vector<uint8_t>     m_checkWant[2];  // four bytes a pixel as read; m_checkChannels of them count
     uint32_t m_checkChannels[2] = {}, m_checks = 0;
-    enum { kCheckNone, kCheckWaiting, kCheckOk, kCheckFailed } m_check = kCheckNone;
+    uint32_t m_checkWaits = 0, m_kind = 0;
+    std::future<bool> m_checkMake;
+    enum { kCheckNone, kCheckMaking, kCheckWaiting, kCheckOk, kCheckFailed } m_check = kCheckNone;
     Texture* Keep(std::unique_ptr<Texture>& t, Format f, uint32_t w, uint32_t h);
     std::vector<std::unique_ptr<Network>> m_oldNets;
     std::vector<std::unique_ptr<Pass>> m_oldPasses;

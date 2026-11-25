@@ -130,7 +130,7 @@ public:
     virtual void Mark(const char* label) = 0;  // profiling
     // GPU time (microseconds) per label of the last profiled frame, when profiling is on.
     virtual std::vector<std::pair<std::string, float>> Profile() { return {}; }
-    virtual void WaitIdle() = 0;  // before destroying what the GPU may still use
+    virtual bool WaitIdle() = 0;  // before destroying what the GPU may still use; false: still busy after 2 s
 };
 
 uint32_t TexelSize(Format f);

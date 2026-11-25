@@ -155,7 +155,7 @@ struct Interpolator::Impl
     Device&  dev;
     Settings s;
     Dims     display, render, ofInput, of, mvLane, flowLane, graph;
-    bool     allInput = false, colourDown = false, bytes = false;
+    bool     allInput = false, colourDown = false;
     FiConstants c = {};
     float    lastVP[16] = {};
     PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post;
@@ -198,7 +198,6 @@ bool Interpolator::Impl::Create(std::string* error)
     const uint32_t flowRows = std::max(ofInput.height / 4u, 1u);
     flowLane = {RoundPositive(double(flowRows) * aspect), flowRows};
     graph    = {(mvLane.width + 7) / 8 * 8, (mvLane.height + 7) / 8 * 8};
-    bytes    = s.outputFormat == Format::RGBA8Unorm || s.outputFormat == Format::BGRA8Unorm || s.outputFormat == Format::RGB10A2Unorm;
 
     NFRUX_PASS(initWarp, kFiInitWarp)
     Format lane = s.outputFormat == Format::BGRA8Unorm ? Format::RGBA8Unorm : s.outputFormat;

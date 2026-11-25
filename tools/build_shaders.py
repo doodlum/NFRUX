@@ -72,7 +72,7 @@ def run(cmd):
 
 
 RELAXED = len(sys.argv) < 4 or sys.argv[3] not in ("1", "ON")
-FLOAT_OPS = {127, 129, 131, 133, 136, 140, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
+FLOAT_OPS = {127, 129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
 
 
 def precise(path, name):

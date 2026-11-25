@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -66,8 +67,8 @@ struct Params : NgxParameter
 };
 
 // --- a graphics API with host textures
-enum Fmt { F_RGBA8, F_BGRA8, F_RGB10, F_RGBA16F, F_R32F, F_RG16F, F_R8, F_COUNT };
-static const uint32_t kBytes[F_COUNT] = {4, 4, 4, 8, 4, 4, 1};
+enum Fmt { F_RGBA8, F_BGRA8, F_RGB10, F_RGBA16F, F_R32F, F_RG16F, F_R8, F_RGBA8S, F_BGRA8S, F_COUNT };  // S: sRGB
+static const uint32_t kBytes[F_COUNT] = {4, 4, 4, 8, 4, 4, 1, 4, 4};
 using Bytes = std::vector<uint8_t>;
 struct Tex
 {
@@ -90,7 +91,21 @@ struct Api
     virtual NgxResult Evaluate(NgxHandle* h, Params& p) = 0;  // recorded, submitted, waited for
     virtual NgxResult Release(NgxHandle* h) = 0;
     virtual void Shutdown() = 0;
-    virtual uint64_t VideoMemory() { return 0; }
+    virtual bool Recreate() = 0;
+    ComPtr<IDXGIAdapter3> adapter;  // video memory of the process on it, whatever the API
+    void FindAdapter(LUID luid)
+    {
+        ComPtr<IDXGIFactory4> f;
+        CreateDXGIFactory1(IID_PPV_ARGS(&f));
+        ComPtr<IDXGIAdapter> a;
+        if (SUCCEEDED(f->EnumAdapterByLuid(luid, IID_PPV_ARGS(&a)))) a.As(&adapter);
+    }
+    uint64_t VideoMemory()
+    {
+        DXGI_QUERY_VIDEO_MEMORY_INFO i = {};
+        if (!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &i)) || !i.CurrentUsage) printf("  video memory not readable\n"), exit(2);
+        return i.CurrentUsage;
+    }
     template <class F> F Fn(const char* n)
     {
         F f = reinterpret_cast<F>(GetProcAddress(dll, n));
@@ -108,10 +123,17 @@ struct Api12 : Api
     ComPtr<ID3D12GraphicsCommandList> cl;
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12InfoQueue> info;
-    ComPtr<IDXGIAdapter3> adapter;
     uint64_t fv = 0;
+    bool Recreate() override
+    {
+        Shutdown();
+        cl.Reset(), al.Reset(), q.Reset(), fence.Reset(), info.Reset();
+        const ULONG left = d.Reset();
+        if (left) printf("    (%lu references left on the old device)\n", left);
+        return Init() && left == 0;
+    }
     static constexpr DXGI_FORMAT kF[F_COUNT] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                                DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R8_UNORM};
+                                                DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
     const char* Name() const override { return "d3d12"; }
     bool Init()
     {
@@ -134,10 +156,7 @@ struct Api12 : Api
             info->SetMessageCountLimit(100000);
             printf("  D3D12 debug layer on%s\n", atoi(getenv("NFRUX_D3D12_DEBUG")) > 1 ? ", GPU validation on" : "");
         }
-        ComPtr<IDXGIFactory4> f;
-        CreateDXGIFactory1(IID_PPV_ARGS(&f));
-        ComPtr<IDXGIAdapter> a;
-        f->EnumAdapterByLuid(d->GetAdapterLuid(), IID_PPV_ARGS(&a)), a.As(&adapter);
+        FindAdapter(d->GetAdapterLuid());
         D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COMPUTE};
         d->CreateCommandQueue(&qd, IID_PPV_ARGS(&q));
         d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&al));
@@ -175,7 +194,7 @@ struct Api12 : Api
         auto t = std::make_shared<Tex12>();
         t->f = f, t->w = w, t->h = h;
         D3D12_HEAP_PROPERTIES hp = {D3D12_HEAP_TYPE_DEFAULT};
-        D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        D3D12_RESOURCE_DESC r = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1, kF[f], {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, output && f < F_RGBA8S ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         d->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&t->r));
         return t;
     }
@@ -233,7 +252,6 @@ struct Api12 : Api
     }
     NgxResult Release(NgxHandle* h) override { return Fn<NgxResult (*)(NgxHandle*)>("NVSDK_NGX_D3D12_ReleaseFeature")(h); }
     void Shutdown() override { Fn<NgxResult (*)(ID3D12Device*)>("NVSDK_NGX_D3D12_Shutdown1")(d.Get()); }
-    uint64_t VideoMemory() override { DXGI_QUERY_VIDEO_MEMORY_INFO i = {}; adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &i); return i.CurrentUsage; }
 };
 
 struct TexV : Tex
@@ -256,7 +274,7 @@ struct ApiV : Api
     VkCommandBuffer cb;
     VkPhysicalDeviceMemoryProperties mp;
     static constexpr VkFormat kF[F_COUNT] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT,
-                                             VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8_UNORM};
+                                             VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB};
     const char* Name() const override { return minimal ? "vulkan (minimal 1.2)" : "vulkan"; }
     static VKAPI_ATTR VkBool32 VKAPI_CALL OnMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT* m, void* self)
     {
@@ -286,6 +304,11 @@ struct ApiV : Api
         }
         uint32_t n = 1;
         vkEnumeratePhysicalDevices(inst, &n, &pd);
+        VkPhysicalDeviceIDProperties idp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2 pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &idp};
+        vkGetPhysicalDeviceProperties2(pd, &pp);
+        LUID luid;
+        memcpy(&luid, idp.deviceLUID, sizeof(luid)), FindAdapter(luid);
         std::vector<const char*> ext;
         const uint32_t ml = minimal ? 0 : ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
@@ -318,6 +341,13 @@ struct ApiV : Api
         return Fn<NgxResult (*)(unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, int, const void*)>("NVSDK_NGX_VULKAN_Init_Ext2")(
                    0, L".", inst, pd, dv, nullptr, nullptr, 0x15, nullptr) == kNgxSuccess;
     }
+    bool Recreate() override
+    {
+        vkDestroyCommandPool(dv, pool, nullptr);
+        Fn<void (*)(VkDevice)>("NFRUX_DropVulkanDevice")(dv);  // what the loader does before vkDestroyDevice
+        vkDestroyDevice(dv, nullptr);
+        return Init();
+    }
     VkDeviceMemory Memory(VkMemoryRequirements r, VkMemoryPropertyFlags want)
     {
         VkMemoryAllocateInfo ma = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, r.size, 0};
@@ -346,7 +376,7 @@ struct ApiV : Api
         t->f = f, t->w = w, t->h = h, t->d = dv;
         VkImageCreateInfo ic = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ic.imageType = VK_IMAGE_TYPE_2D, ic.format = kF[f], ic.extent = {w, h, 1}, ic.mipLevels = ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
-        ic.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (output && f != F_BGRA8 ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+        ic.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | (output && f != F_BGRA8 && f < F_RGBA8S ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
         vkCreateImage(dv, &ic, nullptr, &t->img);
         VkMemoryRequirements r;
         vkGetImageMemoryRequirements(dv, t->img, &r);
@@ -440,8 +470,8 @@ static Bytes Encode(const Image& im, Fmt f)
     {
         const float* c = &im.p[i * 4];
         uint8_t* d = &o[i * kBytes[f]];
-        if (f == F_RGBA8) for (int k = 0; k < 4; ++k) d[k] = uint8_t(u(c[k], 255));
-        if (f == F_BGRA8) d[0] = uint8_t(u(c[2], 255)), d[1] = uint8_t(u(c[1], 255)), d[2] = uint8_t(u(c[0], 255)), d[3] = uint8_t(u(c[3], 255));
+        if (f == F_RGBA8 || f == F_RGBA8S) for (int k = 0; k < 4; ++k) d[k] = uint8_t(u(c[k], 255));
+        if (f == F_BGRA8 || f == F_BGRA8S) d[0] = uint8_t(u(c[2], 255)), d[1] = uint8_t(u(c[1], 255)), d[2] = uint8_t(u(c[0], 255)), d[3] = uint8_t(u(c[3], 255));
         if (f == F_RGB10) { const uint32_t v = u(c[0], 1023) | u(c[1], 1023) << 10 | u(c[2], 1023) << 20 | u(c[3], 3) << 30; memcpy(d, &v, 4); }
         if (f == F_RGBA16F) { uint16_t h[4]; for (int k = 0; k < 4; ++k) h[k] = Half(c[k]); memcpy(d, h, 8); }
         if (f == F_RG16F) { uint16_t h[2] = {Half(c[0]), Half(c[1])}; memcpy(d, h, 4); }
@@ -457,8 +487,8 @@ static Image Decode(const Bytes& b, Fmt f, uint32_t w, uint32_t h)
     {
         const uint8_t* d = &b[i * kBytes[f]];
         float* c = &o.p[i * 4];
-        if (f == F_RGBA8) for (int k = 0; k < 4; ++k) c[k] = d[k] / 255.0f;
-        if (f == F_BGRA8) c[0] = d[2] / 255.0f, c[1] = d[1] / 255.0f, c[2] = d[0] / 255.0f, c[3] = d[3] / 255.0f;
+        if (f == F_RGBA8 || f == F_RGBA8S) for (int k = 0; k < 4; ++k) c[k] = d[k] / 255.0f;
+        if (f == F_BGRA8 || f == F_BGRA8S) c[0] = d[2] / 255.0f, c[1] = d[1] / 255.0f, c[2] = d[0] / 255.0f, c[3] = d[3] / 255.0f;
         if (f == F_RGB10) { uint32_t v; memcpy(&v, d, 4); c[0] = (v & 1023) / 1023.0f, c[1] = (v >> 10 & 1023) / 1023.0f, c[2] = (v >> 20 & 1023) / 1023.0f; }
         if (f == F_RGBA16F) { uint16_t hh[4]; memcpy(hh, d, 8); for (int k = 0; k < 4; ++k) c[k] = Unhalf(hh[k]); }
     }
@@ -714,6 +744,19 @@ static void Scenes(Api& a, Results& res)
         Check(q > 45, "as in the same format, dB", q);
     }
     printf("  output formats\n");
+    for (Fmt f : {F_RGBA8S, F_BGRA8S})
+    {
+        Scene s = d;
+        s.back = s.hud = f;
+        Out u = Run(a, s);
+        keep(f == F_RGBA8S ? "rgba8 srgb" : "bgra8 srgb", u);
+        const double m = std::max(MaxDiff(u.gen[0], o.gen[0], All), MaxDiff(u.gen[1], o.gen[1], All));
+        Check(m <= code, "sRGB images: the same stored values as UNORM", m);
+        Scene st = s;  // the staged path too
+        st.hud = f == F_RGBA8S ? F_BGRA8 : F_RGBA8;
+        u = Run(a, st);
+        Check(Psnr(u.gen[0], o.gen[0]) > 45, "sRGB back buffer, UNORM HUD-less of another order, dB", Psnr(u.gen[0], o.gen[0]));
+    }
     for (Fmt f : {F_BGRA8, F_RGB10, F_RGBA16F})
     {
         Scene s = d;
@@ -834,6 +877,20 @@ static void Scenes(Api& a, Results& res)
         NgxHandle* h3 = a.CreateFeature(p);
         Check(Run(a, c, h3).raw == base.raw, "created again: the same frames", 1);
         a.Release(h3);
+        // Released on one thread while another evaluates.
+        NgxHandle *h4 = a.CreateFeature(p), *h5 = a.CreateFeature(p);
+        Out o4;
+        std::thread t([&] { Scene l = plain; l.frames = 8; o4 = Run(a, l, h4); });
+        Sleep(30);
+        const bool released = a.Release(h5) == kNgxSuccess;
+        t.join();
+        Check(released && o4.ok, "a release while another feature evaluates", 1);
+        a.Release(h4);
+        // The device goes and a new one comes (perhaps at its address).
+        Check(a.Recreate(), "device destroyed and made again", 1);
+        NgxHandle* h6 = a.CreateFeature(p);
+        Check(h6 && Run(a, c, h6).raw == base.raw, "on the new device: the same frames", 1);
+        if (h6) a.Release(h6);
     }
 }
 static void Soak(Api& a, uint32_t n)
@@ -892,6 +949,15 @@ int main(int argc, char** argv)
     }
     if (results.size() == 2 && !soak)
     {
+        printf("both APIs at once, a thread each\n");
+        Scene s;
+        s.backI = [](int i) { return World(W, H, float(i)); }, s.frames = 12;
+        Out o[2], alone[2];
+        for (int i = 0; i < 2; ++i) alone[i] = Run(*apis[i], s);
+        std::thread t([&] { o[0] = Run(*apis[0], s); });
+        o[1] = Run(*apis[1], s);
+        t.join();
+        Check(o[0].ok && o[1].ok && o[0].raw == alone[0].raw && o[1].raw == alone[1].raw, "each as when alone", 1);
         printf("between the APIs\n");
         size_t same = 0, pixels = 0, over1 = 0, over3 = 0;
         for (auto& [n, v] : results[0])
@@ -903,6 +969,14 @@ int main(int argc, char** argv)
             size_t d1 = 0, d3 = 0;
             double e = 0;
             const bool fp16 = n.rfind("rgba16f", 0) == 0 || n.rfind("scrgb", 0) == 0;
+            if (n.rfind("rgb10", 0) == 0)  // packed: by 10-bit code, on the 8-bit scale
+                for (size_t i = 0; i + 3 < v.size(); i += 4)
+                {
+                    uint32_t x, y;
+                    memcpy(&x, &v[i], 4), memcpy(&y, &o[i], 4);
+                    for (int k = 0; k < 30; k += 10) { const int c = abs(int(x >> k & 1023) - int(y >> k & 1023)); d1 += c > 1, d3 += c > 3, e += double(c) * c / 16; }
+                }
+            else
             for (size_t i = 0; i < v.size(); ++i) { const int x = abs(int(v[i]) - int(o[i])); d1 += x > 1, d3 += x > 3, e += double(x) * x; }
             printf("    %s: %zu of %zu bytes off by more than 1, %.1f dB%s\n", n.c_str(), d1, v.size(), 10 * log10(65025.0 / std::max(1e-9, e / v.size())), fp16 ? " (fp16 bytes)" : "");
             if (!fp16 && 10 * log10(65025.0 / std::max(1e-9, e / v.size())) < 60) ++g_bad;

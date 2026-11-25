@@ -95,6 +95,11 @@ static NgxResult __cdecl ReleaseVk(NgxHandle* h)
     if (IsOurs(h)) { { std::lock_guard<std::mutex> k(g_hm); g_handles.erase(h); } return Ours<decltype(&ReleaseVk)>("NVSDK_NGX_VULKAN_ReleaseFeature")(h); }
     return Real<decltype(&ReleaseVk)>("NVSDK_NGX_VULKAN_ReleaseFeature")(h);
 }
+// --- the end: NFRUX's features first, then the core's
+static NgxResult __cdecl Shut12() { L("D3D12 Shutdown"); if (auto o = Ours<decltype(&Shut12)>("NVSDK_NGX_D3D12_Shutdown")) o(); return Real<decltype(&Shut12)>("NVSDK_NGX_D3D12_Shutdown")(); }
+static NgxResult __cdecl Shut12D(ID3D12Device* d) { L("D3D12 Shutdown1"); if (auto o = Ours<decltype(&Shut12D)>("NVSDK_NGX_D3D12_Shutdown1")) o(d); return Real<decltype(&Shut12D)>("NVSDK_NGX_D3D12_Shutdown1")(d); }
+static NgxResult __cdecl ShutVk() { L("Vulkan Shutdown"); if (auto o = Ours<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")) o(); return Real<decltype(&ShutVk)>("NVSDK_NGX_VULKAN_Shutdown")(); }
+static NgxResult __cdecl ShutVkD(VkDevice d) { L("Vulkan Shutdown1"); if (auto o = Ours<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")) o(d); return Real<decltype(&ShutVkD)>("NVSDK_NGX_VULKAN_Shutdown1")(d); }
 // --- vkCreateDevice: what the game enables, plus what NFRUX's fast paths want (DESIGN D3).
 #include "../core/ml/ffx_vk_ml_runtime.h"
 static PFN_vkCreateDevice g_createDevice;
@@ -173,7 +178,6 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     // Core features.
     auto wantCore = [&](VkPhysicalDeviceFeatures& f) {
         f.shaderStorageImageExtendedFormats |= s2.features.shaderStorageImageExtendedFormats;
-        f.shaderInt64 |= s2.features.shaderInt64;
     };
     if (f2) wantCore(f2->features);
     else { if (ci->pEnabledFeatures) core = *ci->pEnabledFeatures; wantCore(core); c.pEnabledFeatures = &core; }
@@ -186,13 +190,13 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     if (f12)
     {
         f12->vulkanMemoryModel |= s12.vulkanMemoryModel, f12->vulkanMemoryModelDeviceScope |= s12.vulkanMemoryModelDeviceScope;
-        f12->shaderInt8 |= s12.shaderInt8, f12->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess, f12->shaderBufferInt64Atomics |= s12.shaderBufferInt64Atomics;
+        f12->shaderInt8 |= s12.shaderInt8, f12->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess;
     }
     else
     {
-        if (!fmm) chain(fmm = &mm); if (!f8) chain(f8 = &i8); if (!f8s) chain(f8s = &st8); if (!fat) chain(fat = &at);
+        if (!fmm) chain(fmm = &mm); if (!f8) chain(f8 = &i8); if (!f8s) chain(f8s = &st8);
         fmm->vulkanMemoryModel |= s12.vulkanMemoryModel, fmm->vulkanMemoryModelDeviceScope |= s12.vulkanMemoryModelDeviceScope;
-        f8->shaderInt8 |= s12.shaderInt8, f8s->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess, fat->shaderBufferInt64Atomics |= s12.shaderBufferInt64Atomics;
+        f8->shaderInt8 |= s12.shaderInt8, f8s->storageBuffer8BitAccess |= s12.storageBuffer8BitAccess;
     }
     if (f13) f13->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct, f13->subgroupSizeControl |= s13.subgroupSizeControl, f13->computeFullSubgroups |= s13.computeFullSubgroups, f13->synchronization2 |= s13.synchronization2;
     else { if (!fdot) chain(fdot = &dot); fdot->shaderIntegerDotProduct |= s13.shaderIntegerDotProduct; }
@@ -218,17 +222,34 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (f13 && s13.subgroupSizeControl && s13.computeFullSubgroups) ml |= FEATURE_SUBGROUP_SIZE_CONTROL;
         if (cmS.cooperativeMatrix) ml |= FEATURE_COOPERATIVE_MATRIX;
     }
-    g_ml = ml, g_atomic64 = added && s12.shaderBufferInt64Atomics && s2.features.shaderInt64;
+    g_ml = ml, g_atomic64 = false;  // not used any more
     if (r == VK_SUCCESS) g_featureDevice = *out;
     L("vkCreateDevice -> %d, features %s, ml 0x%x, 64-bit atomics %d", r, added ? "added" : "refused: the game's own call", ml, g_atomic64);
     return r;
 }
 static uint32_t g_ml_() { return g_ml; } static bool g_atomic_() { return g_atomic64; } static VkDevice g_dev_() { return g_featureDevice; }
+static PFN_vkDestroyDevice g_destroyDevice;
+static void VKAPI_CALL DestroyDevice(VkDevice d, const VkAllocationCallbacks* a)
+{
+    L("vkDestroyDevice %p", d);
+    if (GetModuleHandleA("nvngx_dlssg.dll")) if (auto f = Ours<void(__cdecl*)(VkDevice)>("NFRUX_DropVulkanDevice")) f(d);
+    if (g_featureDevice == d) g_featureDevice = VK_NULL_HANDLE;
+    g_destroyDevice(d, a);
+}
+static PFN_vkGetDeviceProcAddr g_gdpa;
+static PFN_vkVoidFunction VKAPI_CALL HookGdpa(VkDevice d, const char* n)
+{
+    PFN_vkVoidFunction f = g_gdpa(d, n);
+    if (f && n && !strcmp(n, "vkDestroyDevice")) { if (!g_destroyDevice) g_destroyDevice = (PFN_vkDestroyDevice)f; return (PFN_vkVoidFunction)DestroyDevice; }
+    return f;
+}
 static PFN_vkGetInstanceProcAddr g_gipa;
 static PFN_vkVoidFunction VKAPI_CALL HookGipa(VkInstance i, const char* n)
 {
     PFN_vkVoidFunction f = g_gipa(i, n);
     if (f && n && !strcmp(n, "vkCreateDevice")) { if (!g_createDevice) g_createDevice = (PFN_vkCreateDevice)f; return (PFN_vkVoidFunction)CreateDevice; }
+    if (f && n && !strcmp(n, "vkDestroyDevice")) { if (!g_destroyDevice) g_destroyDevice = (PFN_vkDestroyDevice)f; return (PFN_vkVoidFunction)DestroyDevice; }
+    if (f && n && !strcmp(n, "vkGetDeviceProcAddr")) { if (!g_gdpa) g_gdpa = (PFN_vkGetDeviceProcAddr)f; return (PFN_vkVoidFunction)HookGdpa; }
     return f;
 }
 
@@ -242,7 +263,8 @@ template <int N> static NgxResult __cdecl Cap(NgxParameter** p) { const NgxResul
 static const std::map<std::string, void*> kWrap = {
     {"NVSDK_NGX_D3D12_GetCapabilityParameters", (void*)Cap<0>}, {"NVSDK_NGX_VULKAN_GetCapabilityParameters", (void*)Cap<1>}, {"NVSDK_NGX_D3D12_GetParameters", (void*)Cap<2>}, {"NVSDK_NGX_VULKAN_GetParameters", (void*)Cap<3>},
     {"NVSDK_NGX_D3D12_CreateFeature", (void*)Create12}, {"NVSDK_NGX_D3D12_EvaluateFeature", (void*)Eval12}, {"NVSDK_NGX_D3D12_ReleaseFeature", (void*)Release12}, {"NVSDK_NGX_D3D12_GetFeatureRequirements", (void*)Req12},
-    {"NVSDK_NGX_VULKAN_Init", (void*)InitVk}, {"NVSDK_NGX_VULKAN_Init_Ext2", (void*)InitVk2}, {"NVSDK_NGX_VULKAN_Init_ProjectID_Ext", (void*)InitVkP}, {"NVSDK_NGX_VULKAN_CreateFeature", (void*)CreateVk}, {"NVSDK_NGX_VULKAN_CreateFeature1", (void*)CreateVk1}, {"NVSDK_NGX_VULKAN_EvaluateFeature", (void*)EvalVk}, {"NVSDK_NGX_VULKAN_ReleaseFeature", (void*)ReleaseVk}};
+    {"NVSDK_NGX_VULKAN_Init", (void*)InitVk}, {"NVSDK_NGX_VULKAN_Init_Ext2", (void*)InitVk2}, {"NVSDK_NGX_VULKAN_Init_ProjectID_Ext", (void*)InitVkP}, {"NVSDK_NGX_VULKAN_CreateFeature", (void*)CreateVk}, {"NVSDK_NGX_VULKAN_CreateFeature1", (void*)CreateVk1}, {"NVSDK_NGX_VULKAN_EvaluateFeature", (void*)EvalVk}, {"NVSDK_NGX_VULKAN_ReleaseFeature", (void*)ReleaseVk},
+    {"NVSDK_NGX_D3D12_Shutdown", (void*)Shut12}, {"NVSDK_NGX_D3D12_Shutdown1", (void*)Shut12D}, {"NVSDK_NGX_VULKAN_Shutdown", (void*)ShutVk}, {"NVSDK_NGX_VULKAN_Shutdown1", (void*)ShutVkD}};
 
 static FARPROC WINAPI HookGPA(HMODULE m, LPCSTR n)
 {
@@ -258,6 +280,8 @@ static FARPROC WINAPI HookGPA(HMODULE m, LPCSTR n)
     if (HIWORD(n) && r && m == GetModuleHandleA("vulkan-1.dll"))
     {
         if (!strcmp(n, "vkCreateDevice")) { g_createDevice = (PFN_vkCreateDevice)r; return (FARPROC)CreateDevice; }
+        if (!strcmp(n, "vkDestroyDevice")) { g_destroyDevice = (PFN_vkDestroyDevice)r; return (FARPROC)DestroyDevice; }
+        if (!strcmp(n, "vkGetDeviceProcAddr")) { g_gdpa = (PFN_vkGetDeviceProcAddr)r; return (FARPROC)HookGdpa; }
         if (!strcmp(n, "vkGetInstanceProcAddr")) { g_gipa = (PFN_vkGetInstanceProcAddr)r; return (FARPROC)HookGipa; }
     }
     return r;

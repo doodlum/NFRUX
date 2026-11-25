@@ -13,7 +13,7 @@ from ng_model_gym.usecases.nfru_mfg.train_mfg import PairDataset, build_state, l
 
 PARITY = os.environ.get("PARITY", r"C:\dev\NFRUX\build\Release\parity.exe")
 API = os.environ.get("API", "d3d12")
-CKPT = {"torch": r"C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt", "arm": "arm"}
+CKPT = {"torch": r"C:\dev\modelgym\output\nfru_mfg_v14\qat15\last.pt", "arm+prior": "arm", "arm": "arm"}  # arm: as released, no prior
 PAIRS = int(os.environ.get("PAIRS", "4"))
 out = Path(sys.argv[1]); tmp = out.parent / "rec"; gen = out.parent / "gen"
 for d in (tmp, gen): d.mkdir(parents=True, exist_ok=True)
@@ -87,14 +87,14 @@ for info in cfg.infos:
                 for who, ck in CKPT.items():
                     net, tc = load_net(ck, dev)
                     for j, t in enumerate(d["t"].tolist()):
-                        o, _ = P.run_timestep(st, t, net, tc, display_crop=crop, logit_prior=True)
+                        o, _ = P.run_timestep(st, t, net, tc, display_crop=crop, logit_prior=who != "arm")
                         add(who, n, info, psnr((o.cpu().clamp(0, 1) * 255).round() / 255, gt[j]))
             for j, t in enumerate(d["t"].tolist()):
                 add("blend", n, info, psnr(((1 - t) * d["rgb_m1"] + t * d["rgb_p1"])[None, :, y0:y0 + ch, x0:x0 + cw], gt[j]))
     print(info.path.stem, {a: {k: round(float(np.mean(v)), 2) for k, v in b.items()} for a, b in acc.items()}, flush=True)
 for k in sorted(acc["nfrux"]):  # the gap to torch by which generated frame
     n = int(k[0]); a, b = np.array(acc["nfrux"][k]).reshape(-1, n - 1), np.array(acc["torch"][k]).reshape(-1, n - 1)
-    print("gap by frame", k, np.round((a - b).mean(0), 2), "median", np.round(np.median(a - b, 0), 2))
+    print("worst frame gap", k, round(float((a - b).min()), 2)); print("gap by frame", k, np.round((a - b).mean(0), 2), "median", np.round(np.median(a - b, 0), 2))
 hard = {}
 for k in acc["nfrux"]:
     m = np.array(acc["torch"][k]) < 45

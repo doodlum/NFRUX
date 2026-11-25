@@ -110,6 +110,7 @@ bool SameSize(const ExternalImage& a, const ExternalImage& b) { return a && b &&
 
 FrameGenerator::~FrameGenerator()
 {
+    if (m_checkMake.valid()) m_checkMake.wait();
     for (auto& e : m_entries) if (e->making.valid()) e->making.wait();  // a worker may still use the device
     for (auto& e : m_retired) if (e.first->making.valid()) e.first->making.wait();
     m_dev.WaitIdle();
@@ -140,7 +141,8 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
     memcpy(m_vp, s.initialViewProjection, sizeof(m_vp));
     e->making = std::async(std::launch::async, [this, s, w, h, rw, rh, format = color.format] {
         std::string error;
-        auto        ip = Interpolator::Create(m_dev, s, &error);
+        std::unique_ptr<Interpolator> ip;
+        try { ip = Interpolator::Create(m_dev, s, &error); } catch (const std::exception& x) { error = x.what(); }
         if (!ip) Log("frame generation %ux%u (render %ux%u, format %u) not possible: %s; showing rendered frames", w, h, rw, rh, format, error.c_str());
         return ip;
     });
@@ -215,7 +217,10 @@ bool FrameGenerator::Checked()
     if (m_check == kCheckWaiting)
     {
         if (m_checkRead[0]->empty() || m_checkRead[1]->empty())
+        {
+            if (++m_checkWaits > 256) m_checkWaits = 0, m_check = kCheckNone, m_oldNets.push_back(std::move(m_checkNet));  // never submitted: again
             return false;  // not back yet: not a mismatch
+        }
         size_t bad = 0;
         for (int o = 0; o < 2; ++o)
             for (size_t i = 0; i < m_checkWant[o].size(); ++i) bad += i % 4 < m_checkChannels[o] && (*m_checkRead[o])[i] != m_checkWant[o][i];
@@ -227,34 +232,47 @@ bool FrameGenerator::Checked()
         Log("network self-check FAILED (%zu bytes): %s", bad, m_check == kCheckNone ? "trying the next way to run it" : "no frame generation");
         if (m_check == kCheckFailed) return false;
     }
-    std::string error;
-    if (!m_checkPass) m_checkPass = m_dev.CreatePass(shaders::kCheck);
-    m_checkNet = m_dev.CreateNetwork(S, S, &error);
-    if (!m_checkNet && m_dev.DropRung()) m_checkNet = m_dev.CreateNetwork(S, S, &error);
-    if (!m_checkNet || !m_checkPass)
-        return Log("network not possible: %s", error.c_str()), m_check = kCheckFailed, false;
-    if (m_checkWant[0].empty())
+    if (m_check == kCheckNone)
     {
-        std::vector<int8_t> x(S * S * kInputChannels);
-        for (uint32_t i = 0; i < x.size() / 4; ++i)
-        {
-            uint32_t h = i * 2654435761u + 1013904223u;
-            h = (h ^ (h >> 15)) * 2246822519u, h = (h ^ (h >> 13)) * 3266489917u, h ^= h >> 16;
-            memcpy(&x[i * 4], &h, 4);
-        }
-        const ModelBindings mb = GetModelBindings();
-        std::map<uint32_t, std::vector<int8_t>> in{{mb.input, x}}, out;
-        if (!ffx_ml::RunReference(DescribeModel(S, S), in, out, &error))
-            return Log("self-check reference: %s", error.c_str()), m_check = kCheckFailed, false;
-        for (int o = 0; o < 2; ++o)
-        {
-            const auto& v = out[o ? mb.gate : mb.params];
-            const size_t px = S / 2 * S / 2, ch = v.size() / px;
-            m_checkChannels[o] = uint32_t(std::min<size_t>(4, ch));
-            m_checkWant[o].assign(px * 4, 0);
-            for (size_t p = 0; p < px; ++p) for (size_t c = 0; c < ch && c < 4; ++c) m_checkWant[o][p * 4 + c] = uint8_t(v[p * ch + c]);
-        }
+        // The network and the reference's bytes, on a worker thread.
+        m_checkMake = std::async(std::launch::async, [this] {
+            std::string error;
+            try
+            {
+                if (!m_checkPass) m_checkPass = m_dev.CreatePass(shaders::kCheck);
+                m_checkNet = m_dev.CreateNetwork(S, S, &error);
+                if (!m_checkNet && m_dev.DropRung()) m_checkNet = m_dev.CreateNetwork(S, S, &error);
+                if (!m_checkNet || !m_checkPass) return Log("network not possible: %s", error.c_str()), false;
+                if (!m_checkWant[0].empty()) return true;
+                std::vector<int8_t> x(S * S * kInputChannels);
+                for (uint32_t i = 0; i < x.size() / 4; ++i)
+                {
+                    uint32_t h = i * 2654435761u + 1013904223u;
+                    h = (h ^ (h >> 15)) * 2246822519u, h = (h ^ (h >> 13)) * 3266489917u, h ^= h >> 16;
+                    memcpy(&x[i * 4], &h, 4);
+                }
+                const ModelBindings mb = GetModelBindings();
+                std::map<uint32_t, std::vector<int8_t>> in{{mb.input, x}}, out;
+                if (!ffx_ml::RunReference(DescribeModel(S, S), in, out, &error)) return Log("self-check reference: %s", error.c_str()), false;
+                for (int o = 0; o < 2; ++o)
+                {
+                    const auto& v = out[o ? mb.gate : mb.params];
+                    const size_t px = S / 2 * S / 2, ch = v.size() / px;
+                    m_checkChannels[o] = uint32_t(std::min<size_t>(4, ch));
+                    m_checkWant[o].assign(px * 4, 0);
+                    for (size_t p = 0; p < px; ++p) for (size_t c = 0; c < ch && c < 4; ++c) m_checkWant[o][p * 4 + c] = uint8_t(v[p * ch + c]);
+                }
+                return true;
+            }
+            catch (const std::exception& x) { return Log("self-check: %s", x.what()), false; }
+        });
+        m_check = kCheckMaking;
+        if (EnvFlag("NFRUX_SYNC_CREATE", false)) m_checkMake.wait();
     }
+    if (m_checkMake.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return false;
+    if (!m_checkMake.get())
+        return m_check = kCheckFailed, false;
     const Bind b[] = {Bind::Buf(0, *m_checkNet->input)};
     if (!m_checkPass->Dispatch(b, 1, S * S * kInputChannels / 4 / 64, 1))
         return m_check = kCheckFailed, false;
@@ -283,10 +301,11 @@ bool FrameGenerator::InMenu(const EvalInputs& in)
         if (menu != m_inMenu) Log(menu ? "full-screen menu (%.0f%%): no interpolation" : "menu gone (%.0f%%): interpolating again", share * 100.0f);
         m_inMenu = menu;
     }
+    if (m_menuReads.size() > 64) m_menuReads.clear();  // a recording that was never submitted
     if (!m_menuPass) m_menuPass = m_dev.CreatePass(shaders::kMenu);
     Texture*       counts = Keep(m_menuCounts, Format::R32Uint, 2, 1);
     const Texture* src    = m_dev.Wrap(ui, false);
-    if (!m_menuPass || !counts || !src || r.x + r.w > ui.width || r.y + r.h > ui.height || m_menuReads.size() > 16)
+    if (!m_menuPass || !counts || !src || r.x + r.w > ui.width || r.y + r.h > ui.height || false)
         return m_inMenu;
     m_dev.Clear(*counts, 1.0f);  // every bit set: the shader's adds start from there
     const int32_t k[8] = {int32_t(r.x), int32_t(r.y), int32_t(r.w), int32_t(r.h), 8, alpha};
@@ -406,6 +425,8 @@ bool FrameGenerator::Generate(const EvalInputs& in)
         if (uiAlpha || uiLayer) f.uiAlpha = uiAlpha ? in.uiAlpha : in.ui;
     }
     if (!staged && l.hasNoWarp) f.noWarp = in.noWarp;
+    const uint32_t kind = (hudless ? 1u : 0u) | (staged ? 2u : 0u) | (in.distortion ? 4u : 0u);
+    if (kind != m_kind) m_kind = kind, m_restart = true;  // the history is another kind of image
     f.reset = in.reset || m_restart;
     f.jitter[0] = in.jitter[0], f.jitter[1] = in.jitter[1], f.motionJittered = in.motionJittered;
     f.mvScale[0] = in.mvScale[0] * float(l.back.w) / float(std::max(1u, mw));
@@ -445,8 +466,8 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!in.back || !in.output)
         return false;
-    ++m_evaluations;
     static const int dumpAt = Env("NFRUX_DUMP") ? atoi(Env("NFRUX_DUMP")) : -1;  // diagnosis: three rendered frames and what was made
+    static const int dumpFrames = Env("NFRUX_DUMP_FRAMES") ? atoi(Env("NFRUX_DUMP_FRAMES")) : 8;
     static int rendered = 0;
     static std::vector<std::pair<std::string, std::shared_ptr<std::vector<uint8_t>>>> dumps;
     if (in.index <= 1)
@@ -454,7 +475,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         char v[16];
         rendered = dumpAt >= 0 && GetEnvironmentVariableA("NFRUX_FRAME", v, 16) ? std::max(rendered + 1, atoi(v)) : rendered + 1;  // the sample's frame number
     }
-    if (dumpAt >= 0 && rendered >= dumpAt + 60 && !dumps.empty())
+    if (dumpAt >= 0 && rendered >= dumpAt + dumpFrames + 52 && !dumps.empty())
     {
         m_dev.WaitIdle();
         for (auto& [n, v] : dumps)
@@ -463,7 +484,8 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     }    m_retired.erase(std::remove_if(m_retired.begin(), m_retired.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_retired.end());
     m_oldCuts.erase(std::remove_if(m_oldCuts.begin(), m_oldCuts.end(), [&](auto& r) { return m_evaluations - r.second > 256; }), m_oldCuts.end());
     if (!m_dev.BeginFrame(commands))
-        return false;
+        return false;  // nothing can be recorded (32 recordings unfinished after 2 s)
+    ++m_evaluations;  // recordings: 32 at most are in flight, so what is 256 old is free
     if (in.index <= 1)
     {
         m_ready = 0;
@@ -491,7 +513,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     if (in.outputReal && in.outputReal.handle != in.back.handle)
         if (Texture* real = m_dev.Wrap(in.outputReal, true))
             m_dev.CopyTexture(back, *real);
-    if (dumpAt >= 0 && rendered >= dumpAt && rendered < dumpAt + 8)
+    if (dumpAt >= 0 && rendered >= dumpAt && rendered < dumpAt + dumpFrames)
     {
         auto add = [&](const std::string& what, const Texture& t) {
             dumps.push_back({what + "_" + std::to_string(in.back.width) + "x" + std::to_string(in.back.height) + "_f" + std::to_string(rendered - dumpAt) + "_k" + std::to_string(in.index) + ".bin",

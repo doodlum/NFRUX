@@ -34,6 +34,7 @@ FFX_MIN16_F4 Stable_Softmax(FFX_MIN16_F4 tensor, FFX_MIN16_F4 prior)
     // Subtract the max value to help reduce overflow issues
     FFX_MIN16_F4 stable_ten     = tensor - max4(tensor);
     FFX_MIN16_F4 e_ten          = exp2(stable_ten * 1.44269504088896340736f) * prior;
+    e_ten                      /= max4(e_ten);  // the largest is 1, as when the prior is in the logits
     FFX_MIN16_F  sum            = ((e_ten.x + e_ten.y) + e_ten.z) + e_ten.w;
     FFX_MIN16_F4 smax_activated = e_ten / (sum + HALF_MIN);
     return smax_activated;
