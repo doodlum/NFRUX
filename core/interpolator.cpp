@@ -211,7 +211,7 @@ bool Interpolator::Impl::Create(std::string* error)
     bytes    = s.outputFormat == Format::RGBA8Unorm || s.outputFormat == Format::BGRA8Unorm || s.outputFormat == Format::RGB10A2Unorm;
 
     NFRUX_PASS(initWarp, kFiInitWarp)
-    if (bytes) { NFRUX_PASS(downAll, kFiDownsampleAll8) NFRUX_PASS(downColour, kFiDownsampleColour8) NFRUX_PASS(preprocess8, kFiPreprocess8) }
+    if (bytes) { NFRUX_PASS(downAll, kFiDownsampleAll8) NFRUX_PASS(downColour, kFiDownsampleColour8) }
     else { NFRUX_PASS(downAll, kFiDownsampleAll) NFRUX_PASS(downColour, kFiDownsampleColour) }
     NFRUX_PASS(warp, kFiWarpFlow) NFRUX_PASS(warpTm1, kFiWarpFlowTm1) NFRUX_PASS(fillTm1, kFiFillHolesTm1) NFRUX_PASS(preprocess, kFiPreprocess)
     NFRUX_PASS(inpaintSeed, kFiInpaintSeed) NFRUX_PASS(inpaintMip, kFiInpaintMip) NFRUX_PASS(inpaint, kFiInpaint)
@@ -244,7 +244,7 @@ bool Interpolator::Impl::Create(std::string* error)
     for (auto& t : depthTm1) tex(t, Format::R32Float, mvLane);
     for (auto& t : colorTm1) ok = ok && (t = dev.CreateTextureLike(s.colorLike, display.width, display.height));
     if (allInput || colourDown)
-        for (auto& t : prep) tex(t, bytes ? Format::RGBA8Unorm : Format::RGBA16Float, mvLane, bytes);
+        for (auto& t : prep) tex(t, bytes ? Format::RGBA8Unorm : Format::RGBA16Float, mvLane);
     if (allInput) tex(reducedMotion, Format::RG16Float, mvLane);
     tex(computedMv, Format::RG16Float, of), tex(flow, Format::RG16Float, of), tex(flowHint, Format::RG16Float, of);
     for (auto& t : pyramid) tex(t, Format::R8Unorm, {level[1].width, uint32_t(rows)});
@@ -408,7 +408,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         k._DepthClipPower = 1.0f + 2.0f * std::min(diagonal / reference, 1.0f);
     }
     k._Reset = reset ? 1 : 0;
-    const bool down = allInput || colourDown, byteLane = down && bytes && preprocess8;
+    const bool down = allInput || colourDown, byteLane = false;
     const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) |
                              (byteLane ? 0x800u : 0u) | (s.swapRB ? 0x1000u : 0u);
 

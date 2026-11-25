@@ -16,7 +16,7 @@ enum class Format : uint32_t
     Unknown, R8Unorm, RG16Float, R32Float, R32Uint, RGBA8Unorm, RGBA8Snorm, BGRA8Unorm, RGBA16Float, RGB10A2Unorm, RG11B10Float, Native
 };
 
-enum class BindKind : uint32_t { Cbv, SrvTexture, UavTexture, SrvBuffer, UavBuffer };
+enum class BindKind : uint32_t { Cbv, SrvTexture, UavTexture, SrvBuffer, UavBuffer, Sampler };
 struct ShaderBinding
 {
     uint32_t binding;

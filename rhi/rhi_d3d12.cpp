@@ -207,6 +207,7 @@ public:
         for (uint32_t i = 0; i < s.bindingCount; ++i)
         {
             const ShaderBinding& b = s.bindings[i];
+            if (b.kind == BindKind::Sampler) continue;
             if (b.kind == BindKind::Cbv)
             {
                 D3D12_ROOT_PARAMETER rp = {D3D12_ROOT_PARAMETER_TYPE_CBV};

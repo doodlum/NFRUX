@@ -122,6 +122,7 @@ def build(job):
     for kind in ("ubos", "ssbos", "textures", "images", "separate_images", "separate_samplers"):
         for r in refl.get(kind, []):
             if kind == "separate_samplers":
+                binds.append((r["binding"], "Sampler"))
                 continue
             k = {"ubos": "Cbv", "textures": "SrvTexture", "separate_images": "SrvTexture", "images": "UavTexture"}.get(kind)
             if kind == "ssbos":
