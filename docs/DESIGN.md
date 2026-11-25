@@ -1,6 +1,6 @@
 # NFRUX design
 
-Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md). Nothing under "Acceptance" counts as done until its
+Status: revision 9, agreed by all three reviewers (docs/REVIEWS.md); since then one change by decision (fast Vulkan network by default on NVIDIA under OptiScaler, D3), not reviewed. Nothing under "Acceptance" counts as done until its
 evidence is in `docs/RESULTS.md`.
 
 ## 1. Goal and requirements
@@ -199,10 +199,9 @@ else is optional and needs to be *enabled*. Source of truth:
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the
   app's own process and device are affected; additions are logged.
-- OptiScaler route: the enabled set is unknown. The floor is used, with the two assumptions of D1b (Vulkan 1.2, and that
-  `shaderStorageImageExtendedFormats` works (reported by every desktop driver; outside strict validity when the app has not enabled it,
-  and logged so). Formats rgba8/rgba16f/r32f/r32ui need no feature. `NFRUX_VK_ASSUME_FEATURES=1` (opt-in, same caveat) enables the
-  optional rungs.
+- OptiScaler route: the enabled set is unknown. The two assumptions of D1b (Vulkan 1.2, shaderStorageImageExtendedFormats) are made and logged. On NVIDIA the GPU's optional features are used as well (project,
+  2026-11-25: outside strict validity when the game has not enabled them; its driver takes them, RTX 4070 tested), behind the crash marker of CUDA's kind and the self-check; elsewhere the floor.
+  `NFRUX_VK_ASSUME_FEATURES=0 / 1` decides on any GPU. Markers (both rungs) are cleared when 40 recordings have completed since the network first ran, or on an orderly end.
 The loader hands the DLL the recorded set per VkDevice (export `NFRUX_SetVulkanFeatures`); no record means the OptiScaler behaviour.
 A4's validation run uses the standalone loader, which makes the cooperative-matrix rung valid. Fallback when M0a cannot intercept
 vkCreateDevice: Vulkan uses the floor, A4 claims only that, and the ladder text is amended.

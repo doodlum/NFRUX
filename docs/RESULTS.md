@@ -441,3 +441,6 @@ BGRA8 4x: strict 0 bytes, shipped 98.8 dB or better. On the commit after the agr
 
 An OptiScaler build with FGNvngxReplacement (FGInput=nvngxfg), sample 1280x701: on D3D12 it ends with an access violation in ntdll with another provider selected, as with NFRUX and
 with none: not NFRUX's. Vulkan, 2x / 4x: NFRUX selected by name ("NFRUX"), integer network 229 / 226; with NFRUX_VK_ASSUME_FEATURES=1: 2x 375, 4x 419, 6x 510.
+
+Fast Vulkan network by default on NVIDIA where the host's features are unknown: OptiScaler 0.9.5 2x 380 fps (fp16 cooperative matrix), with NFRUX_VK_ASSUME_FEATURES=0 287 (integers). A marker at two unfinished starts: integers, said in the log.
+A start killed early leaves the count at one; the next full run clears it. Harness 158 checks, strict 63 of 63 identical; minimal host with nothing assumed, under validation, 78 of 78; with assumption 78 of 78.

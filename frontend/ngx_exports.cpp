@@ -1,4 +1,5 @@
 // nvngx_dlssg.dll: the NGX entry points of frame generation (feature 11) for D3D12 and Vulkan. SPDX-License-Identifier: MIT
+#include "marker.h"
 #include "frame_generator.h"
 
 #include "../core/log.h"
@@ -52,11 +53,17 @@ std::unique_ptr<Device> DeviceForVk()
     h.minorVersion = 2;  // whatever the GPU reports: the host may have asked for less
     if (!g_vkKnown) Log("Vulkan: assuming 1.2 and shaderStorageImageExtendedFormats are enabled on the game's device (no loader to tell)");
     if (g_vkKnown && g_vkDevice == g_vk.d) h.mlFeatures = g_vkMl;
-    else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", false))
+    // Unknown (OptiScaler): the GPU's features on NVIDIA, whose driver takes them whether or not the game enabled them (2026-11-25), behind a
+    // crash marker; elsewhere only when asked for. NFRUX_VK_ASSUME_FEATURES=0 / 1 decides.
+    else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", p.vendorID == 0x10DE))
     {
+        char m[48];
+        snprintf(m, sizeof(m), "vulkan_%04x_%04x", p.vendorID, p.deviceID);
+        if (!MarkerBegin(m)) return CreateNriVulkanDevice(h);
+        h.marker = m;
         std::vector<const char*> ext;
         h.mlFeatures = ffx_ml::QueryDeviceFeatures(h.instance, h.physicalDevice, h.gipa, &ext);
-        Log("NFRUX_VK_ASSUME_FEATURES: using device features whether or not the game enabled them");
+        Log("Vulkan: the GPU's features are used whether or not the game enabled them (NFRUX_VK_ASSUME_FEATURES=0: not)");
     }
     return CreateNriVulkanDevice(h);
 }

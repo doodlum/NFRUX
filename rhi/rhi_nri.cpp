@@ -151,6 +151,7 @@ public:
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear(), scratch.clear();
         if (cudaState == 1 && !Lost()) MarkerOk(Rung());
+        if (!vk.marker.empty()) MarkerOk(vk.marker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
@@ -383,6 +384,7 @@ public:
         std::lock_guard<std::mutex> lock(making);
         if (rung < 0 || rung >= 2) return false;
         if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
+        if (isVk) vk.marker.clear();
         if (isVk && rung == 0 && lastFloat && !noFloats) { noFloats = true; return true; }  // the int8 matrices next, if there are any
         topRung = rung + 1;
         return true;
@@ -491,7 +493,8 @@ public:
     }
     std::atomic<int> cudaState = 0;  // 0 not tried, 1 in use, -1 not
     uint32_t    finished = 0;
-    bool        marked = false;
+    bool        marked = false, ran = false;
+    uint32_t    firstRun = 0;  // finished when the network first ran
     std::string Rung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
     bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
@@ -516,7 +519,9 @@ public:
     bool BeginFrame(void* commands) override
     {
         Poll();
-        if (cudaState == 1 && finished >= 10 && !marked) marked = true, MarkerOk(Rung());  // ten recordings completed
+        // Recordings from well after the network first ran have completed (those before it say nothing).
+        if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(Rung());
+        if (!vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
         nativeCmd = commands, t_recording = true;
         if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));
         if (isVk)
@@ -722,6 +727,7 @@ public:
     }
     void RunNetworks(Network* const* nets, uint32_t count) override
     {
+        if (!ran) ran = true, firstRun = finished;
         for (uint32_t i = 0; i < count; ++i)
         {
             auto& x = static_cast<NetN&>(*nets[i]);

@@ -1248,6 +1248,7 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) return puts("ngx_harness DLL [--minimal] [--soak N] [d3d12|vulkan]"), 2;
     if (!getenv("NFRUX_ASYNC_TEST")) SetEnvironmentVariableA("NFRUX_SYNC_CREATE", "1");  // every frame counted on; else the worker thread's path
+    for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--minimal") && !getenv("NFRUX_VK_ASSUME_FEATURES")) SetEnvironmentVariableA("NFRUX_VK_ASSUME_FEATURES", "0");  // nothing is enabled there
     HMODULE dll = LoadLibraryExA(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) return printf("cannot load %s\n", argv[1]), 2;
     bool minimal = false;
