@@ -438,3 +438,6 @@ One recording, one scene (noisy ray tracing), one GPU: 0.2 dB is not a ranking, 
 changes little; opaque means over 90 codes from the HUD-less picture. Picture: `build\compare.png` (not in the repository).
 Re-run on 93cff40: GPU-based validation CUDA and dot4, scalar (D3D12), int8 / dot4 / scalar (Vulkan): 78 of 78 each, 0 messages; A5 replays at 4x (60 and 55 frames): strict 0 bytes, shipped 76.0 and 75.1 dB; parity 1366x767 inverted 6x and 4K
 BGRA8 4x: strict 0 bytes, shipped 98.8 dB or better. On the commit after the agreement: harness strict and shipped, 2000-evaluate soak, sample 4x on both APIs (D3D12 under the debug layer).
+
+An OptiScaler build with FGNvngxReplacement (FGInput=nvngxfg), sample 1280x701: on D3D12 it ends with an access violation in ntdll with another provider selected, as with NFRUX and
+with none: not NFRUX's. Vulkan, 2x / 4x: NFRUX selected by name ("NFRUX"), integer network 229 / 226; with NFRUX_VK_ASSUME_FEATURES=1: 2x 375, 4x 419, 6x 510.
