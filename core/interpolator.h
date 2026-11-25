@@ -16,7 +16,7 @@ struct FrameInputs
     const Texture* colorTexture = nullptr;  // instead of color, of Settings::colorLike's format
     bool          scrgb = false;  // linear HDR: the UI difference test compresses its values
     uint32_t      uiKind = 0;  // 0 difference test, 2/3 UI alpha red / alpha over HUD-less, 4/5 without HUD-less
-    bool          reset  = false;
+    bool          reset  = false, motionJittered = false;
     float         jitter[2] = {}, mvScale[2] = {1, 1};  // mvScale: to display pixels
     float         viewProjection[16] = {};
     float         cameraNear = 0.1f, cameraFar = 1000.0f, fovY = 1.0f;

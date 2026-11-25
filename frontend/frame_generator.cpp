@@ -407,7 +407,7 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     }
     if (!staged && l.hasNoWarp) f.noWarp = in.noWarp;
     f.reset = in.reset || m_restart;
-    f.jitter[0] = in.jitter[0], f.jitter[1] = in.jitter[1];
+    f.jitter[0] = in.jitter[0], f.jitter[1] = in.jitter[1], f.motionJittered = in.motionJittered;
     f.mvScale[0] = in.mvScale[0] * float(l.back.w) / float(std::max(1u, mw));
     f.mvScale[1] = in.mvScale[1] * float(l.back.h) / float(std::max(1u, mh));
     f.cameraNear = in.cameraNear, f.cameraFar = in.cameraFar, f.fovY = in.fovY, f.orthographic = in.ortho;

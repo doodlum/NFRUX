@@ -19,7 +19,7 @@ struct EvalInputs
     float distortionScale = 1, distortionBias = 0;
     float mvScale[2] = {1, 1}, jitter[2] = {}, cameraNear = 0.1f, cameraFar = 1000.0f, fovY = 1.0f;
     float viewToClip[16] = {}, clipToPrevClip[16] = {}, pos[3] = {}, up[3] = {}, right[3] = {}, fwd[3] = {};
-    bool  hasClipToPrevClip = false, depthInverted = false, hdr = false, reset = false, notRendering = false, ortho = false, menuDetection = false;
+    bool  hasClipToPrevClip = false, depthInverted = false, hdr = false, reset = false, notRendering = false, ortho = false, menuDetection = false, motionJittered = false;
     uint32_t count = 1, index = 1;  // DLSSG.MultiFrameCount / MultiFrameIndex
 };
 

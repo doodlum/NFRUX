@@ -367,6 +367,10 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     float inv[16];
     Invert(lastVP, inv), Multiply(in.viewProjection, inv, k._MotionTM1ToTP1);
     Invert(in.viewProjection, inv), Multiply(lastVP, inv, k._MotionTP1ToTM1);
+    // Vectors that contain the sample positions' jitter (render pixels): its change taken out, as the SDK's jitter cancellation does.
+    const bool jittered = in.motionJittered && !reset;
+    k._JitterCancellation[0] = jittered ? (in.jitter[0] - k._Jitter[0]) / float(render.width) : 0.0f;
+    k._JitterCancellation[1] = jittered ? (in.jitter[1] - k._Jitter[1]) / float(render.height) : 0.0f;
     k._Jitter[0] = in.jitter[0], k._Jitter[1] = in.jitter[1];
     k._MotionVectorScale[0] = in.mvScale[0] / float(display.width), k._MotionVectorScale[1] = in.mvScale[1] / float(display.height);
     {

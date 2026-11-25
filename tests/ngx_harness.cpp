@@ -519,6 +519,7 @@ struct Scene
 {
     Fmt back = F_RGBA8, hud = F_RGBA8, ui = F_RGBA8, alpha = F_R8;
     bool hdr = false;
+    float mvOffset[2] = {};
     uint32_t w = W, h = H, gen = 2, frames = 4;
     std::function<Image(int)> backI, hudI, uiI, alphaI, noWarpI, fieldI;
     std::function<void(Params&, int)> extra;
@@ -532,7 +533,7 @@ static Out Run(Api& a, const Scene& s, NgxHandle* use = nullptr)
     TexP back = tex(s.back, s.w, s.h), out = tex(s.back, s.w, s.h, true), real = tex(s.back, s.w, s.h, true), depth = tex(F_R32F, W, H), mv = tex(F_RG16F, W, H);
     TexP hud, ui, al, nw, fd;
     Image dI(W, H, 0.9f), mI(W, H);
-    for (uint32_t i = 0; i < W * H; ++i) mI.p[i * 4] = -8, mI.p[i * 4 + 1] = -2;
+    for (uint32_t i = 0; i < W * H; ++i) mI.p[i * 4] = -8 + s.mvOffset[0], mI.p[i * 4 + 1] = -2 + s.mvOffset[1];
     a.Upload(*depth, Encode(dI, F_R32F)), a.Upload(*mv, Encode(mI, F_RG16F));
     a.Bind(p, "DLSSG.Backbuffer", back.get()), a.Bind(p, "DLSSG.OutputInterpolated", out.get()), a.Bind(p, "DLSSG.OutputReal", real.get());
     a.Bind(p, "DLSSG.Depth", depth.get()), a.Bind(p, "DLSSG.MVecs", mv.get());
@@ -687,6 +688,19 @@ static void Scenes(Api& a, Results& res)
         Out u = Run(a, s);  // half-resolution inputs in the corner of a bigger image: vectors in their own pixels would be half; the scale says display
         keep("depth subrect", u);
         Check(u.ok, "evaluates", 1);
+    }
+    printf("  jittered motion vectors\n");
+    {
+        // The camera's sample positions move by (0.4, -0.3) a frame and the vectors contain it: the same frames as without.
+        Scene s = plain;
+        s.extra = [](Params& p, int i) {
+            p.Set("DLSSG.JitterOffsetX", 0.4f * float(i)), p.Set("DLSSG.JitterOffsetY", -0.3f * float(i)), p.Set("DLSSG.MvecJittered", 1);
+        };
+        s.mvOffset[0] = 0.4f, s.mvOffset[1] = -0.3f;
+        Out u = Run(a, s);
+        keep("jitter", u);
+        double q = Psnr(u.gen[0], base.gen[0], 24);
+        Check(q > 50, "taken out: as without, dB", q);
     }
     printf("  HUD-less in another format (RGB10A2, BGRA8)\n");
     for (Fmt f : {F_RGB10, F_BGRA8})
