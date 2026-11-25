@@ -8,6 +8,7 @@
 //
 //   ffx_ml_runtime_test [--gpu N] [--width W] [--height H] [--iterations N]
 
+#include "cuda_vulkan.h"
 #include "tosa_graph.h"
 #include "vulkan_network.h"
 
@@ -241,6 +242,15 @@ namespace
             extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
         }
 
+        for (const char* e : {VK_NVX_BINARY_IMPORT_EXTENSION_NAME})  // CUDA kernels, where the driver has them
+        {
+            uint32_t n = 0;
+            vkEnumerateDeviceExtensionProperties(ctx.physical, nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> all(n);
+            vkEnumerateDeviceExtensionProperties(ctx.physical, nullptr, &n, all.data());
+            for (auto& x : all) if (!strcmp(x.extensionName, e)) extensions.push_back(e);
+        }
+        v12.bufferDeviceAddress = VK_TRUE;
         const float             priority  = 1.0f;
         VkDeviceQueueCreateInfo queueInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, nullptr, 0, ctx.queueFamily, 1, &priority};
         VkDeviceCreateInfo      deviceInfo = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -540,6 +550,74 @@ namespace
             ctx.Destroy(b);
         return pass;
     }
+    // CUDA kernels on Vulkan against the reference, and their time (64 in a submission, best of the last few).
+    bool RunCuda(Context& ctx, const Model& model, const std::map<uint32_t, std::vector<int8_t>>& inputs, const std::map<uint32_t, std::vector<int8_t>>& reference, bool time)
+    {
+        const ffx_ml::DeviceContext dc = {ctx.instance, ctx.physical, ctx.device, vkGetInstanceProcAddr, vkGetDeviceProcAddr, ctx.features};
+        std::string error;
+        auto g = nfrux::CudaVulkanGraph::Create(dc, model.desc, &error);
+        if (!g) return printf("  CUDA on Vulkan: not available (%s)\n", error.c_str()), true;
+        std::vector<std::unique_ptr<nfrux::CudaVulkanGraph>> three;
+        auto in = g->MakeBuffer(inputs.begin()->second.size(), false);
+        nfrux::CudaVulkanGraph::Buffer o[2];
+        for (int i = 0; i < 2; ++i) o[i] = g->MakeBuffer(reference.at(g->outputBinding(i)).size(), false);
+        Buffer up = ctx.CreateBuffer(inputs.begin()->second.size());
+        memcpy(up.mapped, inputs.begin()->second.data(), up.size);
+        VkCommandBuffer cmd;
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, ctx.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        CHECK_VK(vkAllocateCommandBuffers(ctx.device, &ai, &cmd));
+        auto submit = [&](auto&& record) {
+            VkCommandBufferBeginInfo b = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK_VK(vkBeginCommandBuffer(cmd, &b));
+            record();
+            CHECK_VK(vkEndCommandBuffer(cmd));
+            VkSubmitInfo s = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            s.commandBufferCount = 1, s.pCommandBuffers = &cmd;
+            CHECK_VK(vkQueueSubmit(ctx.queue, 1, &s, VK_NULL_HANDLE));
+            CHECK_VK(vkQueueWaitIdle(ctx.queue));
+        };
+        const uint32_t pitch = uint32_t(model.desc.inputShapes.begin()->second[2] / 2 * 4);
+        nfrux::CudaVulkanGraph* gp[3] = {g.get()};
+        const uint64_t ia[3] = {in.address, in.address, in.address}, oa[3][2] = {{o[0].address, o[1].address}, {o[0].address, o[1].address}, {o[0].address, o[1].address}};
+        submit([&] { VkBufferCopy c = {0, 0, up.size}; vkCmdCopyBuffer(cmd, up.buffer, in.buffer, 1, &c); nfrux::CudaVulkanGraph::Record(cmd, gp, ia, oa, 1, pitch); });
+        size_t bad = 0, total = 0;
+        for (int i = 0; i < 2; ++i)
+        {
+            const auto& want = reference.at(g->outputBinding(i));
+            Buffer rb = ctx.CreateBuffer(want.size());
+            submit([&] { VkBufferCopy c = {0, 0, want.size()}; vkCmdCopyBuffer(cmd, o[i].buffer, rb.buffer, 1, &c); });
+            for (size_t b = 0; b < want.size(); ++b) bad += static_cast<int8_t*>(rb.mapped)[b] != want[b];
+            total += want.size();
+            ctx.Destroy(rb);
+        }
+        double ms1 = 0, ms3 = 0;
+        if (time)
+        {
+            for (int i = 0; i < 2; ++i) three.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error)), gp[i + 1] = three.back().get();
+            for (int which = 0; which < 2; ++which)
+            {
+                double best = 1e30;
+                for (int rep = 0; rep < 16; ++rep)
+                {
+                    submit([&] {
+                        vkCmdResetQueryPool(cmd, ctx.queries, 0, 2);
+                        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.queries, 0);
+                        for (int b = 0; b < 32; ++b) nfrux::CudaVulkanGraph::Record(cmd, gp, ia, oa, which ? 3 : 1, pitch);
+                        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.queries, 1);
+                    });
+                    uint64_t ts[2];
+                    CHECK_VK(vkGetQueryPoolResults(ctx.device, ctx.queries, 0, 2, sizeof(ts), ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                    if (rep >= 12) best = std::min(best, double(ts[1] - ts[0]) * ctx.timestampPeriod * 1e-6 / 32);
+                }
+                (which ? ms3 : ms1) = best;
+            }
+        }
+        printf("  CUDA kernels on Vulkan%32s %s  mismatches %zu/%zu  %.3f ms batched, three interleaved %.3f ms each\n", "", bad ? "FAIL  " : "EXACT ", bad, total, ms1, ms3 / 3);
+        g->Destroy(in), g->Destroy(o[0]), g->Destroy(o[1]);
+        ctx.Destroy(up);
+        vkFreeCommandBuffers(ctx.device, ctx.pool, 1, &cmd);
+        return bad == 0;
+    }
 }  // namespace
 
 int main(int argc, char** argv)
@@ -633,6 +711,7 @@ int main(int argc, char** argv)
                 printf("%s: reference failed: %s\n", model.name, error.c_str());
                 return 1;
             }
+            allPass &= RunCuda(ctx, model, inputs, reference, pattern == 0);
             for (const Config& config : configs)
             {
                 // FFX_ML_TEST_PATHS=dot4,scalar,... limits the paths run (faster tuning loops).

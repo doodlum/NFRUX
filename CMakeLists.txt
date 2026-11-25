@@ -15,7 +15,7 @@ add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
 add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
 set(NRI_DIR "${CMAKE_SOURCE_DIR}/third_party/NRI" CACHE PATH "NRI, from tools/build_nri.ps1")
-add_library(nfrux_core STATIC core/log.cpp core/marker.cpp core/model.cpp core/ml/tosa_graph.cpp core/ml/cpu_reference.cpp core/ml/d3d12_network.cpp core/ml/cuda_network.cpp core/ml/vulkan_network.cpp core/interpolator.cpp rhi/rhi_nri.cpp)
+add_library(nfrux_core STATIC core/log.cpp core/marker.cpp core/model.cpp core/ml/tosa_graph.cpp core/ml/cpu_reference.cpp core/ml/d3d12_network.cpp core/ml/cuda_network.cpp core/ml/cuda_vulkan.cpp core/ml/vulkan_network.cpp core/interpolator.cpp rhi/rhi_nri.cpp)
 add_dependencies(nfrux_core nfrux_shaders)
 target_include_directories(nfrux_core PUBLIC core core/ml core/model rhi ${GEN} $ENV{VULKAN_SDK}/Include ${NRI_DIR}/Include)
 add_executable(ml_conformance_d3d12 tests/ml_conformance_d3d12.cpp)

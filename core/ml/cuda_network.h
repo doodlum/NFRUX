@@ -13,6 +13,22 @@
 namespace nfrux
 {
 bool HasTensorCores(const char* name);  // an sm_75 device, by its name
+// What both APIs launch: the kernels linked for the GPU, the constants and the layers.
+struct CudaPlan
+{
+    struct Layer
+    {
+        uint64_t weights = 0, params = 0;
+        int32_t  src[2] = {}, dst = 0;  // internal tensor; -1 the input; -(2 + i) output i
+        uint32_t grid[2] = {};
+        bool     external = false;
+    };
+    std::vector<uint8_t>  cubin, constants;
+    std::vector<uint64_t> tensors;  // bytes
+    std::vector<Layer>    layers;   // layerN
+    std::vector<uint32_t> outputBindings;
+};
+bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::string* error);
 class CudaGraph
 {
 public:
@@ -24,15 +40,7 @@ public:
     uint32_t outputBinding(uint32_t i) const { return m_outputBindings[i]; }
 
 private:
-    struct Layer
-    {
-        void*    fn = nullptr;
-        uint64_t weights = 0, params = 0;
-        int32_t  src[2] = {}, dst = 0;  // internal tensor; -1 the input; -(2 + i) output i
-        uint32_t grid[2] = {};
-        bool     external = false;
-        uint32_t row = 0;  // bytes an output row (internal)
-    };
+    struct Layer : CudaPlan::Layer { void* fn = nullptr; };
     Microsoft::WRL::ComPtr<ID3D12Device>                m_device;
     Microsoft::WRL::ComPtr<ID3D12Resource>              m_constants, m_upload;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_tensors;

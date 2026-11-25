@@ -290,43 +290,31 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
     return head + w.s + "}\n";
 }
 
-std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error)
+bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::string* error)
 {
-    auto fail = [&](const std::string& m) -> std::unique_ptr<CudaGraph> { if (error) *error = m; return nullptr; };
-    if (!Nv().ok) return fail("no NVAPI CUDA launch");
+    auto fail = [&](const std::string& m) { if (error) *error = m; return false; };
+    if (!Nv().cuda) return fail("no nvcuda.dll");
     ffx_ml::tosa::Graph  parsed;
     ffx_ml::LoweredGraph g;
-    if (!ffx_ml::tosa::Parse(desc, parsed, error) || !ffx_ml::Lower(parsed, g, error)) return nullptr;
-    auto out = std::unique_ptr<CudaGraph>(new CudaGraph());
-    out->m_device = device;
-    out->m_outputBindings = parsed.outputBindings;
-    auto buffer = [&](uint64_t size, D3D12_HEAP_TYPE heap) {
-        D3D12_HEAP_PROPERTIES hp = {heap};
-        D3D12_RESOURCE_DESC   d  = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, (size + 255) & ~255ull, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                                    heap == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
-        ComPtr<ID3D12Resource> r;
-        device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, heap == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
-        return r;
-    };
+    if (!ffx_ml::tosa::Parse(desc, parsed, error) || !ffx_ml::Lower(parsed, g, error)) return false;
+    out.outputBindings = parsed.outputBindings;
     std::map<uint32_t, int32_t> slot;
     for (uint32_t i = 0; i < g.tensors.size(); ++i)
     {
         const auto& t = g.tensors[i];
         if (!t.external)
         {
-            slot[i] = int32_t(out->m_tensors.size());
-            out->m_tensors.push_back(buffer(uint64_t(t.h) * t.w * t.channelStride, D3D12_HEAP_TYPE_DEFAULT));
-            if (!out->m_tensors.back()) return fail("out of memory");
+            slot[i] = int32_t(out.tensors.size());
+            out.tensors.push_back(uint64_t(t.h) * t.w * t.channelStride);
             continue;
         }
         const auto it = std::find(parsed.outputBindings.begin(), parsed.outputBindings.end(), t.binding);
         slot[i] = std::find(parsed.inputBindings.begin(), parsed.inputBindings.end(), t.binding) != parsed.inputBindings.end() ? -1 : -2 - int32_t(it - parsed.outputBindings.begin());
     }
     // Without tensor cores (GTX) dot4 uses the same hardware as CUDA would.
-    if (!ComputeCapability(device->GetAdapterLuid(), error)) return nullptr;
-    std::string          ptx = ".version 7.1\n.target sm_75\n.address_size 64\n";
-    std::vector<uint8_t> constants;
-    for (size_t li = 0; li < g.convs.size(); ++li)
+    if (!ComputeCapability(luid, error)) return false;
+    std::string           ptx = ".version 7.1\n.target sm_75\n.address_size 64\n";
+    std::vector<uint8_t>& constants = out.constants;    for (size_t li = 0; li < g.convs.size(); ++li)
     {
         const auto& fc = g.convs[li];
         const auto& c  = *fc.conv;
@@ -340,7 +328,7 @@ std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml:
                   fc.outC <= 64 && (s0.resize ? s0.offset[0] >= -s0.scale[0] && s0.offset[1] >= -s0.scale[2] : t0.h == fc.inH && t0.w == fc.inW);
         for (int32_t s : r.shift) ok = ok && s >= 2 && s <= 62;
         if (!ok) return fail("unsupported layer " + std::to_string(li));
-        Layer l;
+        CudaPlan::Layer l;
         l.dst = slot[fc.output], l.external = l.dst < -1;
         ptx += LayerPtx(uint32_t(li), fc, g, l.external);
         const int chunks = (ic0 + ic1 + 3) / 4, nt = (fc.outC + 7) / 8, taps = c.kernelH * c.kernelW, ic = fc.inC, pad = (fc.outC + 3) & ~3;
@@ -367,21 +355,49 @@ std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml:
         constants.insert(constants.end(), reinterpret_cast<uint8_t*>(p.data()), reinterpret_cast<uint8_t*>(p.data() + p.size()));
         l.src[0] = slot[s0.tensor], l.src[1] = two ? slot[fc.sources[1].tensor] : l.src[0];
         l.grid[0] = uint32_t(fc.outW + 63) / 64, l.grid[1] = uint32_t(fc.outH);
+        out.layers.push_back(l);
+    }
+    out.cubin = Cubin(ptx, luid, error);
+    return !out.cubin.empty();
+}
+
+std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error)
+{
+    auto fail = [&](const std::string& m) -> std::unique_ptr<CudaGraph> { if (error) *error = m; return nullptr; };
+    if (!Nv().ok) return fail("no NVAPI CUDA launch");
+    CudaPlan plan;
+    if (!MakeCudaPlan(desc, device->GetAdapterLuid(), plan, error)) return nullptr;
+    auto out = std::unique_ptr<CudaGraph>(new CudaGraph());
+    out->m_device = device;
+    out->m_outputBindings = plan.outputBindings;
+    auto buffer = [&](uint64_t size, D3D12_HEAP_TYPE heap) {
+        D3D12_HEAP_PROPERTIES hp = {heap};
+        D3D12_RESOURCE_DESC   d  = {D3D12_RESOURCE_DIMENSION_BUFFER, 0, (size + 255) & ~255ull, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0}, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                    heap == D3D12_HEAP_TYPE_DEFAULT ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        ComPtr<ID3D12Resource> r;
+        device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, heap == D3D12_HEAP_TYPE_UPLOAD ? D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
+        return r;
+    };
+    for (uint64_t s : plan.tensors)
+    {
+        out->m_tensors.push_back(buffer(s, D3D12_HEAP_TYPE_DEFAULT));
+        if (!out->m_tensors.back()) return fail("out of memory");
+    }
+    if (Nv().createModule(device, plan.cubin.data(), uint32_t(plan.cubin.size()), &out->m_module)) return fail(error && error->rfind("linked", 0) == 0 ? *error + ", CreateCuModule" : std::string("CreateCuModule"));
+    for (size_t i = 0; i < plan.layers.size(); ++i)
+    {
+        Layer l;
+        static_cast<CudaPlan::Layer&>(l) = plan.layers[i];
+        if (Nv().createFunction(device, out->m_module, ("layer" + std::to_string(i)).c_str(), &l.fn)) return fail("CreateCuFunction");
         out->m_layers.push_back(l);
     }
-    const std::vector<uint8_t> cubin = Cubin(ptx, device->GetAdapterLuid(), error);
-    if (cubin.empty()) return nullptr;
-    if (Nv().createModule(device, cubin.data(), uint32_t(cubin.size()), &out->m_module)) return fail(error && error->rfind("linked", 0) == 0 ? *error + ", CreateCuModule" : std::string("CreateCuModule"));
-    for (size_t i = 0; i < out->m_layers.size(); ++i)
-        if (Nv().createFunction(device, out->m_module, ("layer" + std::to_string(i)).c_str(), &out->m_layers[i].fn)) return fail("CreateCuFunction");
-    out->m_constants = buffer(constants.size(), D3D12_HEAP_TYPE_DEFAULT), out->m_upload = buffer(constants.size(), D3D12_HEAP_TYPE_UPLOAD);
+    out->m_constants = buffer(plan.constants.size(), D3D12_HEAP_TYPE_DEFAULT), out->m_upload = buffer(plan.constants.size(), D3D12_HEAP_TYPE_UPLOAD);
     void* map = nullptr;
     if (!out->m_constants || !out->m_upload || FAILED(out->m_upload->Map(0, nullptr, &map))) return fail("out of memory");
-    memcpy(map, constants.data(), constants.size());
+    memcpy(map, plan.constants.data(), plan.constants.size());
     out->m_upload->Unmap(0, nullptr);
     return out;
 }
-
 CudaGraph::~CudaGraph()
 {
     if (Nv().destroyFunction) for (auto& l : m_layers) if (l.fn) Nv().destroyFunction(m_device.Get(), l.fn);
