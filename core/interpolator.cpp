@@ -493,6 +493,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
                           Bind::Tex(13, uiAlpha), Bind::Tex(14, noWarp)};
         if (!post->Dispatch(b, 12, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup))) return false;
     }
+    dev.Mark("(composite)");
     dev.CopyTexture(color, backup);  // the history, in the colour's own format
     return true;
 }

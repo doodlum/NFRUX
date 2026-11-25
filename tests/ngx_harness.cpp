@@ -395,7 +395,7 @@ struct ApiV : Api
         VkCommandBufferAllocateInfo ca = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         vkAllocateCommandBuffers(dv, &ca, &cb);
         vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-        if (!minimal) Fn<void (*)(VkDevice, uint32_t)>("NFRUX_SetVulkanFeatures")(dv, ml);
+        if (!minimal && GetProcAddress(dll, "NFRUX_SetVulkanFeatures")) Fn<void (*)(VkDevice, uint32_t)>("NFRUX_SetVulkanFeatures")(dv, ml);
         return Fn<NgxResult (*)(unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, int, const void*)>("NVSDK_NGX_VULKAN_Init_Ext2")(
                    0, L".", inst, pd, dv, nullptr, nullptr, 0x15, nullptr) == kNgxSuccess;
     }
@@ -1225,6 +1225,50 @@ static bool Replay(Api12& a, const std::string& dir, int first, int count, uint3
     a.Release(h);
     return puts("  replayed"), true;
 }
+// --time: a batch of GEN evaluates, submitted and waited for, with any DLL: milliseconds a rendered frame and what each evaluate was.
+static void Time(Api& a, uint32_t w, uint32_t h, uint32_t gen)
+{
+    Params p;
+    TexP back = a.Create(F_BGRA8, w, h, false), out = a.Create(F_BGRA8, w, h, true), depth = a.Create(F_R32F, w, h, false), mv = a.Create(F_RG16F, w, h, false);
+    Image dI(w, h, 0.9f), mI(w, h);
+    for (uint32_t i = 0; i < w * h; ++i) mI.p[i * 4] = -8, mI.p[i * 4 + 1] = -2;
+    a.Upload(*depth, Encode(dI, F_R32F)), a.Upload(*mv, Encode(mI, F_RG16F));
+    a.Bind(p, "DLSSG.Backbuffer", back.get()), a.Bind(p, "DLSSG.OutputInterpolated", out.get()), a.Bind(p, "DLSSG.Depth", depth.get()), a.Bind(p, "DLSSG.MVecs", mv.get());
+    float id[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    for (const char* n : {"DLSSG.ClipToPrevClip", "DLSSG.PrevClipToClip", "DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView"}) p.Set(n, static_cast<void*>(id));
+    p.Set("Width", w), p.Set("Height", h), p.Set("DLSSG.Width", w), p.Set("DLSSG.Height", h), p.Set("DLSSG.InternalWidth", w), p.Set("DLSSG.InternalHeight", h);
+    p.Set("DLSSG.BackbufferFormat", strcmp(a.Name(), "d3d12") ? 44u : 87u), p.Set("DLSSG.MvecScaleX", 1.0f), p.Set("DLSSG.MvecScaleY", 1.0f), p.Set("DLSSG.CameraNear", 0.1f), p.Set("DLSSG.CameraFar", 100.0f), p.Set("DLSSG.CameraFOV", 1.0f), p.Set("DLSSG.MultiFrameCount", gen), p.Set("DLSSG.CameraMotionIncluded", 1);
+    NgxHandle* f = a.CreateFeature(p);
+    if (!f) { puts("  no feature"); return; }
+    std::vector<Bytes> src;
+    for (int i = 0; i < 4; ++i) src.push_back(Encode(World(w, h, float(i)), F_BGRA8));
+    std::vector<std::vector<double>> ms(gen + 1);
+    LARGE_INTEGER fr, t0, t1;
+    QueryPerformanceFrequency(&fr);
+    bool differs = false;
+    for (int i = 0; i < 160; ++i)
+    {
+        a.Upload(*back, src[i % 4]);
+        p.Set("DLSSG.Reset", int(i == 0));
+        double all = 0;
+        for (uint32_t k = 1; k <= gen; ++k)
+        {
+            p.Set("DLSSG.MultiFrameIndex", k);
+            QueryPerformanceCounter(&t0);
+            a.Evaluate(f, p);
+            QueryPerformanceCounter(&t1);
+            const double d = double(t1.QuadPart - t0.QuadPart) * 1000 / fr.QuadPart;
+            all += d;
+            if (i >= 80) ms[k - 1].push_back(d);
+        }
+        if (i >= 80) ms[gen].push_back(all);
+        if (i == 159) differs = a.Read(*out) != src[i % 4];
+    }
+    printf("  %ux%u %ux:", w, h, gen + 1);
+    for (auto& v : ms) std::sort(v.begin(), v.end()), printf(" %.2f", v[v.size() / 2]);
+    printf(" ms (each evaluate, then all; medians)%s\n", differs ? "" : "  OUTPUT IS THE BACK BUFFER");
+    a.Release(f);
+}
 static void Vram(Api& a)
 {
     for (auto [w, h] : {std::pair<uint32_t, uint32_t>{1920, 1080}, std::pair<uint32_t, uint32_t>{2560, 1440}, std::pair<uint32_t, uint32_t>{3840, 2160}})
@@ -1261,6 +1305,7 @@ int main(int argc, char** argv)
         if (s == "--minimal") minimal = true;
         else if (s == "--replay") { replay = i; i += 5; }
         else if (s == "--vram") soak = ~0u;
+        else if (s == "--time") soak = ~1u;
         else if (s == "--soak") soak = uint32_t(atoi(argv[++i]));
         else which.push_back(s);
     }
@@ -1283,6 +1328,7 @@ int main(int argc, char** argv)
         else { auto a = std::make_unique<Api12>(); a->dll = dll, ok = a->Init(), apis.push_back(std::move(a)); }
         if (!ok) return puts("  device failed"), 2;
         results.emplace_back();
+        if (soak == ~1u) { for (uint32_t n : {1u, 3u, 5u}) Time(*apis.back(), 1280, 701, n), Time(*apis.back(), 1920, 1080, n); continue; }
         if (soak == ~0u) Vram(*apis.back());
         else if (soak) Soak(*apis.back(), soak);
         else Scenes(*apis.back(), results.back());

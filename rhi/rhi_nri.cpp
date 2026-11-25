@@ -148,6 +148,9 @@ public:
 
     ~DevN() override
     {
+        for (auto& [name, t] : times) Log("gpu %-44s %.4f ms a batch, %u dispatches", name.c_str(), t.first / std::max(1u, timedFrames - 60), t.second / std::max(1u, timedFrames - 60));
+        if (marks) n.DestroyQueryPool(marks);
+        if (markBack) n.DestroyBuffer(markBack);
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear(), scratch.clear();
         if (cudaState == 1 && !Lost()) MarkerOk(Rung());
@@ -546,6 +549,8 @@ public:
     {
         for (size_t i = 0; i < wrapped.size(); ++i) To(*wrapped[i], wrappedHome[i]);
         Flush();
+        if (timed && markCount) { Mark("end"); n.CmdCopyQueries(*cmd, *marks, slot * kMarks, markCount, *markBack, uint64_t(slot) * kMarks * 8); }
+        markCount = 0;
         if (!hostBack.empty()) static_cast<ID3D12GraphicsCommandList*>(nativeCmd)->ResourceBarrier(UINT(hostBack.size()), hostBack.data()), hostBack.clear();
         // Everything recorded before finished: then this recording's own value into its own slot, visible to the host.
         if (isVk)
@@ -794,7 +799,43 @@ public:
         n.CmdReadbackTextureToBuffer(*cmd, *r.buf, l, *a.tex, rg);
         reads.push_back(r);
     }
-    void Mark(const char*) override {}
+    // NFRUX_TEST_TIMES: the GPU's time after each pass; means by pass when the device ends.
+    static constexpr uint32_t kMarks = 256;
+    nri::QueryPool* marks = nullptr;
+    nri::Buffer*    markBack = nullptr;
+    bool            timed = EnvFlag("NFRUX_TEST_TIMES", false);
+    uint32_t        markCount = 0;
+    std::vector<std::string> markNames[kSlots];
+    uint32_t        markValue[kSlots] = {};
+    std::map<std::string, std::pair<double, uint32_t>> times;
+    uint32_t        timedFrames = 0;
+    void Mark(const char* label) override
+    {
+        if (!timed || markCount >= kMarks) return;
+        if (!marks)
+        {
+            nri::QueryPoolDesc q = {};
+            q.queryType = nri::QueryType::TIMESTAMP, q.capacity = kMarks * kSlots;
+            if (!NRI_OK(n.CreateQueryPool(*dev, q, marks))) { timed = false; return; }
+            markBack = Committed(uint64_t(kMarks) * kSlots * 8, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE);
+        }
+        if (!markCount)
+        {
+            if (!markNames[slot].empty() && markBack)  // the slot's last recording has finished
+                if (auto* v = static_cast<const uint64_t*>(n.MapBuffer(*markBack, 0, nri::WHOLE_SIZE)))
+                {
+                    const uint64_t* q = v + size_t(slot) * kMarks;
+                    const double hz = double(n.GetDeviceDesc(*dev).other.timestampFrequencyHz), ms = hz > 0 ? 1000.0 / hz : 0;  // (a wrapped D3D12 device has no queue to ask: 0)
+                    if (markNames[slot].size() > 8 && ++timedFrames > 60)
+                        for (size_t i = 1; i < markNames[slot].size(); ++i) { auto& t = times[markNames[slot][i]]; t.first += double(q[i] - q[i - 1]) * ms, ++t.second; }
+                    n.UnmapBuffer(*markBack);
+                }
+            markNames[slot].clear();
+            n.CmdResetQueries(*cmd, *marks, slot * kMarks, kMarks);
+        }
+        markNames[slot].push_back(label);
+        n.CmdEndQuery(*cmd, *marks, slot * kMarks + markCount++);
+    }
     bool WaitIdle() override
     {
         bool busy = true;
@@ -858,7 +899,9 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
     d.n.CmdSetPipeline(*d.cmd, *pipeline);
     nri::SetDescriptorSetDesc sd = {0, set, nri::BindPoint::COMPUTE};
     d.n.CmdSetDescriptorSet(*d.cmd, sd);
+    if (d.timed && !d.markCount) d.Mark("begin");
     d.n.CmdDispatch(*d.cmd, {gx, gy, 1});
+    if (d.timed) d.Mark(name.c_str());
     return true;
 }
 }  // namespace
