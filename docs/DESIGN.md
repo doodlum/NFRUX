@@ -177,7 +177,7 @@ checks each layer and the rung fails if any is outside it. The shape list is wri
 The `[flatten]` two-source load is split so no out-of-range address is formed. Outputs go to buffers and are copied to the
 params / gate textures on every path (paths that write images directly are an optimisation, checked by the same test).
 
-**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML`; a forced rung that is unavailable fails creation.
+**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML`; a forced rung that is unavailable fails creation. For users, `nfrux.ini` beside the DLL (`core/log.cpp`, environment variables win): `Network` per API falls back to the automatic choice when it cannot be made, and a CUDA forced there still counts crash markers; the self-check applies to every choice.
 
 | | 1st | 2nd | floor |
 |---|---|---|---|

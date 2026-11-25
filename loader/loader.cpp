@@ -2,6 +2,7 @@
 // rest to the core untouched. Nothing outside this process changes. SPDX-License-Identifier: MIT
 #include "ngx.h"
 #include "proxy_exports.h"
+#include "../core/log.h"
 #include <windows.h>
 #include <winternl.h>
 #include <atomic>
@@ -16,7 +17,7 @@
 
 static FILE* g_log;
 static std::mutex g_m;
-static void L(const char* f, ...) { static const bool on = getenv("NFRUX_LOG") && strcmp(getenv("NFRUX_LOG"), "0"); if (!on) return; std::lock_guard<std::mutex> k(g_m); if (!g_log && !(g_log = fopen("nfrux_loader.log", "w"))) return; va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
+static void L(const char* f, ...) { static const bool on = nfrux::Env("NFRUX_LOG") && strcmp(nfrux::Env("NFRUX_LOG"), "0"); if (!on) return; std::lock_guard<std::mutex> k(g_m); if (!g_log && !(g_log = fopen("nfrux_loader.log", "w"))) return; va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
 
 static std::map<std::string, void*> g_real;
 static std::set<void*> g_handles;

@@ -3,6 +3,8 @@
 namespace nfrux
 {
 void        Log(const char* fmt, ...);
-const char* Env(const char* name);  // null when unset
+const char* Env(const char* name);  // null when unset; nfrux.ini's value where it has that option
+const char* Option(const char* section, const char* key);  // nfrux.ini's, lower case names; null when absent or auto
+void        LogOptions();  // nfrux.ini's lines, once
 bool        EnvFlag(const char* name, bool fallback);
 }

@@ -36,7 +36,9 @@ unsigned g_next = 0x4e460001;
 uint32_t MaxFrames()
 {
     const char* v = Env("NFRUX_MAX_FRAMES");
-    return v ? std::clamp(atoi(v), 1, int(kMaxGenerated)) : kMaxGenerated;
+    if (v) return std::clamp(atoi(v), 1, int(kMaxGenerated));
+    const char* m = Option("general", "maxmultiplier");  // 2 to 6, "4" or "4x"
+    return m && atoi(m) ? std::clamp(atoi(m) - 1, 1, int(kMaxGenerated)) : kMaxGenerated;
 }
 std::unique_ptr<Device> DeviceForVk()
 {
@@ -70,6 +72,7 @@ std::unique_ptr<Device> DeviceForVk()
 }
 NgxResult Add(void* host, bool vulkan, NgxHandle** out)
 {
+    LogOptions();
     auto f    = std::make_unique<Feature>();
     f->handle = {g_next++}, f->vulkan = vulkan, f->host = host;
     if (auto w = g_warm.find(host); w != g_warm.end())

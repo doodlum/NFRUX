@@ -418,12 +418,23 @@ public:
         topRung = rung + 1;
         return true;
     }
+    bool iniRefused = false;  // what nfrux.ini asks for cannot be made here
     std::unique_ptr<Network> CreateNetwork(uint32_t w, uint32_t h, std::string* error) override
     {
         std::lock_guard<std::mutex> lock(making);  // worker threads
+        if (const char* ml = Env("NFRUX_ML")) return MakeNetwork(w, h, error, ml, false);  // tests: strict
+        const char* ml = iniRefused ? nullptr : Option(isVk ? "vulkan" : "d3d12", "network");
+        if (!ml) return MakeNetwork(w, h, error, nullptr, false);
+        std::string why;
+        if (auto net = MakeNetwork(w, h, &why, ml, true)) return net;
+        Log("nfrux.ini: network=%s cannot be used (%s): the automatic choice instead", ml, why.c_str());
+        iniRefused = true;
+        return MakeNetwork(w, h, error, nullptr, false);
+    }
+    std::unique_ptr<Network> MakeNetwork(uint32_t w, uint32_t h, std::string* error, const char* ml, bool guarded)  // guarded: crash markers count for a forced CUDA too
+    {
         auto net = std::make_unique<NetN>();
         const ModelBindings mb = GetModelBindings();
-        const char* ml = Env("NFRUX_ML");
         std::string what;
         if (isVk)
         {
@@ -453,7 +464,7 @@ public:
                 {
                     char b[48];
                     snprintf(b, sizeof(b), "vulkan_cuda_%04x", c.deviceId);
-                    cudaMarker = b, cudaState = forced || MarkerBegin(cudaMarker) ? 1 : -1;
+                    cudaMarker = b, cudaState = (forced && !guarded) || MarkerBegin(cudaMarker) ? 1 : -1;
                 }
                 if (cudaState > 0) net->cudaVk = CudaVulkanGraph::Create(dc, DescribeModel(w, h), &why);
                 if (!net->cudaVk && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(cudaMarker), cudaState = -1;
@@ -497,7 +508,7 @@ public:
             if (forced || (!ml && !topRung && c.vendorId == uint32_t(nri::Vendor::NVIDIA)))
             {
                 std::string why;
-                if (cudaState == 0) cudaState = forced || MarkerBegin(Rung()) ? 1 : -1;
+                if (cudaState == 0) cudaState = (forced && !guarded) || MarkerBegin(Rung()) ? 1 : -1;
                 if (cudaState > 0) net->cuda = CudaGraph::Create(d3d, DescribeModel(w, h), &why);
                 if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(Rung()), cudaState = -1;
                 if (forced && !net->cuda) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }

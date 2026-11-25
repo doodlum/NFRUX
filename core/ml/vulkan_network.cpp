@@ -3,6 +3,7 @@
 
 #include "vulkan_network.h"
 #include "tosa_graph.h"
+#include "../log.h"
 
 #include <algorithm>
 #include <climits>
@@ -573,10 +574,10 @@ namespace ffx_ml
             sel.path          = Path::Dot4;
             sel.workgroupSize = tuning.vectorWorkgroup;
             sel.dot4Tiled     = tuning.dot4Tiled != 0;
-            if (const char* e = getenv("FFX_ML_DOT4_TILED"))
+            if (const char* e = nfrux::Env("FFX_ML_DOT4_TILED"))
                 sel.dot4Tiled = atoi(e) != 0;
             uint32_t sgSize = tuning.dot4Subgroup;
-            if (const char* e = getenv("FFX_ML_DOT4_SUBGROUP"))
+            if (const char* e = nfrux::Env("FFX_ML_DOT4_SUBGROUP"))
                 sgSize = uint32_t(atoi(e));
             sel.subgroupSize = subgroup.subgroupSize;
             if (sel.dot4Tiled && (features & FEATURE_SUBGROUP_SIZE_CONTROL) && sgSize != 0 && sgSize >= sizeControl.minSubgroupSize &&

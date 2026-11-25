@@ -60,5 +60,5 @@ add_custom_target(package
     COMMAND ${CMAKE_COMMAND} -E copy ${NRI_DIR}/LICENSE.txt ${CMAKE_BINARY_DIR}/package/licenses/NRI.txt
     COMMAND ${CMAKE_COMMAND} -E copy ${NRI_DIR}/_build/_deps/vma-src/LICENSE.txt ${CMAKE_BINARY_DIR}/package/licenses/VulkanMemoryAllocator.txt
     COMMAND ${CMAKE_COMMAND} -E copy ${NRI_DIR}/_build/_deps/d3d12ma-src/LICENSE.txt ${CMAKE_BINARY_DIR}/package/licenses/D3D12MemoryAllocator.txt
-    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md ${CMAKE_SOURCE_DIR}/INSTALL.txt ${CMAKE_BINARY_DIR}/package
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md ${CMAKE_SOURCE_DIR}/INSTALL.txt ${CMAKE_SOURCE_DIR}/nfrux.ini ${CMAKE_BINARY_DIR}/package
     DEPENDS nvngx_dlssg VERBATIM)
