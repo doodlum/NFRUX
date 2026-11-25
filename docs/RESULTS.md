@@ -467,3 +467,6 @@ Not run: the loader's new extension and the OptiScaler route in the sample (no w
 
 After the review: the markers wait for the real size. A process ended at the first full-size run, twice: the third start uses fp16 cooperative matrix (Vulkan) / dot4 (D3D12), said in the log. Two sample launches on Vulkan (loader; OptiScaler)
 presented 1x: Streamline created the feature and never evaluated it (no interpolation line in its log); focus is the likely cause, not shown. So the sample has not exercised CUDA on Vulkan.
+
+CUDA on Vulkan in the sample (789ba49, 1280x701, 2500 rendered frames, window focus sampled every 0.4 s and held throughout): through the loader 4x 651 fps (583 with fp16 earlier); OptiScaler 0.9.5 2x 395 fps
+(380 with fp16). Both chose "CUDA kernels, int8 tensor cores (Vulkan)", passed the self-check, exited 0 and left no marker. One start each; the sample under validation with CUDA was not run.

@@ -326,7 +326,7 @@ M1-M3 do not depend on M0a.
 | First-transition corruption at 5x (Vulkan): fixed by waiting for earlier work; mechanism not established | regression case in A2; synchronization validation with a messenger that fails the run |
 | Vulkan: a Reflex cap is not kept when generation and presenting are heavy (5x and up; RESULTS) | open; D3D12 keeps it. Suspected: Streamline's pacer presenting while vkLatencySleepNV runs (validation reports the race) |
 | NRI changes | pinned commit; A1 and A2 on update |
-| CUDA on Vulkan and the NVIDIA default under OptiScaler have not run in a real host | headless evidence only; A4 and A6 on Vulkan before a package is handed out |
+| CUDA on Vulkan and the NVIDIA default under OptiScaler: short sample runs only (RESULTS) | A4 and A6 on Vulkan before a package is handed out |
 | OptiScaler route (R2), D3D12: tagged inputs in another state than the guide's are read without a transition. On NVIDIA no fault was seen (2x, sample); others not tested | known; only a host that gives the states can fix it |
 
 ## 8. Acceptance
