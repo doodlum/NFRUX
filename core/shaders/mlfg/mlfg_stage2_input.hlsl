@@ -64,21 +64,30 @@ float3 Read(Texture2D<float4> t, float2 uv)
 float2 Clamp(float2 q) { return min(max(q, c_genRect.xy), c_genRect.zw); }
 float  Luma(float3 c) { return (c.r * 0.298999994993210 + c.g * 0.587000012397766) + c.b * 0.114000000059605; }
 
-[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID)
+// The group's uniform quotients (exact long divisions), made once by its first thread.
+groupshared float s_div[3];
+
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     const int2 g = int2(id.xy);
+    if (gi == 0u)
+    {
+        const float2 r = FDiv(float2(1, 1), float2(c_out.zw));
+        s_div[0] = r.x, s_div[1] = r.y, s_div[2] = SplatFlowOffset(c_splat.xy, c_out.z);
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (any(g >= c_out.xy))
         return;
     const uint base = TexelBase(g, uint(c_out.x), 32u);
     float      ch[24];
     [unroll] for (uint z = 0u; z < 24u; ++z)
         ch[z] = 0.0;
-    const float2 uv = TexelUv(g, FDiv(float2(1, 1), float2(c_out.zw)));
+    const float2 uv = TexelUv(g, float2(s_div[0], s_div[1]));
     const bool   outRect = any(uv > c_genRect.zw) || any(uv < c_genRect.xy) || any(g >= c_colour.xy / 4);
     if (all(g < c_out.zw) && !outRect)
     {
         const int2   ss  = c_splat.xy;
-        const float2 s0  = SplatFlow(t_word0, uv, ss, c_out.z), s1 = SplatFlow(t_word1, uv, ss, c_out.z);
+        const float2 s0  = SplatFlow(t_word0, uv, ss, s_div[2]), s1 = SplatFlow(t_word1, uv, ss, s_div[2]);
         const float2 f0  = F16Round(SampleG(t_flow0, uv, c_colour.zw).xy), f1 = F16Round(SampleG(t_flow1, uv, c_colour.zw).xy);
         // The six colour reads, one copy of the code: rgb0 at uv - s0, uv + f0, uv; rgb1 at uv - s1, uv + f1, uv.
         const float2 at[6] = {Clamp(uv - s0), Clamp(uv + f0), uv, Clamp(uv - s1), Clamp(uv + f1), uv};

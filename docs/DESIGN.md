@@ -29,6 +29,7 @@ loader/     process-local NGX router, active when the DLL is named as a Windows 
 frontend/   NGX exports, parameter reading, batch protocol (section 4)
 core/       interpolator: pass list, constants, histories, UI, subrects. API neutral
 core/ml     TOSA lowering and CPU reference; Vulkan, D3D12 and CUDA kernels
+core/mlfg   the second interpolator: AMD FSR Frame Generation 4's network and its runtime (docs/FFX_MLFG.md)
 rhi/        Device / Texture / Buffer / Pass / Network (rhi.h); one implementation on NVIDIA NRI (rhi_nri.cpp)
 tools/      build_shaders.py, build_nri.ps1
 tests/      conformance, parity, NGX harness, quality reference
@@ -189,6 +190,9 @@ params / gate textures on every path (paths that write images directly are an op
 | Vulkan AssumeFeatures | `NFRUX_VK_ASSUME_FEATURES` | flag |
 | Vulkan Dot4Tiled, Dot4Subgroup | `FFX_ML_DOT4_TILED`, `FFX_ML_DOT4_SUBGROUP` | flag; subgroup size |
 | Vulkan FullBarriers | `NFRUX_FULL_BARRIERS` | flag |
+| General Model | `NFRUX_MODEL` | nfru (default), amd (FSR FG4, docs/FFX_MLFG.md) |
+| General AmdWeights | `NFRUX_AMD_WEIGHTS` | a `tools/mlfg_weights.py --bin` file |
+| D3D12 / Vulkan AmdNetwork | `NFRUX_MLFG` (tests: strict, no markers) | generic, cuda (D3D12) / generic, coopmat (Vulkan) |
 
 `Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
 
@@ -197,6 +201,8 @@ params / gate textures on every path (paths that write images directly are an op
 | Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | NVIDIA: CUDA kernels (VK_NVX_binary_import, the same as D3D12's), then cooperative matrix fp16, int8; elsewhere int8, fp16 (exact, D2) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
+| FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores (NVAPI, crash marker) | - | generic (strict HLSL) |
+| FSR FG4 (Model=amd), Vulkan | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA) | - | generic (strict HLSL) |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of

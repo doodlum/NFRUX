@@ -229,7 +229,8 @@ for n, d in KERNELS.items():
 # sums are the matrix unit's): mlfg_conv_coopmat.comp per shape and subgroup size, SPIR-V only.
 mat = []
 for n, k in [("3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("2", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2"]), ("1", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1"]),
-             ("T", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"])]:
+             ("T", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"]),
+             ("3n1", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_NB=1"]), ("Tn1", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1", "-DMLFG_NB=1"])]:
     for sg in (16, 32, 64):
         nm = f"kMlfgMat{n}_{sg}"
         p = os.path.join(out, nm + ".spv")

@@ -96,7 +96,7 @@ private:
     std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames
     uint32_t                m_frames = 0;
     std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
-    std::unique_ptr<Pass>   m_mat[4];
+    std::unique_ptr<Pass>   m_mat[4], m_matN1[2];
     std::unique_ptr<CudaKernels> m_cuda;
     std::vector<std::unique_ptr<Pass>> m_layerPasses, m_layerPassesBig;  // NFRUX_TEST_TIMES
     bool                    m_uploaded = false;

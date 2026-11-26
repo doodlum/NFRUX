@@ -22,14 +22,14 @@ class CudaKernels
 public:
     static std::unique_ptr<CudaKernels> Create(Device& dev, std::string* error);
     ~CudaKernels();
-    // shape 0 3x3/1, 1 2x2/2, 2 1x1, 3 transposed; list: the D3D12 command list (Device::NativeAccess). 32 threads a group.
+    // shape 0 3x3/1, 1 2x2/2, 2 1x1, 3 transposed, 4 / 5: 3x3 / transposed with one n tile a warp; list: the D3D12 command list (Device::NativeAccess). 32 threads a group.
     bool Launch(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const;
 
 private:
     CudaKernels() = default;
     ID3D12Device* m_device = nullptr;
     void*         m_module = nullptr;
-    void*         m_fn[4] = {};
+    void*         m_fn[6] = {};
 };
 std::string CudaPtx();  // tests
 }  // namespace nfrux::mlfg

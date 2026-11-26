@@ -88,13 +88,22 @@ float4 Quantise(float3 c)
 #endif
 }
 
-[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID)
+// The group's uniform quotients (exact long divisions), made once by its first thread.
+groupshared float s_div[3];
+
+[numthreads(8, 8, 1)] void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex)
 {
     const int2 g = int2(id.xy);
     const int2 size = c_colour.xy;
+    if (gi == 0u)
+    {
+        const float2 r = FDiv(float2(1, 1), float2(size));
+        s_div[0] = r.x, s_div[1] = r.y, s_div[2] = SplatFlowOffset(c_splat.xy, size.x);
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (any(g >= size))
         return;
-    const float2 uv = TexelUv(g, FDiv(float2(1, 1), float2(size)));
+    const float2 uv = TexelUv(g, float2(s_div[0], s_div[1]));
     const bool   outRect = any(uv > c_genRect.zw) || any(uv < c_genRect.xy);
     const float3 p0 = t_rgb0.Load(int3(g, 0)).rgb, p1 = t_rgb1.Load(int3(g, 0)).rgb;
     float3       o  = p1;
@@ -113,7 +122,7 @@ float4 Quantise(float3 c)
             w[k] = Bilerp16(LoadHalf(t_weights, a + k), LoadHalf(t_weights, b + k), LoadHalf(t_weights, c + k), LoadHalf(t_weights, d + k), fx, fy);
         const int2   ss = c_splat.xy;
         const float  m1 = SplatCoverage(t_key1, t_word1, uv, ss), m0 = SplatCoverage(t_key0, t_word0, uv, ss);
-        const float2 s0 = SplatFlow(t_word0, uv, ss, size.x), s1 = SplatFlow(t_word1, uv, ss, size.x);
+        const float2 s0 = SplatFlow(t_word0, uv, ss, s_div[2]), s1 = SplatFlow(t_word1, uv, ss, s_div[2]);
         const float2 f0 = F16Round(SampleG(t_flow0, uv, c_colour.zw).xy), f1 = F16Round(SampleG(t_flow1, uv, c_colour.zw).xy);
         // The four colour reads, one copy of the code: rgb0 at uv - s0, uv + f0; rgb1 at uv - s1, uv + f1.
         const float2 at[4] = {Clamp(uv - s0), Clamp(uv + f0), Clamp(uv - s1), Clamp(uv + f1)};

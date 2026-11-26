@@ -31,15 +31,16 @@ struct Ptx
     }
 };
 
-// One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2.
-std::string Kernel(int shape)
+// One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2; narrow: one n tile (8 channels) a warp,
+// for the layers with at most 16 outputs.
+std::string Kernel(int shape, bool narrow)
 {
     const bool T = shape == 3;
     const int  K = shape == 0 ? 3 : shape == 1 ? 2 : shape == 2 ? 1 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0;
-    const int  taps = K * K, NB = T ? 4 : 8, NA = T ? 4 : 1;  // n tiles a warp; accumulator sets (transposed: one per output phase)
+    const int  taps = K * K, NB = narrow ? 1 : T ? 4 : 8, NA = T ? 4 : 1;  // n tiles a warp; accumulator sets (transposed: one per output phase)
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "(.param .align 8 .b8 P[128])\n{\n";
+    w.s = std::string(".visible .entry ") + names[shape] + (narrow ? "n" : "") + "(.param .align 8 .b8 P[128])\n{\n";
     w(".reg .b32 %%r<160>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // s0 s1 w b add out
     // r1 inW r2 inH r3 p0 r4 ch0 r5 p1 r6 ch1m r7 split r8 cin r9 outW r10 outH r11 po r12 cho r13 cout r14 writeEnd r15 act
@@ -49,6 +50,7 @@ std::string Kernel(int shape)
     w("mov.u32 %%r24, %%ctaid.x; shl.b32 %%r24, %%r24, 4; mov.u32 %%r25, %%ctaid.y; mov.u32 %%r26, %%ctaid.z; mul.lo.u32 %%r26, %%r26, %d;", NB);  // x0, y, nt0
     w("add.u32 %%r27, %%r24, %%r22; add.u32 %%r28, %%r27, 8;");  // xa, xb (output pixels; transposed: input pixels)
     w("setp.eq.s32 %%p1, %%r15, 1; setp.eq.s32 %%p2, %%r15, 2; setp.ne.s32 %%p3, %%r16, 0; setp.ne.s32 %%p4, %%r17, 0;");  // leaky, relu, fp8, add
+    w("or.b32 %%r34, %%r3, %%r4; or.b32 %%r34, %%r34, %%r5; or.b32 %%r34, %%r34, %%r6; and.b32 %%r34, %%r34, 1; setp.eq.u32 %%p30, %%r34, 0;");  // aligned
     // Per tap and row: in-range predicate and the byte addresses of channel 0 in src0 / src1 (rd 10 + 4t ..).
     for (int t = 0; t < (T ? 1 : taps); ++t)
     {
@@ -82,8 +84,11 @@ std::string Kernel(int shape)
         {
             const int pr = 10 + t * 2 + r, ra = 10 + (t * 2 + r) * 2;
             w("selp.b64 %%rd62, %%rd%d, %%rd%d, %%p9; add.s64 %%rd62, %%rd62, %%rd61;", ra, ra + 1);
-            w("and.pred %%p62, %%p%d, %%p60; and.pred %%p63, %%p%d, %%p61; mov.b16 %%h1, 0; mov.b16 %%h2, 0;", pr, pr);
-            w("@%%p62 ld.global.u16 %%h1, [%%rd62]; @%%p63 ld.global.u16 %%h2, [%%rd62+2]; mov.b32 %%r%d, {%%h1, %%h2};", 50 + r);
+            // Both channels in range and the tensors' halves word-aligned: one 32-bit load; else two 16-bit ones.
+            w("and.pred %%p62, %%p%d, %%p60; and.pred %%p63, %%p%d, %%p61; and.pred %%p64, %%p63, %%p30; not.pred %%p65, %%p64;", pr, pr);
+            w("and.pred %%p66, %%p62, %%p65; and.pred %%p67, %%p63, %%p65; mov.b16 %%h1, 0; mov.b16 %%h2, 0;");
+            w("@%%p64 ld.global.u32 %%r%d, [%%rd62]; @%%p66 ld.global.u16 %%h1, [%%rd62]; @%%p67 ld.global.u16 %%h2, [%%rd62+2];", 50 + r);
+            w("@%%p65 mov.b32 %%r%d, {%%h1, %%h2};", 50 + r);
         }
         for (int a = 0; a < NA; ++a)
         {
@@ -145,7 +150,8 @@ std::string Kernel(int shape)
 std::string CudaPtx()
 {
     std::string p = ".version 7.0\n.target sm_75\n.address_size 64\n";
-    for (int s = 0; s < 4; ++s) p += Kernel(s);
+    for (int s = 0; s < 4; ++s) p += Kernel(s, false);
+    p += Kernel(0, true), p += Kernel(3, true);
     return p;
 }
 
@@ -160,12 +166,12 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
     std::unique_ptr<CudaKernels> k(new CudaKernels());
     k->m_device = d3d;
     if (!(k->m_module = cuda::CreateModule(d3d, cubin))) return fail("CreateCuModule");
-    static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
-    for (int i = 0; i < 4; ++i)
+    static const char* names[6] = {"conv3", "conv2", "conv1", "convT", "conv3n", "convTn"};
+    for (int i = 0; i < 6; ++i)
         if (!(k->m_fn[i] = cuda::CreateFunction(d3d, k->m_module, names[i]))) return fail("CreateCuFunction");
     return k;
 }
-CudaKernels::~CudaKernels() { cuda::Destroy(m_device, m_module, {m_fn[0], m_fn[1], m_fn[2], m_fn[3]}); }
+CudaKernels::~CudaKernels() { cuda::Destroy(m_device, m_module, {m_fn[0], m_fn[1], m_fn[2], m_fn[3], m_fn[4], m_fn[5]}); }
 
 bool CudaKernels::Launch(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const
 {

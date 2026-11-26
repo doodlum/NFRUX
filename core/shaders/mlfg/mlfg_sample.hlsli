@@ -45,9 +45,10 @@ float SplatCoverage(Texture2D<uint> key, Texture2D<uint> flow, float2 uv, int2 s
 
 // The single-texel splat flow read: texel ivec2(uv * size - 0.5 * size.x / refWidth) (both axes use size.x),
 // 0 outside the image, flow (0, 0) when the texel's x is 65504 (no flow). Keys are not consulted, as in AMD's shader.
-float2 SplatFlow(Texture2D<uint> flow, float2 uv, int2 size, int refWidth)
+// o = 0.5 * size.x / refWidth (SplatFlowOffset; uniform, so the passes compute it once a group).
+float SplatFlowOffset(int2 size, int refWidth) { return 0.5 * FDiv(float(size.x), float(refWidth)); }
+float2 SplatFlow(Texture2D<uint> flow, float2 uv, int2 size, float o)
 {
-    const float  o = 0.5 * FDiv(float(size.x), float(refWidth));
     const int2   p = TruncI(uv * float2(size) - o);
     const float2 f = UnpackF16x2(Inside(p, size) ? flow.Load(int3(p, 0)) : 0u);
     return f.x != F16_MAX ? f : float2(0, 0);

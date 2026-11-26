@@ -54,6 +54,8 @@ float Half(uint16_t h)
     memcpy(&f, &u, 4);
     return f;
 }
+// The CUDA kernels' n tiles a warp: 8 (transposed 4), or 1 for the 3x3 and transposed layers with at most 16 outputs.
+uint32_t CudaNb(const LayerWeights& L) { return L.cout <= 16 && (L.kind == 1 || L.k == 3) ? 1 : L.kind == 1 ? 4 : 8; }
 uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
 {
     uint32_t u;
@@ -233,7 +235,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         for (uint32_t l = 0; l < kLayers; ++l)
         {
             const LayerWeights& L = m_weights.layers[l];
-            const uint32_t taps = L.k * L.k, kc = (L.cin + 7) / 8, nb = L.kind == 1 ? 4 : 8, nt = (L.cout + 7) / 8, ntp = (nt + nb - 1) / nb * nb;
+            const uint32_t taps = L.k * L.k, kc = (L.cin + 7) / 8, nb = CudaNb(L), nt = (L.cout + 7) / 8, ntp = (nt + nb - 1) / nb * nb;
             const uint32_t coP = (L.cout + 63) & ~63u;
             m_offset[l] = uint32_t(h.size()), m_biasOffset[l] = uint32_t(bias.size());
             h.resize(h.size() + size_t(kc) * taps * ntp * 32, 0);
@@ -290,6 +292,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                                sg == 16 ? &shaders::kMlfgMatT_16 : sg == 32 ? &shaders::kMlfgMatT_32 : &shaders::kMlfgMatT_64};
         bool made = m_gpuWeights && m_gpuBias;
         for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = m_dev.CreatePass(*sh[i]));
+        made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
+        made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
         if (!made) return fail("cooperative-matrix passes or weights buffer");
     }
     else
@@ -372,7 +376,7 @@ bool Network::Run(const Conv& c)
     const View& s1 = c.src1 ? c.src1 : c.src;
     if (m_tier == Tier::Cuda)
     {
-        const uint32_t split = std::min(c.split, L.cin), nb = L.kind == 1 ? 4 : 8, nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
+        const uint32_t split = std::min(c.split, L.cin), nb = CudaNb(L), nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
         if (nt > ntp || (split < L.cin && split % 8)) return false;
         const Buffer* bufs[] = {c.src.buf, s1.buf, m_gpuWeights.get(), m_gpuBias.get(), c.add ? c.add.buf : c.src.buf, c.out.buf};
         void* list = m_dev.NativeAccess(bufs, 6);
@@ -382,24 +386,27 @@ bool Network::Run(const Conv& c)
                         int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch) - int32_t(split), int32_t(split), int32_t(L.cin),
                         int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch), int32_t(L.cout), int32_t(writeEnd), int32_t(c.act), c.fp8 ? 1 : 0,
                         c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t((L.cin + 7) / 8), int32_t(ntp)};
-        const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+        const int      shape = nb == 1 ? (L.kind == 1 ? 5 : 4) : L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, L.kind == 1 ? c.src.h : c.out.h, ntp / nb};
         return m_cuda->Launch(list, shape, grid, p);
     }
     if (m_tier == Tier::CoopMat)
     {
+        const uint32_t split = std::min(c.split, L.cin);
+        const bool     aligned = L.cin % 16 == 0 && split % 16 == 0 && c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && s1.pitch % 8 == 0 && (s1.ch + 16 - split % 16) % 8 == 0 && s1.ch % 8 == 0;
         struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
             {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
             {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
             {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
             {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
             {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 63) & ~63u)},
-            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), 0, 0}};
+            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned ? 1 : 0, 0}};
         const int shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
-        if (L.kind == 1) return m_mat[3]->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, (L.cout + 31) / 32);
-        return m_mat[shape]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 63) / 64);
+        const bool narrow = L.cout <= 16 && (L.kind == 1 || L.k == 3);  // one 16-channel tile a group
+        if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
+        return (narrow ? m_matN1[0] : m_mat[shape])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, narrow ? 1 : (L.cout + 63) / 64);
     }
     struct { int32_t in[4], in2[4], out[4], cfg[4], add[4]; } k = {
         {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},

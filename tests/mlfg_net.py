@@ -156,6 +156,8 @@ def main():
         got = {}
         for tier in A.tiers.split(','):
             for api in A.apis.split(','):
+                if (tier, api) in (('coopmat', 'd3d12'), ('cuda', 'vulkan')):
+                    continue  # coopmat is Vulkan's, cuda D3D12's
                 env = dict(os.environ, NFRUX_MLFG=tier)
                 r = subprocess.run([A.exe, api, str(W)] + (['--bench', str(A.bench)] if A.bench else []), capture_output=True, text=True, env=env)
                 print('   ', r.stdout.strip().replace('\n', '\n    '))
