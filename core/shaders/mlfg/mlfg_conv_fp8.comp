@@ -25,6 +25,7 @@ layout(set = 0, binding = 0, std140) uniform Constants
     ivec4 c_cfg;  // cout, act, round (0 fp16, 1 fp8), write end
     ivec4 c_add;  // add pitch (0: none), add first channel, weight offset (16-byte units), coPad
     ivec4 c_x;    // bias offset (floats), ciPad32, 0, 0
+    ivec4 c_fmt;  // e4m3 bytes in: src0, src1, add, out (as mlfg_conv_coopmat.comp)
 };
 layout(set = 0, binding = 1, std430) readonly buffer Src0V { uvec4 s0v[]; };
 layout(set = 0, binding = 2, std430) readonly buffer Src1V { uvec4 s1v[]; };
@@ -32,6 +33,9 @@ layout(set = 0, binding = 3, std430) readonly buffer Weights { uvec4 wt[]; };
 layout(set = 0, binding = 4, std430) readonly buffer Add { float16_t ad[]; };
 layout(set = 0, binding = 5, std430) buffer Out { uint o[]; };
 layout(set = 0, binding = 6, std430) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Src0B { uvec2 s0b[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Src1B { uvec2 s1b[]; };
+layout(set = 0, binding = 4, std430) readonly buffer AddB { uint ab[]; };
 
 #define NB MLFG_NB
 shared uint  sA[16 * 8];  // 16 pixels x 32 e4m3 channels
@@ -93,9 +97,22 @@ uint E4m3(uint h)
     if (ue >= -6) return s | (uint(ue + 7) << 3) | (m >> 7);
     return s | (ue >= -9 ? (1024u + m) >> uint(1 - ue) : 0u);  // e4m3 subnormal: units of 2^-9
 }
+uint H8(uint b)  // e4m3 byte -> fp16 bits, exact, integer code: normals move their fields; subnormals normalise; NaN
+{
+    const uint a = b & 0x7Fu, s = (b & 0x80u) << 8;
+    if (a >= 8u) return s | (a == 0x7Fu ? 0x7E00u : (a << 7) + 0x2000u);
+    if (a == 0u) return s;
+    const int msb = findMSB(a);  // m * 2^-9 = 2^(msb - 9) * (1 + ...)
+    return s | (uint(6 + msb) << 10) | ((a << uint(10 - msb)) & 0x3FFu);
+}
 float Finish(float y, int c, uint pix)
 {
-    if (c_add.x != 0) y += float(ad[pix * uint(c_add.x) + uint(c_add.y + c)]);
+    if (c_add.x != 0 && c_fmt.z != 0)
+    {
+        const uint i = pix * uint(c_add.x) + uint(c_add.y + c);
+        y += unpackHalf2x16(H8((ab[i >> 2] >> ((i & 3u) * 8u)) & 255u)).x;
+    }
+    else if (c_add.x != 0) y += float(ad[pix * uint(c_add.x) + uint(c_add.y + c)]);
     if (c_cfg.y == 1) y = y > 0.0 ? y : y * 0.2;
     else if (c_cfg.y == 2) y = max(y, 0.0);
     return c_cfg.z == 1 ? F8Round(y) : y;
@@ -112,6 +129,18 @@ void main()
         acc[b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     for (int c0 = 0; c0 < cin; c0 += 32)
     {
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a;
+        // e4m3 tensors: the A matrix straight from the tensor when the chunk is whole, in one source, 16-byte aligned
+        // and the 16 pixels inside (the host checks the pitches / first channels: c_fmt.x / y = 2).
+        const bool in0 = c0 + 32 <= c_in.w;
+        if ((in0 ? c_fmt.x : c_fmt.y) == 2 && c0 + 32 <= cin && (in0 || c0 >= c_in.w) && tile.x + 16 <= c_in.x)
+        {
+            const uint pix0 = uint(tile.y) * uint(c_in.x) + uint(tile.x);
+            if (in0) coopMatLoad(a, s0v, (pix0 * uint(c_in.z) + uint(c_in2.x + c0)) >> 4, uint(c_in.z) >> 4, gl_CooperativeMatrixLayoutRowMajor);
+            else coopMatLoad(a, s1v, (pix0 * uint(c_in2.y) + uint(c0 - c_in.w + c_in2.z)) >> 4, uint(c_in2.y) >> 4, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        else
+        {
         barrier();
         for (uint i = li; i < 64u; i += uint(MLFG_SG))  // pixel i / 4, channels c0 + 8 (i % 4) .. + 7 (8-aligned: the host checks)
         {
@@ -122,16 +151,20 @@ void main()
             if (q.x < c_in.x && c < cin)
             {
                 const uint base = uint(q.y) * uint(c_in.x) + uint(q.x);
-                v = c < c_in.w ? s0v[(base * uint(c_in.z) + uint(c_in2.x + c)) >> 3] : s1v[(base * uint(c_in2.y) + uint(c - c_in.w + c_in2.z)) >> 3];
+                if (c < c_in.w) { const uint e = (base * uint(c_in.z) + uint(c_in2.x + c)) >> 3; v = c_fmt.x != 0 ? uvec4(s0b[e], 0u, 0u) : s0v[e]; }
+                else { const uint e = (base * uint(c_in2.y) + uint(c - c_in.w + c_in2.z)) >> 3; v = c_fmt.y != 0 ? uvec4(s1b[e], 0u, 0u) : s1v[e]; }
             }
             uvec2 b8;
-            [[unroll]] for (int k = 0; k < 2; ++k)
-                b8[k] = E4m3(v[2 * k] & 0xFFFFu) | (E4m3(v[2 * k] >> 16) << 8) | (E4m3(v[2 * k + 1] & 0xFFFFu) << 16) | (E4m3(v[2 * k + 1] >> 16) << 24);
+            if (c < c_in.w ? c_fmt.x != 0 : c_fmt.y != 0)  // already e4m3 bytes
+                b8 = v.xy;
+            else
+                [[unroll]] for (int k = 0; k < 2; ++k)
+                    b8[k] = E4m3(v[2 * k] & 0xFFFFu) | (E4m3(v[2 * k] >> 16) << 8) | (E4m3(v[2 * k + 1] & 0xFFFFu) << 16) | (E4m3(v[2 * k + 1] >> 16) << 24);
             sA[px * 8u + (i & 3u) * 2u] = b8.x, sA[px * 8u + (i & 3u) * 2u + 1u] = b8.y;
         }
         barrier();
-        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> a;
         coopMatLoad(a, sA, 0, 8, gl_CooperativeMatrixLayoutRowMajor);  // in uints (4 channels)
+        }
         [[unroll]] for (int b = 0; b < NB; ++b)
         {
             coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> w;
@@ -143,6 +176,22 @@ void main()
     [[unroll]] for (int b = 0; b < NB; ++b)
         coopMatStore(acc[b], sC, uint(b * 16), uint(16 * NB), gl_CooperativeMatrixLayoutRowMajor);
     barrier();
+    if (c_fmt.w != 0)  // e4m3 out: four channels a word
+    {
+        for (uint i = li; i < uint(16 * 4 * NB); i += uint(MLFG_SG))
+        {
+            const uint  px = i / uint(4 * NB), cp = (i % uint(4 * NB)) * 4u;
+            const int   c = n0 + int(cp);
+            const ivec2 op = tile + ivec2(int(px), 0);
+            if (op.x >= c_out.x || op.y >= c_out.y || c >= c_cfg.w) continue;
+            const uint pix = uint(op.y) * uint(c_out.x) + uint(op.x);
+            uint word = 0u;
+            [[unroll]] for (int k = 0; k < 4; ++k)
+                if (c + k < c_cfg.x) word |= E4m3(F32ToF16(Finish(sC[px * uint(16 * NB) + cp + uint(k)] + bias[c_x.x + c + k], c + k, pix))) << (8 * k);
+            o[(pix * uint(c_out.z) + uint(c_out.w + c)) >> 2] = word;
+        }
+        return;
+    }
     for (uint i = li; i < uint(16 * 8 * NB); i += uint(MLFG_SG))
     {
         const uint  px = i / uint(8 * NB), cp = (i % uint(8 * NB)) * 2u;

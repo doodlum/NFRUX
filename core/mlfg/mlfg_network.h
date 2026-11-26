@@ -42,6 +42,7 @@ struct View
 {
     const Buffer* buf = nullptr;
     uint32_t      w = 0, h = 0, pitch = 0, ch = 0;
+    bool          e8 = false;  // e4m3 bytes, not fp16 (coopmat's stage-2 tensors: their values are e4m3 anyway)
     explicit operator bool() const { return buf != nullptr; }
     View At(uint32_t c) const { View v = *this; v.ch = c; return v; }
 };
@@ -109,6 +110,7 @@ private:
     bool                    m_m2 = true;
     bool                    m_m4 = true;
     bool                    m_vec8 = true;
+    bool                    m_s2e8 = false;  // coopmat: stage 2's fp8 tensors stored as e4m3 bytes (NFRUX_MLFG_S2_FP16=1: fp16)
     std::vector<bool>       m_acc16, m_matAcc16;  // coopmat: the same idea (3x3 / 2x2 / 3x3 2 tiles / 3x3 1 tile: m_matH)
     std::unique_ptr<Pass>   m_matH[4];
     std::unique_ptr<Pass>   m_mat8[2];  // coopmat FP8 1x1 (48 / 96, 64 / 128 outputs)  // CUDA: layers with fp16 sums a chunk (shipped build)  // coopmat: 16-byte staging loads (NFRUX_MLFG_NO_VEC8=1: off)  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)

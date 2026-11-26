@@ -244,6 +244,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
     m_m4 = !EnvFlag("NFRUX_MLFG_NO_M4", false);
     m_vec8 = !EnvFlag("NFRUX_MLFG_NO_VEC8", false);
+    // e4m3 stage-2 tensors: with the FP8 matrices only (the fp16 matrices would convert every staged byte and lose the direct
+    // 1x1 loads: stage 2 4.48 -> 5.23 ms); bit-identical either way.
+    m_s2e8 = m_tier == Tier::CoopMat && m_vec8 && m_dev.caps().coopMatF8 && !EnvFlag("NFRUX_MLFG_NO_FP8", false) && !EnvFlag("NFRUX_MLFG_S2_FP16", false) &&
+             !EnvFlag("NFRUX_MLFG_FUSED", false);  // (the fused kernel reads fp16)
     // CUDA, shipped build: the layers whose sums run in fp16 within each 8-channel chunk (all taps; the chunks added in
     // fp32), measured per layer at 4K (docs/FFX_MLFG.md): only where it is faster; short chunks keep the error small.
     // NFRUX_MLFG_ACC16_LAYERS=a,b,... (tests) replaces the list; NFRUX_MLFG_NO_ACC16=1 none.
@@ -362,10 +366,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
             for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
         }
         // FP8 cooperative matrices (Caps.coopMatF8): the fp8 1x1 layers' weights again as e4m3 bytes [ciPad32][coPad64]
-        // (m_off8 in 16-byte units). Slower than fp16 on the RTX 4070 (these layers are bound by the fp16 tensors' traffic and
-        // the epilogue, not the matrix rate; the e4m3 staging adds work): off unless NFRUX_MLFG_FP8MAT=1.
+        // (m_off8 in 16-byte units). With stage 2's tensors in e4m3 bytes (m_s2e8) the default where the device has FP8 matrices:
+        // RTX 4070 stage 2 4.48 -> 4.41 ms (on fp16 tensors FP8 was slower: 4.75). NFRUX_MLFG_NO_FP8=1: fp16 matrices and tensors.
         std::fill(m_off8.begin(), m_off8.end(), ~0u);
-        if (m_dev.caps().coopMatF8 && EnvFlag("NFRUX_MLFG_FP8MAT", false))
+        if (m_dev.caps().coopMatF8 && !EnvFlag("NFRUX_MLFG_NO_FP8", false))
         {
             for (uint32_t l = 0; l < kLayers; ++l)
             {
@@ -528,13 +532,16 @@ bool Network::Run(const Conv& c)
         const bool     aligned = L.cin % 16 == 0 && split % 16 == 0 && c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && s1.pitch % 8 == 0 && (s1.ch + 16 - split % 16) % 8 == 0 && s1.ch % 8 == 0;
         // 8-channel staging (one 16-byte load a pixel's 8 channels): 8-aligned pitches, first channels, cin and split.
         const bool     vec8 = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && L.cin % 8 == 0 && (split >= L.cin || (split % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0)) && m_vec8;
-        struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
+        const bool e8in = c.src.e8 || (split < L.cin && s1.e8) || (c.add && c.add.e8);
+        if ((e8in && !vec8) || (c.out.e8 && (!c.fp8 || writeEnd % 4 || c.out.ch % 4 || c.out.pitch % 4))) return false;  // e4m3 tensors: 8-channel staging, 4-aligned out
+        struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4], fmt[4]; } k = {
             {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
             {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
             {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
             {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
             {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 63) & ~63u)},
-            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned ? 1 : 0, vec8 ? 1 : 0}};
+            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned && !e8in ? 1 : 0, vec8 ? 1 : 0},
+            {c.src.e8 ? 1 : 0, s1.e8 ? 1 : 0, c.add && c.add.e8 ? 1 : 0, c.out.e8 ? 1 : 0}};
         const int shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
@@ -543,6 +550,8 @@ bool Network::Run(const Conv& c)
         if (m_mat8[0] && m_off8[c.layer] != ~0u && vec8)  // FP8 cooperative matrices: e4m3 inputs and weights, fp32 sums
         {
             k.add[2] = int32_t(m_off8[c.layer]), k.x[1] = int32_t((L.cin + 31) & ~31u), k.x[2] = k.x[3] = 0;
+            if (c.src.e8 && c.src.pitch % 16 == 0 && c.src.ch % 16 == 0) k.fmt[0] = 2;  // e4m3, 16-byte rows: direct A loads
+            if (s1.e8 && s1.pitch % 16 == 0 && s1.ch % 16 == 0) k.fmt[1] = 2;
             const Bind b8[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuW8),
                                Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
             const uint32_t nb = L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : 4;
@@ -687,8 +696,10 @@ bool Network::Stage2(const View& in, const View& logits, const View* weights)
 {
     const uint32_t W = in.w, H = in.h;
     const View t32 = Sized(m_t32, W, H, 32);
-    const View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), pc16 = Sized(m_pc16, W / 2, H / 2, 16), h96 = Sized(m_h96, W / 2, H / 2, 96);
-    const View x64 = Sized(m_x64, W / 4, H / 4, 64), y64 = Sized(m_y64, W / 4, H / 4, 64), pc32 = Sized(m_pc32, W / 4, H / 4, 32), h128 = Sized(m_h128, W / 4, H / 4, 128);
+    View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), pc16 = Sized(m_pc16, W / 2, H / 2, 16), h96 = Sized(m_h96, W / 2, H / 2, 96);
+    View x64 = Sized(m_x64, W / 4, H / 4, 64), y64 = Sized(m_y64, W / 4, H / 4, 64), pc32 = Sized(m_pc32, W / 4, H / 4, 32), h128 = Sized(m_h128, W / 4, H / 4, 128);
+    if (m_s2e8)  // the fp8 tensors as e4m3 bytes (exact): half the traffic
+        for (View* v : {&x48, &y48, &pc16, &h96, &x64, &y64, &pc32, &h128}) v->e8 = true;
     Conv c;
     c.layer = kS2Inp, c.src = in, c.out = t32, c.act = Relu;  // fp16
     if (!Run(c)) return false;
