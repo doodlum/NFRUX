@@ -60,7 +60,9 @@ shared float     sC[16 * 16 * NB];
 // specified by Vulkan).
 uint F32ToF16(float f)
 {
-    const uint u = floatBitsToUint(f);
+    const uint u = floatBitsToUint(f), a = u & 0x7FFFFFFFu;
+    if (a >= 0x38800000u && a < 0x477FF000u)  // an fp16 normal result: round on 10 mantissa bits in place (exact)
+        return ((u >> 16) & 0x8000u) | ((((a + 0xFFFu + ((a >> 13) & 1u)) & 0x7FFFE000u) - 0x38000000u) >> 13);
     const uint s = (u >> 16) & 0x8000u;
     const uint e = (u >> 23) & 0xFFu;
     uint m = u & 0x7FFFFFu;
