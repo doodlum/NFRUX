@@ -1,4 +1,4 @@
-// Shared helpers of the FSR Frame Generation 4 port (AMD FidelityFX SDK v2.4.0, MIT; see docs/FFX_MLFG.md and
+﻿// Shared helpers of the FSR Frame Generation 4 port (AMD FidelityFX SDK v2.4.0, MIT; see docs/FFX_MLFG.md and
 // tools/ffx_extract/mlfg_io.py / mlfg_glue.py, which are the specification these shaders follow).
 //
 // Numeric rules (docs/DESIGN.md D1, A2a): the passes compute the same bits on D3D12 and Vulkan and the same bits as the
@@ -72,12 +72,21 @@ float F16ToF32(uint h)
 // The same results faster: where the result is an fp16 normal ([2^-14, 65520) in magnitude, so no overflow and no
 // subnormal), round to nearest even on 10 mantissa bits in the fp32 encoding itself (a carry moves into the exponent, as
 // it should); elsewhere the full conversion.
+// The other ranges without a branch (the softmax weights and their products often fall below 2^-14, where a divergent
+// call of the full conversion cost the refinement passes a quarter of their time): an fp16 subnormal is a multiple of
+// 2^-24, which is the ulp of fp32 values in [0.5, 1): (x + 0.75) - 0.75 rounds x to it, to nearest even (0.75 is an
+// even multiple; both adds are IEEE operations, marked precise so that no compiler reassociates them), and the sign is put back
+// for zeros; 65520 and above: inf; NaN: F32ToF16's quiet NaN (s | 0x7FC00000). F16ToF32(F32ToF16(x))'s bits for every
+// input (tests/mlfg_passes.py).
 float F16Round(float x)
 {
-    const uint u = asuint(x), a = u & 0x7FFFFFFFu;
-    if (a >= 0x38800000u && a < 0x477FF000u)
-        return asfloat((u + 0xFFFu + ((u >> 13) & 1u)) & 0xFFFFE000u);
-    return F16ToF32(F32ToF16(x));
+    const uint u = asuint(x), a = u & 0x7FFFFFFFu, s = u & 0x80000000u;
+    precise const float biased = x + 0.75f;  // precise: spirv-opt would fold (x + c) - c to x
+    precise const float back   = biased - 0.75f;
+    const uint sub = s | asuint(back);
+    const uint nrm = (u + 0xFFFu + ((u >> 13) & 1u)) & 0xFFFFE000u;
+    const uint big = s | (a > 0x7F800000u ? 0x7FC00000u : 0x7F800000u);
+    return asfloat(a < 0x38800000u ? sub : (a < 0x477FF000u ? nrm : big));
 }
 float2 F16Round(float2 x) { return float2(F16Round(x.x), F16Round(x.y)); }
 float3 F16Round(float3 x) { return float3(F16Round(x.x), F16Round(x.y), F16Round(x.z)); }
