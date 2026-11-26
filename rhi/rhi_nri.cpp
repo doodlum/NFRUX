@@ -34,7 +34,8 @@ thread_local bool t_recording = false;
 void LogBarriers(ID3D12GraphicsCommandList* list);
 namespace
 {
-constexpr uint32_t kSlots = 32, kSets = 160, kConstants = 512, kConstantStride = 512;
+// Sets and constants a recording: the FSR FG4 interpolator makes about 60 dispatches a frame and 60 a generated frame.
+constexpr uint32_t kSlots = 32, kSets = 768, kConstants = 1024, kConstantStride = 512;
 #define NRI_OK(x) ((x) == nri::Result::SUCCESS)
 
 nri::Format ToNri(Format f)
@@ -97,7 +98,7 @@ struct PassN : Pass
     nri::PipelineLayout*       layout = nullptr;
     nri::Pipeline*             pipeline = nullptr;
     ~PassN() override;
-    bool Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy) override;
+    bool Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy, uint32_t gz) override;
 };
 struct NetN : Network
 {
@@ -173,6 +174,7 @@ public:
         for (auto& x : reads) n.DestroyBuffer(x.buf);
         for (auto& x : freeReads) n.DestroyBuffer(x.second);
         for (auto& x : dying) n.DestroyBuffer(x.second);
+        for (auto& x : uploads) n.DestroyBuffer(x.buf);
         if (dev) nri::nriDestroyDevice(dev);
     }
     const Caps& caps() const override { return c; }
@@ -206,8 +208,9 @@ public:
             if (!NRI_OK(n.CreateSampler(*dev, s, samplers[i]))) return false;
         }
         nri::DescriptorPoolDesc pd = {};
-        pd.descriptorSetMaxNum = kSets, pd.samplerMaxNum = kSets * 4, pd.constantBufferMaxNum = kSets, pd.textureMaxNum = kSets * 8;
-        pd.storageTextureMaxNum = kSets * 4, pd.structuredBufferMaxNum = kSets, pd.storageStructuredBufferMaxNum = kSets;
+        // Samplers: 640 (a D3D12 sampler heap holds 2048, and only the NFRU passes take them).
+        pd.descriptorSetMaxNum = kSets, pd.samplerMaxNum = 640, pd.constantBufferMaxNum = kSets, pd.textureMaxNum = kSets * 8;
+        pd.storageTextureMaxNum = kSets * 3, pd.structuredBufferMaxNum = kSets * 4, pd.storageStructuredBufferMaxNum = kSets;
         for (auto& p : pools) if (!NRI_OK(n.CreateDescriptorPool(*dev, pd, p))) return false;
         constants = Committed(uint64_t(kSlots) * kConstants * kConstantStride, nri::MemoryLocation::HOST_UPLOAD, nri::BufferUsageBits::CONSTANT);
         tokenUp   = Committed(256, nri::MemoryLocation::HOST_UPLOAD, nri::BufferUsageBits::NONE);
@@ -367,6 +370,21 @@ public:
         return t;
     }
     std::unique_ptr<Buffer> CreateBuffer(uint64_t size) override { return MakeBuf(size); }
+    bool Upload(const Buffer& dst, const void* data, uint64_t size) override
+    {
+        auto& b = static_cast<const BufN&>(dst);
+        if (!cmd || size > b.size) return false;
+        nri::Buffer* up = Committed(size, nri::MemoryLocation::HOST_UPLOAD, nri::BufferUsageBits::NONE);
+        void*        p  = up ? n.MapBuffer(*up, 0, nri::WHOLE_SIZE) : nullptr;
+        if (!p) { if (up) n.DestroyBuffer(up); return false; }
+        memcpy(p, data, size_t(size)), n.UnmapBuffer(*up);
+        To(b, nri::AccessBits::COPY_DESTINATION, nri::StageBits::COPY), Flush();
+        n.CmdCopyBuffer(*cmd, *b.buf, 0, *up, 0, size);
+        uploads.push_back({up, slot, slotValue[slot]});  // freed once its recording has finished
+        return true;
+    }
+    struct Staged { nri::Buffer* buf; uint32_t slot, value; };
+    std::vector<Staged> uploads;
 
     std::unique_ptr<Pass> CreatePass(const Shader& s) override
     {
@@ -572,6 +590,8 @@ public:
             if (next - it->value >= 16 && Done(it->slot, it->value)) { if (it->cmd) n.DestroyCommandBuffer(it->cmd); ++finished, it = retired.erase(it); } else ++it;
         for (auto it = dying.begin(); it != dying.end();)
             if (next - it->first >= 16) n.DestroyBuffer(it->second), it = dying.erase(it); else ++it;
+        for (auto it = uploads.begin(); it != uploads.end();)
+            if (next - it->value >= 16 && Done(it->slot, it->value)) n.DestroyBuffer(it->buf), it = uploads.erase(it); else ++it;
         for (auto it = reads.begin(); it != reads.end();)
             if (Done(it->slot, it->value)) { Finish(*it); it = reads.erase(it); } else ++it;
     }
@@ -932,6 +952,15 @@ public:
         n.CmdReadbackTextureToBuffer(*cmd, *r.buf, l, *a.tex, rg);
         reads.push_back(r);
     }
+    void ReadBack(const Buffer& b, std::shared_ptr<std::vector<uint8_t>> out) override
+    {
+        auto& a = static_cast<const BufN&>(b);
+        Read r = {nullptr, out, uint32_t(b.size), uint32_t(b.size), 1, slot, slotValue[slot], b.size};
+        if (!(r.buf = Committed(r.size, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE))) return;
+        To(a, nri::AccessBits::COPY_SOURCE, nri::StageBits::COPY), Flush();
+        n.CmdCopyBuffer(*cmd, *r.buf, 0, *a.buf, 0, b.size);
+        reads.push_back(r);
+    }
     // NFRUX_TEST_TIMES: the GPU's time after each pass; means by pass when the device ends.
     static constexpr uint32_t kMarks = 256;
     nri::QueryPool* marks = nullptr;
@@ -988,7 +1017,7 @@ TexN::~TexN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyD
 BufN::~BufN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyDescriptor(uav); if (buf) dev->n.DestroyBuffer(buf); }
 PassN::~PassN() { if (pipeline) dev->n.DestroyPipeline(pipeline); if (layout) dev->n.DestroyPipelineLayout(layout); }
 
-bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy)
+bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy, uint32_t gz)
 {
     DevN& d = *dev;
     nri::DescriptorSet* set = nullptr;
@@ -1033,7 +1062,7 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
     nri::SetDescriptorSetDesc sd = {0, set, nri::BindPoint::COMPUTE};
     d.n.CmdSetDescriptorSet(*d.cmd, sd);
     if (d.timed && !d.markCount) d.Mark("begin");
-    d.n.CmdDispatch(*d.cmd, {gx, gy, 1});
+    d.n.CmdDispatch(*d.cmd, {gx, gy, gz});
     if (d.timed) d.Mark(name.c_str());
     return true;
 }

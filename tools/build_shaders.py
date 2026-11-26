@@ -78,6 +78,13 @@ passes += [("kMlfgDilate", mg_ + "dilate.hlsl", [], MGINV, 60),
            ("kMlfgSoftmax5", mg_ + "softmax5.hlsl", [], "NFRUX_UNUSED", 60)]
 for suffix, f in [("Rgba16f", "RGBA16F"), ("Rgb10a2", "RGB10A2"), ("Rgba8", "RGBA8")]:
     passes.append((f"kMlfgComposite{suffix}", mg_ + "composite.hlsl", [f"-DMLFG_OUT_{f}=1"], "NFRUX_UNUSED", 60))
+    passes.append((f"kMlfgFinish{suffix}", mg_ + "finish.hlsl", [f"-DMLFG_OUT_{f}=1"], "NFRUX_UNUSED", 60))
+# The ML runtime's generic tier (core/mlfg): convolutions 3x3/1, 2x2/2, 1x1 and transposed 2x2/2, strict like every kMlfg pass.
+passes += [("kMlfgClear", mg_ + "clear.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgConv3", mg_ + "conv.hlsl", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"], "NFRUX_UNUSED", 60),
+           ("kMlfgConv2", mg_ + "conv.hlsl", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2"], "NFRUX_UNUSED", 60),
+           ("kMlfgConv1", mg_ + "conv.hlsl", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1"], "NFRUX_UNUSED", 60),
+           ("kMlfgConvT", mg_ + "conv.hlsl", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"], "NFRUX_UNUSED", 60)]
 
 
 def run(cmd):

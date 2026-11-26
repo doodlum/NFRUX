@@ -131,6 +131,7 @@ static FrameInputs Inputs(const ExternalImage* im, bool first)
 static Settings MakeSettings(const ExternalImage& color)
 {
     Settings s;
+    s.model = SelectedModel();  // NFRUX_MODEL=amd: the FSR FG4 interpolator
     s.depthInverted = g.inverted;
     s.outputFormat = g.format == 3 ? Format::RGBA16Float : g.format == 2 ? Format::RGB10A2Unorm : g.format == 1 ? Format::BGRA8Unorm : Format::RGBA8Unorm;
     if (g.format == 1 && g_vulkan) s.outputFormat = Format::RGBA8Unorm, s.swapRB = true;

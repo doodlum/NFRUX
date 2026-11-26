@@ -1,4 +1,4 @@
-// FSR FG4 network passes 149 + 151: final flow residual and the export of the two flows as UV images
+﻿// FSR FG4 network passes 149 + 151: final flow residual and the export of the two flows as UV images
 // (AMD FidelityFX SDK v2.4.0, MIT; spec: tools/ffx_extract/mlfg_glue.py pass149 / pass151).
 //
 // Reads   t1 head     f149 [headH][headW][16] fp16 from the network (ch 0-3 = the last flow residual), tensorSizes[69]
@@ -18,6 +18,8 @@ cbuffer Constants : register(b0)
     int4 c_head;   // head width (row pitch), prev width (row pitch), 0, 0
     int4 c_out;    // flowout width, height (the buffer's extent), live size tensorSizes[69].xy
     int4 c_image;  // image size tensorSizes[70].xy, 0, 0
+    float4 c_scale;  // flow A scale, flow B scale: 1, 1 = AMD; 2t, 2(1 - t) for a frame at t from a network run at
+                     // t = 0.5 (mlfg_net flow_t 'scale'), the flows (and so flowout and both images) times these, fp16
 };
 ByteAddressBuffer   t_head : register(t1);
 ByteAddressBuffer   t_prev : register(t2);
@@ -36,6 +38,7 @@ RWByteAddressBuffer u_flow : register(u3);
     {
         const uint hb = TexelBase(g, uint(c_head.x), 16u), pb = TexelBase(g, uint(c_head.y), 4u);
         f = F16Round(float4(LoadHalf2(t_head, hb), LoadHalf2(t_head, hb + 2u)) + float4(LoadHalf2(t_prev, pb), LoadHalf2(t_prev, pb + 2u)));
+        f = F16Round(f * c_scale.xxyy);  // mlfg_net flow_t 'scale': exact (no change) at 1
     }
     if (inOut)
     {

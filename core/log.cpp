@@ -22,8 +22,12 @@ const Known kKnown[] = {
     {"general", "maxmultiplier", nullptr, false},
     {"general", "ignorecrashmarkers", "NFRUX_IGNORE_MARKERS", true},
     {"general", "log", "NFRUX_LOG", false},
+    {"general", "model", "NFRUX_MODEL", false},
+    {"general", "amdweights", "NFRUX_AMD_WEIGHTS", false},
     {"d3d12", "network", nullptr, false},
     {"vulkan", "network", nullptr, false},
+    {"d3d12", "amdnetwork", nullptr, false},
+    {"vulkan", "amdnetwork", nullptr, false},
     {"vulkan", "assumefeatures", "NFRUX_VK_ASSUME_FEATURES", true},
     {"vulkan", "dot4tiled", "FFX_ML_DOT4_TILED", true},
     {"vulkan", "dot4subgroup", "FFX_ML_DOT4_SUBGROUP", false},
@@ -67,7 +71,7 @@ struct Ini
                 else if (v == "0" || v == "false" || v == "off" || v == "no") value = "0";
                 else { notes.push_back("nfrux.ini: " + key + "=" + value + " is not auto, 0 or 1: ignored"); continue; }
             }
-            else if (key != "log") value = v;
+            else if (key != "log" && key != "amdweights") value = v;  // file names as written
             else if (v == "true" || v == "on" || v == "yes") value = "1";  // Log: a flag or a file name
             else if (v == "false" || v == "off" || v == "no") value = "0";
             values[section + "." + key] = value;

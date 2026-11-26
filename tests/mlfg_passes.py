@@ -249,7 +249,7 @@ def run_flowout(name, f149, flow112, S69, S70, t_note=''):
     W, H = S69
     head = nhwc(f149[:, :H, :W], 16)
     prev = nhwc(flow112[:, :H, :W], 4)
-    k = cbytes(('i', [W, W]), ('i', [W, H, W, H]), ('i', list(S70)))
+    k = cbytes(('i', [W, W]), ('i', [W, H, W, H]), ('i', list(S70)), ('f', [1.0, 1.0]))
     gw, gh = max(W, S70[0]), max(H, S70[1])
     j = Job(name, 'kMlfgFlowOut', k, *groups(gw, gh))
     j.buf(1, head).buf(2, prev)

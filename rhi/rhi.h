@@ -90,7 +90,7 @@ class Pass
 {
 public:
     virtual ~Pass() = default;
-    virtual bool Dispatch(const Bind* binds, uint32_t count, uint32_t groupsX, uint32_t groupsY) = 0;
+    virtual bool Dispatch(const Bind* binds, uint32_t count, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ = 1) = 0;
 };
 
 // The network at one size. Input: the 20-channel int8 tensor; outputs: the blend parameters (4 int8) and the gate (its int8
@@ -112,6 +112,8 @@ public:
     // A texture of an external image's own format (the colour history).
     virtual std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& image, uint32_t width, uint32_t height) = 0;
     virtual std::unique_ptr<Buffer>  CreateBuffer(uint64_t size) = 0;
+    // Host data into a buffer, recorded into the current frame (between BeginFrame and EndFrame); the staging copy is freed later.
+    virtual bool Upload(const Buffer& dst, const void* data, uint64_t size) = 0;
     virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader) = 0;
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;
 
@@ -129,6 +131,7 @@ public:
     virtual void RunNetworks(Network* const* nets, uint32_t count) = 0;
     // A texture's texels into host memory, tightly packed: filled at a BeginFrame or WaitIdle after the frame has completed.
     virtual void ReadBack(const Texture& t, std::shared_ptr<std::vector<uint8_t>> out) = 0;
+    virtual void ReadBack(const Buffer& b, std::shared_ptr<std::vector<uint8_t>> out) = 0;  // all of it, the same way
     virtual void Mark(const char* label) = 0;  // profiling
     // GPU time (microseconds) per label of the last profiled frame, when profiling is on.
     virtual std::vector<std::pair<std::string, float>> Profile() { return {}; }

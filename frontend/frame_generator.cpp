@@ -101,6 +101,7 @@ void CameraViewProjection(const EvalInputs& in, float out[16])
             out[r * 4 + c] = s;
         }
 }
+Model TheModel() { static const Model m = [] { const Model x = SelectedModel(); Log("model: %s", x == Model::Amd ? "AMD FSR Frame Generation 4" : "NFRU"); return x; }(); return m; }
 bool Whole(const Rect& r, const ExternalImage& e) { return !r.w || !r.h || (!r.x && !r.y && r.w == e.width && r.h == e.height); }
 bool SameSize(const ExternalImage& a, const ExternalImage& b) { return a && b && a.width == b.width && a.height == b.height; }
 }  // namespace
@@ -130,6 +131,7 @@ FrameGenerator::Entry* FrameGenerator::Get(const ExternalImage& color, const Eva
     auto e = std::make_unique<Entry>();
     e->w = w, e->h = h, e->rw = rw, e->rh = rh, e->format = color.format, e->inverted = in.depthInverted;
     Settings s;
+    s.model = TheModel();
     s.displayWidth = w, s.displayHeight = h, s.renderWidth = rw, s.renderHeight = rh, s.depthInverted = in.depthInverted;
     s.colorLike = color, s.outputFormat = color ? ClassOf(color, m_vulkan) : Format::RGBA16Float;  // no image: the staged path's own
     if (m_vulkan && s.outputFormat == Format::BGRA8Unorm)
@@ -508,7 +510,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
             m_frameId = in.frameId;
         }
         if (in.notRendering || menu) m_restart = true;
-        else if (!Checked()) m_restart = true;
+        else if (TheModel() == Model::Nfru && !Checked()) m_restart = true;  // the int8 network's self-check (D7); FSR FG4 has its own runtime
         else if (!Generate(in) && m_generated == 0 && m_evaluations == 1) Log("first frame not generated");
         static uint32_t logged = 0;
         if (in.count != logged) Log("%u generated frame(s) per rendered frame", in.count), logged = in.count;

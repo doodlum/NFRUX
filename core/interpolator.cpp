@@ -150,7 +150,7 @@ struct Out
     Tex qMotionTp1, qFlowTm1, filledFlowTm1, level[5], inpaint, seed, output, dynScratch, depthScratch;
 };
 
-struct Interpolator::Impl
+struct NfruImpl
 {
     Device&  dev;
     Settings s;
@@ -170,7 +170,7 @@ struct Interpolator::Impl
     Out      outs[kMaxGenerated];
     uint32_t made = 0;
 
-    Impl(Device& d) : dev(d) {}
+    NfruImpl(Device& d) : dev(d) {}
     bool MakePass(PassPtr& p, const Shader& a, const Shader& b) { p = dev.CreatePass(s.depthInverted ? b : a); return p != nullptr; }
     bool Create(std::string* error);
     bool MakeOuts(uint32_t n, std::string* error);
@@ -180,7 +180,7 @@ struct Interpolator::Impl
 
 #define NFRUX_PASS(var, name) if (!MakePass(var, shaders::name, shaders::name##Inv)) return fail("pass " #name);
 
-bool Interpolator::Impl::Create(std::string* error)
+bool NfruImpl::Create(std::string* error)
 {
     auto fail = [&](const char* m) { if (error) *error = m; return false; };
     display = {s.displayWidth, s.displayHeight};
@@ -269,7 +269,7 @@ bool Interpolator::Impl::Create(std::string* error)
     return MakeOuts(kMaxGenerated, error);
 }
 
-bool Interpolator::Impl::MakeOuts(uint32_t n, std::string* error)
+bool NfruImpl::MakeOuts(uint32_t n, std::string* error)
 {
     for (; made < std::min(n, kMaxGenerated); ++made)
     {
@@ -289,7 +289,7 @@ bool Interpolator::Impl::MakeOuts(uint32_t n, std::string* error)
     return true;
 }
 
-bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const Texture& depth, const Texture& mv, bool reset)
+bool NfruImpl::Flow(const FrameInputs& in, const Texture& color, const Texture& depth, const Texture& mv, bool reset)
 {
     const Texture& depthPrev = *depthTm1[depthCur];
     MvHintsConstants h = {};
@@ -346,7 +346,7 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
     return true;
 }
 
-bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t total)
+bool NfruImpl::Frame(const FrameInputs& in, uint32_t count, uint32_t total)
 {
     if (!MakeOuts(count, nullptr))
         return false;
@@ -498,36 +498,55 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     return true;
 }
 
-std::unique_ptr<Interpolator> Interpolator::Create(Device& device, const Settings& settings, std::string* error)
+namespace
 {
-    std::unique_ptr<Interpolator> it(new Interpolator());
-    it->m.reset(new Impl(device));
+class NfruInterpolator final : public Interpolator
+{
+public:
+    std::unique_ptr<NfruImpl> m;
+    bool Dispatch(const FrameInputs& in, uint32_t count, uint32_t total) override
+    {
+        if (!count || !m->Frame(in, std::min(count, kMaxGenerated), total))
+            return false;
+        m->dynCur ^= 1, m->depthCur ^= 1, m->prepCur ^= 1;
+        return true;
+    }
+    const Texture&  Output(uint32_t i) const override { return *m->outs[i].output; }
+    const Settings& settings() const override { return m->s; }
+    std::vector<std::pair<std::string, const Texture*>> Intermediates() const override
+    {
+        const NfruImpl& i = *m;
+        const Out&      o = i.outs[0];
+        return {{"pyramid", i.pyramid[i.pyrCur ^ 1].get()}, {"hints", i.computedMv.get()}, {"flow_hint", i.flowHint.get()}, {"flow", i.flow.get()},
+                {"depth", i.depthTm1[i.depthCur].get()}, {"motion_t", o.qMotionTp1.get()}, {"flow_t", o.qFlowTm1.get()}, {"flow_filled", o.filledFlowTm1.get()},
+                {"seed", o.seed.get()}, {"params", o.net->params}, {"gate", o.net->gate}, {"inpaint", o.inpaint.get()}, {"output", o.output.get()}};
+    }
+};
+}  // namespace
+
+std::unique_ptr<Interpolator> CreateNfruInterpolator(Device& device, const Settings& settings, std::string* error)
+{
+    auto it = std::make_unique<NfruInterpolator>();
+    it->m.reset(new NfruImpl(device));
     it->m->s = settings;
     if (!it->m->Create(error))
         return nullptr;
-    const Impl& m = *it->m;
+    const NfruImpl& m = *it->m;
     Log("interpolator %ux%u, render %ux%u, motion lane %ux%u, network %ux%u", m.display.width, m.display.height, m.render.width, m.render.height,
         m.mvLane.width, m.mvLane.height, m.graph.width, m.graph.height);
     return it;
 }
-Interpolator::~Interpolator() = default;
-const Texture&  Interpolator::Output(uint32_t i) const { return *m->outs[i].output; }
-const Settings& Interpolator::settings() const { return m->s; }
 
-bool Interpolator::Dispatch(const FrameInputs& in, uint32_t count, uint32_t total)
+std::unique_ptr<Interpolator> Interpolator::Create(Device& device, const Settings& settings, std::string* error)
 {
-    if (!count || !m->Frame(in, std::min(count, kMaxGenerated), total))
-        return false;
-    m->dynCur ^= 1, m->depthCur ^= 1, m->prepCur ^= 1;
-    return true;
+    return settings.model == Model::Amd ? CreateMlfgInterpolator(device, settings, error) : CreateNfruInterpolator(device, settings, error);
 }
 
-std::vector<std::pair<std::string, const Texture*>> Interpolator::Intermediates() const
+Model SelectedModel()
 {
-    const Impl& i = *m;
-    const Out&  o = i.outs[0];
-    return {{"pyramid", i.pyramid[i.pyrCur ^ 1].get()}, {"hints", i.computedMv.get()}, {"flow_hint", i.flowHint.get()}, {"flow", i.flow.get()},
-            {"depth", i.depthTm1[i.depthCur].get()}, {"motion_t", o.qMotionTp1.get()}, {"flow_t", o.qFlowTm1.get()}, {"flow_filled", o.filledFlowTm1.get()},
-            {"seed", o.seed.get()}, {"params", o.net->params}, {"gate", o.net->gate}, {"inpaint", o.inpaint.get()}, {"output", o.output.get()}};
+    const char* m = Env("NFRUX_MODEL");
+    if (m && !_stricmp(m, "amd")) return Model::Amd;
+    if (m && _stricmp(m, "nfru")) Log("Model=%s is not nfru or amd: nfru", m);
+    return Model::Nfru;
 }
 }  // namespace nfrux
