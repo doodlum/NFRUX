@@ -320,3 +320,37 @@ accumulators; see above), the CUDA staged 3x3 kernel and its ldmatrix variant, t
 the 64-pixel one-tile and the 4-tile CUDA kernels (0.04 / 0.06 ms), coopmat FP8 with e4m3 tensors (0.07 ms), the fused
 coopmat and generic FasterNet kernels (slower), the unused coopmat multi-tile (MT) and 2-tile 1x1 variants. Kept from
 round 2: CUDA on Vulkan, split-K, the branchless fp16 rounding, coopmat 16-byte staging and its 2- / 3-tile layers.
+
+### AMD and Intel matrix units (2026-11-26)
+
+Neither vendor's GPU is here; what was built is verified as far as an RTX 4070 allows.
+
+**Vulkan coopmat for any fp16 fragment shape (done).** The rhi now records every fp16 x fp16 -> fp32 subgroup
+cooperative-matrix shape the driver reports (`Caps.coopShapes`, logged at startup: "fp16 -> fp32 MxNxK: ...") and the
+subgroup-size range (Vulkan 1.3 subgroup size control); a pass can require a subgroup size (NRI `waveLaneNum`). The coopmat
+kernel computes its 16 pixels x 16 NB channels from MLFG_MM x MLFG_MN x 16 fragments. Variant sets: 16x16 at subgroup
+16 / 32 / 64 (NVIDIA, AMD RDNA3+ wave32 / wave64), 8x8 at 8 / 16 (Intel Xe-HPG, Arc A), 8x16 at 16 (Intel Xe2, Arc B),
+16x8 at 32 (reported by NVIDIA: the set that checks the fragment tiling here). The set is picked per device (largest
+fragment the device reports, at a subgroup size it runs; required explicitly where the size can vary) and logged with
+the tier ("network: cooperative matrices fp16, fragments MxNx16, subgroup S"). The RTX 4070 reports 16x16x16, 16x8x16 and
+16x8x8 at subgroup 32: both runnable sets pass mlfg_net (16x8 gives the same bytes as 16x16). The 8-row sets cannot run
+here; every variant is compiled and passes spirv-val in the build. Off NVIDIA the tier keeps its crash marker
+(`vulkan_mlfg_coopmat_<vendor>_<device>`) with generic as the fallback. `NFRUX_MLFG_MAT_SHAPE=MxN@S` (tests) asks for one
+set.
+
+**AMD WMMA on D3D12 (not done: no public interface).** AMD's own FG DLL does not use AGS: it calls amdxc64.dll's private
+`AmdExtD3DCreateInterface` and its DXIL writes driver-intrinsic words to the `AmdExtD3DShaderIntrinsicsUAV`
+(space 2147420894) with opcodes 0x28-0x32 (counted in its shaders: 0x28 11340, 0x29 10950, 0x32 260, ...). Public AGS
+(6.3.1, MIT, the copy NRI fetches) defines intrinsic opcodes up to 0x20 only, none of them matrix operations, and
+enabling intrinsics through AGS needs a device AGS created, which a DLSS-G DLL never gets. Reproducing the private
+opcodes' encoding without documentation or hardware to test on would be guesswork, so no D3D12 WMMA tier was added; AMD
+GPUs on D3D12 run generic, and on Vulkan the coopmat tier (16x16x16, RDNA3+).
+
+**D3D12 Cooperative Vectors (not done: preview only).** Matrix-vector multiply-add per thread (SM 6.9 preview,
+`dx/linalg.h`) maps onto 1x1 convolutions directly and onto 3x3 as nine of them (or im2col); it would be the cross-vendor
+D3D12 route. It needs the Agility SDK preview, experimental features (`D3D12EnableExperimentalFeatures`, which requires
+Windows Developer Mode) and a preview DXC: the installed DXC 1.9.0.5512 has no `dx/linalg.h`, Developer Mode is off
+here, and a DLL loaded into games cannot rely on either. Revisit when cooperative vectors (or the SM 6.10 linear-algebra
+matrices) reach a retail Agility SDK.
+
+**Intel D3D12 extensions:** see docs/DESIGN.md ("Vendor matrix units").

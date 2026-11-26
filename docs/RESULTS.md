@@ -541,3 +541,12 @@ kernels, fused coopmat / generic FasterNet). Not done: the stage-2 input pass fu
 0.1 ms). Gates on the final state: mlfg_passes 74/74 (68 + the rows-path checks); mlfg_net 76/76 on each sample (cuda
 47.4-49.3 / 44.0-45.0 dB vs the fp64-summed net); parity --strict 0 differing bytes; ngx_harness Model=amd 77/78 per API
 (RGB10A2 PQ quality), Model=nfru 158/158; build-ship and build-strict green.
+
+## FSR FG4, AMD / Intel matrix paths (2026-11-26, commit ca68a8e)
+
+Coopmat fragment shapes from the device: the RTX 4070 reports fp16 16x16x16, 16x8x16, 16x8x8 at subgroup 32 (logged).
+Sets 16x16@32 and 16x8@32 both pass mlfg_net (49.3-50.0 dB vs mlfg_net; 16x8 the same bytes as 16x16); 8x8@8/16 and
+8x16@16 compile and pass spirv-val (no such GPU here). AMD D3D12 WMMA, D3D12 cooperative vectors and Intel D3D12
+extensions not built (reasons in docs/DESIGN.md "Vendor matrix units"). Gates: mlfg_passes 74/74, mlfg_net 76/76 on each
+sample, parity --strict 0 differing bytes (strict build rebuilt), ngx_harness Model=amd 77/78 per API (RGB10A2 PQ),
+Model=nfru 158/158, both builds green.

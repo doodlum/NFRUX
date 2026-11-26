@@ -381,3 +381,25 @@ Why these numbers: a uniform 1-code error everywhere is 48 dB, 1 code on 6% of c
 
 Hardware: one RTX 4070. AMD and Intel ladders are exercised by forcing (correctness only); their speed and cooperative-matrix tile
 sizes are untested, and RESULTS says so.
+
+## Vendor matrix units (2026-11-26)
+
+- **Vulkan cooperative matrices, any vendor:** MLFG's coopmat tier takes the fragment shape and subgroup size from the
+  device (docs/FFX_MLFG.md "AMD and Intel matrix units"); NFRU's int8 coopmat already did (core/ml/vulkan_network.cpp).
+  Both log the shape they chose.
+- **AMD on D3D12:** no WMMA tier. AMD's FG DLL reaches WMMA through private driver-intrinsic opcodes (0x28-0x32) enabled
+  by amdxc64.dll's undocumented `AmdExtD3DCreateInterface`, not through AGS; public AGS 6.3.1 has no matrix intrinsics and
+  needs a device it created itself. AMD GPUs use Vulkan coopmat (RDNA3+) or the generic tier on D3D12.
+- **NFRU int8 WMMA on RDNA3:** left as it is (int8 first, then fp16; wave32 required; 16x16x16 from the driver's list;
+  4 subgroups a group). RDNA3's WMMA runs iu8 and fp16 at the same rate, so int8 halves the operand traffic for the same
+  math and stays first; RDNA4 doubles the iu8 rate, which favours it further. Any finer change (subgroups a group, tile
+  M, split targets) would need measurements on RDNA3 hardware: none here, and an untested change to a shipped path is
+  not low-risk.
+- **D3D12 Cooperative Vectors:** the eventual cross-vendor D3D12 route (matrix-vector ops per thread fit 1x1 directly,
+  3x3 as nine taps); preview-only (Agility SDK preview, experimental features with Developer Mode, a preview DXC with
+  `dx/linalg.h`), so not usable from a DLL loaded into games. Not built: the preview toolchain is not installed here and
+  fetching it is a download the user has to approve.
+- **Intel D3D12 extensions (igdext, INTC_D3D12):** not used. There is no copy here to read its licence from (fetching the
+  SDK is a download the user has to approve), and as far as is known its public extensions (queue throttling, 64-bit
+  typed atomics, shader debug) do not expose the XMX matrix units: XeSS reaches them privately. Intel GPUs use Vulkan
+  coopmat (8x8 / 8x16 fragments) or the generic tier on D3D12.
