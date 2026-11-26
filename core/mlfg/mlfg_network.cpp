@@ -54,9 +54,15 @@ float Half(uint16_t h)
     memcpy(&f, &u, 4);
     return f;
 }
-// The CUDA kernels' n tiles a warp: 8 (transposed 4), or 1 for the 3x3 and transposed layers with at most 16 outputs.
-uint32_t CudaNb(const LayerWeights& L) { return L.cout <= 16 && (L.kind == 1 || L.k == 3) ? 1 : L.kind == 1 ? 4 : 8; }
-uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
+// The CUDA kernels' n tiles (8 channels) a warp: 8 (transposed 4), padded; 1 for the 3x3 / transposed layers with at most
+// 16 outputs. Measured on the RTX 4070: the divisor that pads nothing (6 for 96 outputs, 3 for 24 ...) is slower (stage 1
+// at 4K 2.8 -> 3.4 ms; the warps are latency-bound and want 8 independent accumulators). The fused FasterNet kernels
+// rely on this rule.
+uint32_t CudaNb(const LayerWeights& L)
+{
+    if (L.cout <= 16 && (L.kind == 1 || L.k == 3)) return 1;
+    return L.kind == 1 ? 4 : 8;
+}uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
 {
     uint32_t u;
     memcpy(&u, &f, 4);
@@ -229,7 +235,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     if (l0w % 32 || l0h % 32 || s2w % 4 || s2h % 4) return fail("network sizes");
     if (!SelectTier(error)) return false;
     m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
-    m_offset.resize(kLayers), m_biasOffset.resize(kLayers);
+    m_m2 = !EnvFlag("NFRUX_MLFG_NO_M2", false);
+    m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers);
     if (m_tier == Tier::Cuda)
     {
         // mma fragments: per layer [kc][tap][ntp][lane] words, word = (W[k = 8 kc + 2q][n], W[k + 1][n]), n = 8 nt + g, lane = 4g + q;
@@ -239,7 +246,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         for (uint32_t l = 0; l < kLayers; ++l)
         {
             const LayerWeights& L = m_weights.layers[l];
-            const uint32_t taps = L.k * L.k, kc = (L.cin + 7) / 8, nb = CudaNb(L), nt = (L.cout + 7) / 8, ntp = (nt + nb - 1) / nb * nb;
+            m_nb[l] = CudaNb(L);
+            const uint32_t taps = L.k * L.k, kc = (L.cin + 7) / 8, nb = m_nb[l], nt = (L.cout + 7) / 8, ntp = (nt + nb - 1) / nb * nb;
             const uint32_t coP = (L.cout + 63) & ~63u;
             m_offset[l] = uint32_t(h.size()), m_biasOffset[l] = uint32_t(bias.size());
             h.resize(h.size() + size_t(kc) * taps * ntp * 32, 0);
@@ -296,6 +304,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                                sg == 16 ? &shaders::kMlfgMatT_16 : sg == 32 ? &shaders::kMlfgMatT_32 : &shaders::kMlfgMatT_64};
         bool made = m_gpuWeights && m_gpuBias;
         for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = m_dev.CreatePass(*sh[i]));
+        made = made && (m_fn[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn48_16 : sg == 32 ? shaders::kMlfgFn48_32 : shaders::kMlfgFn48_64));
+        made = made && (m_fn[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn64_16 : sg == 32 ? shaders::kMlfgFn64_32 : shaders::kMlfgFn64_64));
         made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
         made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
         if (!made) return fail("cooperative-matrix passes or weights buffer");
@@ -367,7 +377,7 @@ bool Network::Run(const Conv& c)
     const View& s1 = c.src1 ? c.src1 : c.src;
     if (m_tier == Tier::Cuda)
     {
-        const uint32_t split = std::min(c.split, L.cin), nb = CudaNb(L), nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
+        const uint32_t split = std::min(c.split, L.cin), nb = m_nb[c.layer], nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
         if (nt > ntp || (split < L.cin && split % 8)) return false;
         const Buffer* bufs[] = {c.src.buf, s1.buf, m_gpuWeights.get(), m_gpuBias.get(), c.add ? c.add.buf : c.src.buf, c.out.buf};
         void* list = m_dev.NativeAccess(bufs, 6);
@@ -377,9 +387,13 @@ bool Network::Run(const Conv& c)
                         int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch) - int32_t(split), int32_t(split), int32_t(L.cin),
                         int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch), int32_t(L.cout), int32_t(writeEnd), int32_t(c.act), c.fp8 ? 1 : 0,
                         c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t((L.cin + 7) / 8), int32_t(ntp)};
-        const int      shape = nb == 1 ? (L.kind == 1 ? 5 : 4) : L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
-        const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, L.kind == 1 ? c.src.h : c.out.h, ntp / nb};
-        const bool ok = m_cuda->Launch(list, shape, grid, p);
+        const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+        const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, ((L.kind == 1 ? c.src.h : c.out.h) + kCudaWarps - 1) / kCudaWarps, ntp / nb};
+        // 32 pixels a warp (each B fragment twice) for the 8-tile convolutions without a second source on 3x3 / 2x2.
+        // Only where that still gives 256 warps or more (measured: the 30- and 60-pixel-wide stage-1 layers get slower).
+        const bool m2 = nb == 8 && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
+        const uint32_t gridM[3] = {(c.out.w + 31) / 32, grid[1], grid[2]};
+        const bool ok = m2 ? m_cuda->LaunchM(list, shape, gridM, p) : m_cuda->Launch(list, shape, nb, grid, p);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }
@@ -482,9 +496,21 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
         const FnParams p = {m_dev.NativeAddress(*x.buf), m_dev.NativeAddress(*y.buf), wa + uint64_t(m_offset[first]) * 4, wa + uint64_t(m_offset[first + 1]) * 4,
                             wa + uint64_t(m_offset[first + 2]) * 4, ba + uint64_t(m_biasOffset[first]) * 4, ba + uint64_t(m_biasOffset[first + 1]) * 4,
                             ba + uint64_t(m_biasOffset[first + 2]) * 4, int32_t(x.w), int32_t(x.h)};
-        const uint32_t grid[3] = {(x.w + 15) / 16, x.h, 1};
+        const uint32_t grid[3] = {(x.w + 15) / 16, (x.h + kCudaWarps - 1) / kCudaWarps, 1};
         if (!m_cuda->LaunchFn(list, C, grid, p)) return false;
         if (m_dev.Timing()) m_dev.Mark(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
+        if (!skip) return true;
+        c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
+        return Run(c);
+    }
+    if (m_tier == Tier::CoopMat && m_fused && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
+    {
+        auto pad = [&](uint32_t l) { return int32_t((m_weights.layers[l].cout + 63) & ~63u); };
+        const int32_t k[16] = {int32_t(x.w), int32_t(x.h), 0, 0, int32_t(m_offset[first]), int32_t(m_offset[first + 1]), int32_t(m_offset[first + 2]), 0,
+                               int32_t(m_biasOffset[first]), int32_t(m_biasOffset[first + 1]), int32_t(m_biasOffset[first + 2]), 0, pad(first), pad(first + 1), pad(first + 2), 0};
+        const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Buf(1, *x.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(5, *y.buf), Bind::Buf(6, *m_gpuBias)};
+        if (m_dev.Timing()) m_dev.Label(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
+        if (!m_fn[C == 48 ? 0 : 1]->Dispatch(b, 5, (x.w + 15) / 16, x.h, 1)) return false;
         if (!skip) return true;
         c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
         return Run(c);

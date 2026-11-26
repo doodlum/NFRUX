@@ -1,0 +1,194 @@
+// One FasterNet block of FSR FG4's stage 2 on Vulkan cooperative matrices (the coopmat tier, core/mlfg): y = q8(project(
+// q8(relu(expand(cat(q8(pconv3x3(x[:P])), x[P:]))))) + x), C = MLFG_C (48 / 64), P = MLFG_P (16 / 32). A workgroup is one
+// subgroup and 16 pixels of a row; each step's rounded fp8 values (exact in fp16) go through shared memory to the next
+// product. Accumulators start at the bias (a row-replicated matrix), so the epilogues (ReLU, fp8 rounding, the residual)
+// are element-wise on the accumulators; the sums' order differs from mlfg_conv_coopmat.comp's layers by the bias.
+// Weights as that tier's ([tap][ciPad16][coPad64] fp16 at c_w.xyz halves, biases fp32 at c_b.xyz).
+// SPDX-License-Identifier: MIT
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#define C MLFG_C
+#define P MLFG_P
+#define E (2 * C)
+layout(local_size_x = MLFG_SG) in;
+layout(set = 0, binding = 0, std140) uniform Constants
+{
+    ivec4 c_size;  // width, height, 0, 0
+    ivec4 c_w;     // weight offsets (halves): pconv, expand, project; 0
+    ivec4 c_b;     // bias offsets (floats): pconv, expand, project; 0
+    ivec4 c_pad;   // the layers' coPad64: pconv, expand, project; 0
+};
+layout(set = 0, binding = 1, std430) readonly buffer X { float16_t x[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Weights { float16_t wt[]; };
+layout(set = 0, binding = 5, std430) buffer Y { float16_t y[]; };
+layout(set = 0, binding = 6, std430) readonly buffer Bias { float bias[]; };
+
+shared float16_t sIn[18 * 3 * 16];  // the pconv patch, one 16-channel chunk
+shared float16_t sX[16 * C];        // x at the 16 pixels (0 outside)
+shared float16_t sH[16 * C];        // cat(pconv, x[P:]) of the 16 pixels
+shared float16_t sE[16 * E];        // relu(expand)
+shared float     sB[16 * E];        // a layer's biases, every row the same: the accumulators' start
+
+uint F32ToF16(float f)  // round to nearest even (as mlfg_conv_coopmat.comp)
+{
+    const uint u = floatBitsToUint(f);
+    const uint s = (u >> 16) & 0x8000u;
+    const uint e = (u >> 23) & 0xFFu;
+    uint m = u & 0x7FFFFFu;
+    if (e == 0xFFu) return s | 0x7C00u | (m != 0u ? 0x200u : 0u);
+    const int Ex = int(e) - 112;
+    if (Ex >= 31) return s | 0x7C00u;
+    if (Ex <= 0)
+    {
+        if (Ex < -10) return s;
+        m |= 0x800000u;
+        const uint shift = uint(14 - Ex);
+        uint q = m >> shift;
+        const uint rem = m & ((1u << shift) - 1u), half_ = 1u << (shift - 1u);
+        if (rem > half_ || (rem == half_ && (q & 1u) != 0u)) q += 1u;
+        return s | q;
+    }
+    uint q = (uint(Ex) << 10) | (m >> 13);
+    const uint rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (q & 1u) != 0u)) q += 1u;
+    return s | q;
+}
+float F8Round(float v)
+{
+    const uint u = floatBitsToUint(v);
+    const uint s = u & 0x80000000u, a = u & 0x7FFFFFFFu;
+    if (a >= 0x7F800000u) return uintBitsToFloat(0x7FC00000u);
+    const uint e = a >> 23;
+    if (e >= 121u)
+    {
+        uint q = a >> 20;
+        const uint rem = a & 0xFFFFFu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u) != 0u)) q += 1u;
+        const uint r = q << 20;
+        return r > 0x43E00000u ? uintBitsToFloat(0x7FC00000u) : uintBitsToFloat(s | r);
+    }
+    if (e == 0u) return uintBitsToFloat(s);
+    const uint m = (a & 0x7FFFFFu) | 0x800000u, shift = 141u - e;
+    if (shift >= 26u) return uintBitsToFloat(s);
+    uint q = m >> shift;
+    const uint rem = m & ((1u << shift) - 1u), half_ = 1u << (shift - 1u);
+    if (rem > half_ || (rem == half_ && (q & 1u) != 0u)) q += 1u;
+    return uintBitsToFloat(s | floatBitsToUint(float(q) * 0.001953125));
+}
+// An fp8 value as fp16: exact (e4m3's values, its subnormals included, are fp16 normals), whatever the conversion's rounding.
+float16_t H(float v) { return float16_t(v); }
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define ACCH coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+// The layer's 16 bias columns from n as a matrix (rows the same).
+void Biases(int off, int n)
+{
+    barrier();
+    for (uint i = gl_LocalInvocationID.x; i < uint(16 * n); i += uint(MLFG_SG))
+        sB[i] = bias[off + int(i % uint(n))];
+    barrier();
+}
+
+void main()
+{
+    const uint  li = gl_LocalInvocationID.x;
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy) * ivec2(16, 1);
+    const int   W = c_size.x, Hh = c_size.y;
+    for (uint i = li; i < 16u * uint(C); i += uint(MLFG_SG))
+    {
+        const int xx = tile.x + int(i / uint(C));
+        sX[i] = xx < W ? x[(uint(tile.y) * uint(W) + uint(xx)) * uint(C) + i % uint(C)] : float16_t(0);
+    }
+    // pconv 3x3 P -> P on x[:P].
+    Biases(c_b.x, P);
+    ACC ap[P / 16];
+    [[unroll]] for (int b = 0; b < P / 16; ++b) coopMatLoad(ap[b], sB, uint(b * 16), uint(P), gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (int c0 = 0; c0 < P; c0 += 16)
+    {
+        barrier();
+        for (uint i = li; i < 18u * 3u * 16u; i += uint(MLFG_SG))
+        {
+            const uint  p = i >> 4, c = i & 15u;
+            const ivec2 q = tile + ivec2(int(p % 18u) - 1, int(p / 18u) - 1);
+            sIn[i] = (q.x >= 0 && q.y >= 0 && q.x < W && q.y < Hh) ? x[(uint(q.y) * uint(W) + uint(q.x)) * uint(C) + uint(c0) + c] : float16_t(0);
+        }
+        barrier();
+        [[unroll]] for (int t = 0; t < 9; ++t)
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+            coopMatLoad(a, sIn, uint(((t / 3) * 18 + t % 3) * 16), 16u, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int b = 0; b < P / 16; ++b)
+            {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+                coopMatLoad(w, wt, uint(c_w.x) + uint((t * P + c0) * c_pad.x + b * 16), uint(c_pad.x), gl_CooperativeMatrixLayoutRowMajor);
+                ap[b] = coopMatMulAdd(a, w, ap[b]);
+            }
+        }
+    }
+    [[unroll]] for (int b = 0; b < P / 16; ++b)
+    {
+        for (int k = 0; k < ap[b].length(); ++k) ap[b][k] = F8Round(ap[b][k]);
+        coopMatStore(ACCH(ap[b]), sH, uint(b * 16), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+    }
+    for (uint i = li; i < 16u * uint(C); i += uint(MLFG_SG))
+        if (i % uint(C) >= uint(P)) sH[i] = sX[i];
+    // expand 1x1 C -> 2C, ReLU.
+    Biases(c_b.y, E);
+    ACC ae[E / 16];
+    [[unroll]] for (int b = 0; b < E / 16; ++b) coopMatLoad(ae[b], sB, uint(b * 16), uint(E), gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (int c0 = 0; c0 < C; c0 += 16)
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopMatLoad(a, sH, uint(c0), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (int b = 0; b < E / 16; ++b)
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+            coopMatLoad(w, wt, uint(c_w.y) + uint(c0 * c_pad.y + b * 16), uint(c_pad.y), gl_CooperativeMatrixLayoutRowMajor);
+            ae[b] = coopMatMulAdd(a, w, ae[b]);
+        }
+    }
+    [[unroll]] for (int b = 0; b < E / 16; ++b)
+    {
+        for (int k = 0; k < ae[b].length(); ++k) ae[b][k] = F8Round(max(ae[b][k], 0.0));
+        coopMatStore(ACCH(ae[b]), sE, uint(b * 16), uint(E), gl_CooperativeMatrixLayoutRowMajor);
+    }
+    // project 1x1 2C -> C, + x.
+    Biases(c_b.z, C);
+    ACC aj[C / 16];
+    [[unroll]] for (int b = 0; b < C / 16; ++b) coopMatLoad(aj[b], sB, uint(b * 16), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (int c0 = 0; c0 < E; c0 += 16)
+    {
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+        coopMatLoad(a, sE, uint(c0), uint(E), gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (int b = 0; b < C / 16; ++b)
+        {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
+            coopMatLoad(w, wt, uint(c_w.z) + uint(c0 * c_pad.z + b * 16), uint(c_pad.z), gl_CooperativeMatrixLayoutRowMajor);
+            aj[b] = coopMatMulAdd(a, w, aj[b]);
+        }
+    }
+    const bool inside = tile.x + 16 <= W;
+    [[unroll]] for (int b = 0; b < C / 16; ++b)
+    {
+        ACCH r;
+        coopMatLoad(r, sX, uint(b * 16), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+        ACC rf = ACC(r);
+        for (int k = 0; k < aj[b].length(); ++k) aj[b][k] = F8Round(aj[b][k] + rf[k]);
+        if (inside) coopMatStore(ACCH(aj[b]), y, (uint(tile.y) * uint(W) + uint(tile.x)) * uint(C) + uint(b * 16), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+        else coopMatStore(ACCH(aj[b]), sH, uint(b * 16), uint(C), gl_CooperativeMatrixLayoutRowMajor);
+    }
+    if (!inside)
+    {
+        barrier();
+        for (uint i = li; i < 16u * uint(C); i += uint(MLFG_SG))
+        {
+            const int xx = tile.x + int(i / uint(C));
+            if (xx < W) y[(uint(tile.y) * uint(W) + uint(xx)) * uint(C) + i % uint(C)] = sH[i];
+        }
+    }
+}

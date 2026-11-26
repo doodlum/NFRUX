@@ -90,15 +90,16 @@ private:
     Device&                 m_dev;
     Tier                    m_tier = Tier::Generic;
     Weights                 m_weights;
-    std::vector<uint32_t>   m_offset, m_biasOffset;  // the layer's weights in the tier's buffers (floats / halves)
+    std::vector<uint32_t>   m_offset, m_biasOffset, m_nb;  // the layer's weights in the tier's buffers (floats / halves)
     std::vector<uint8_t>    m_blob, m_biasBlob;  // the tier's weights until uploaded
     std::unique_ptr<Buffer> m_gpuWeights, m_gpuBias;
     std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames
     uint32_t                m_frames = 0;
     std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
-    std::unique_ptr<Pass>   m_mat[4], m_matN1[2];
+    std::unique_ptr<Pass>   m_mat[4], m_matN1[2], m_fn[2];  // coopmat: layers; narrow; fused FasterNet 48 / 64
     std::unique_ptr<CudaKernels> m_cuda;
-    bool                    m_fused = true;  // fused FasterNet blocks (NFRUX_MLFG_UNFUSED=1: the layers one by one, tests)
+    bool                    m_fused = true;
+    bool                    m_m2 = true;  // CUDA: 32 pixels a warp (NFRUX_MLFG_NO_M2=1: 16, tests)  // fused FasterNet blocks (NFRUX_MLFG_UNFUSED=1: the layers one by one, tests)
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch
     Tensor                  m_t32, m_x48, m_y48, m_skip, m_pc16, m_h96, m_x64, m_y64, m_pc32, m_h128, m_u32;  // stage 2
