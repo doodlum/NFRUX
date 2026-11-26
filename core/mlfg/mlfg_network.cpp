@@ -237,6 +237,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     if (!SelectTier(error)) return false;
     m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
     m_m2 = !EnvFlag("NFRUX_MLFG_NO_M2", false);
+    // Shared-memory staging of the 3x3 inputs: measured neutral on the RTX 4070 (the per-tap loads hit L1); off unless
+    // NFRUX_MLFG_STAGING=1.
+    m_staged = EnvFlag("NFRUX_MLFG_STAGING", false);
+    m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
     // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
     // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
     // untested elsewhere. Off unless NFRUX_MLFG_FUSED=1. CUDA's is on (NFRUX_MLFG_UNFUSED=1 turns every one off).
@@ -304,6 +308,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
         m_gpuWeights = m_dev.CreateBuffer(m_blob.size(), true), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size(), true);
         if (!m_gpuWeights || !m_gpuBias) return fail("weights buffer");
+        if (m_splitK && !(m_partial = m_dev.CreateBuffer(kPartialFloats * 4, true))) return fail("split-K buffer");
     }
     else if (m_tier == Tier::CoopMat)
     {
@@ -427,7 +432,25 @@ bool Network::Run(const Conv& c)
         // Only where that still gives 256 warps or more (measured: the 30- and 60-pixel-wide stage-1 layers get slower).
         const bool m2 = nb == 8 && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
         const uint32_t gridM[3] = {(c.out.w + 31) / 32, grid[1], grid[2]};
-        const bool ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
+        const bool staged = m_staged && L.k == 3 && split >= L.cin && c.src.pitch % 2 == 0 && c.src.ch % 2 == 0;  // shared-memory staging
+        // Split-K for the low-resolution 3x3 layers that fill few warps: S splits of the channel chunks each write fp32 sums,
+        // a second pass adds them in split order (the same bytes every run, on both APIs) and runs the epilogue.
+        const uint32_t warps = grid[0] * c.out.h * grid[2], kc = (L.cin + 7) / 8, pixels = c.out.w * c.out.h;
+        uint32_t       splits = 1;
+        if (m_partial && !m2 && nb == 8 && L.kind == 0 && L.k == 3 && warps < 256 && kc >= 4 && writeEnd <= ntp * 8)
+            splits = std::min({4u, (256 + warps - 1) / warps, kc / 2});
+        while (splits > 1 && uint64_t(splits) * pixels * ntp * 8 > kPartialFloats) --splits;
+        bool ok;
+        if (splits > 1)
+        {
+            const uint32_t per = (kc + splits - 1) / splits;
+            splits = (kc + per - 1) / per;
+            SplitParams    sp = {p, m_dev.NativeAddress(*m_partial), int32_t(per), int32_t(splits)};
+            const Buffer*  sb[] = {bufs[0], bufs[1], bufs[2], bufs[3], bufs[4], bufs[5], m_partial.get()};
+            const uint32_t sg[3] = {grid[0], grid[1], grid[2] * splits};
+            ok = m_cuda->LaunchSplit(sb, 7, sg, sp, pixels);
+        }
+        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }

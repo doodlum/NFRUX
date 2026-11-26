@@ -34,14 +34,14 @@ struct Ptx
 };
 
 // One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2; NB n tiles (8 channels each) a warp.
-std::string Kernel(int shape, int NB)
+std::string Kernel(int shape, int NB, bool split = false)
 {
     const bool T = shape == 3;
     const int  K = shape == 0 ? 3 : shape == 1 ? 2 : shape == 2 ? 1 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0;
     const int  taps = K * K, NA = T ? 4 : 1;  // accumulator sets (transposed: one per output phase)
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "(.param .align 8 .b8 P[128])\n{\n";
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
     w(".reg .b32 %%r<160>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // s0 s1 w b add out
     // r1 inW r2 inH r3 p0 r4 ch0 r5 p1 r6 ch1m r7 split r8 cin r9 outW r10 outH r11 po r12 cho r13 cout r14 writeEnd r15 act
@@ -73,7 +73,16 @@ std::string Kernel(int shape, int NB)
     w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7;");
     w("mul.wide.u32 %%rd9, %%r20, 128;");  // a tap's stride (ntp * 128)
     w("mul.lo.u64 %%rd60, %%rd9, %d;", T ? 4 : taps);  // a chunk's stride
-    w("mov.u32 %%r40, 0;");  // kc
+    if (split)  // grid z = n-tile groups x splits: this split's chunks [kc0, kc0 + per)
+    {
+        w("ld.param.u64 %%rd70, [P+128]; ld.param.u32 %%r110, [P+136];");  // partial sums, chunks a split
+        w("mov.u32 %%r111, %%ctaid.z; div.u32 %%r112, %%r20, %d; rem.u32 %%r113, %%r111, %%r112; div.u32 %%r114, %%r111, %%r112;", NB);  // groups, group, split
+        w("mul.lo.u32 %%r26, %%r113, %d; mul.lo.u32 %%r40, %%r114, %%r110; add.u32 %%r115, %%r40, %%r110; min.u32 %%r19, %%r19, %%r115;", NB);
+        // the weight base again for this group, and the first chunk
+        w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7; mul.wide.u32 %%rd7, %%r40, 1; mul.lo.u64 %%rd7, %%rd7, %%rd60; add.s64 %%rd8, %%rd8, %%rd7;");
+    }
+    else
+        w("mov.u32 %%r40, 0;");  // kc
     w("LOOP:");
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3; setp.lt.s32 %%p9, %%r41, %%r7;");  // chunk's first channel, from src0
@@ -106,6 +115,24 @@ std::string Kernel(int shape, int NB)
     }
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
+    if (split)  // the raw sums: part[split][pixel][ntp * 8] fp32
+    {
+        w("mul.lo.u32 %%r116, %%r9, %%r10; mul.lo.u32 %%r116, %%r116, %%r114; shl.b32 %%r117, %%r20, 3;");  // split * pixels, cpad
+        for (int j = 0; j < NB; ++j)
+        {
+            w("add.u32 %%r60, %%r26, %d; shl.b32 %%r60, %%r60, 3; shl.b32 %%r61, %%r23, 1; add.s32 %%r60, %%r60, %%r61;", j);
+            for (int r = 0; r < 2; ++r)
+            {
+                const int f = j * 4 + r * 2, lab = w.label++;
+                w("setp.lt.s32 %%p23, %%r%d, %%r9; setp.lt.s32 %%p24, %%r25, %%r10; and.pred %%p23, %%p23, %%p24; @!%%p23 bra SKIP%d;", r ? 28 : 27, lab);
+                w("mad.lo.s32 %%r65, %%r25, %%r9, %%r%d; add.u32 %%r65, %%r65, %%r116; mad.lo.u32 %%r65, %%r65, %%r117, %%r60; mul.wide.u32 %%rd66, %%r65, 4; add.s64 %%rd66, %%rd70, %%rd66;", r ? 28 : 27);
+                w("st.global.v2.f32 [%%rd66], {%%f%d, %%f%d};", f, f + 1);
+                w("SKIP%d:", lab);
+            }
+        }
+        w("ret;");
+        return w.s + "}\n";
+    }
     // Epilogue: bias, add, activation, rounding (fp8 e4m3 as torch, then fp16 round to nearest even), two channels a word.
     for (int a = 0; a < NA; ++a)
         for (int j = 0; j < NB; ++j)
@@ -147,6 +174,43 @@ std::string Kernel(int shape, int NB)
     return w.s + "}\n";
 }
 void Fp8(Ptx& w, int v);
+
+// The 8-row-group convolutions' epilogue (KernelM / KernelS): bias, add, activation, rounding, two channels a word.
+void Epilogue(Ptx& w, int NB, int R)
+{
+    for (int j = 0; j < NB; ++j)
+    {
+        w("add.u32 %%r60, %%r26, %d; shl.b32 %%r60, %%r60, 3; shl.b32 %%r61, %%r23, 1; add.s32 %%r60, %%r60, %%r61;", j);
+        w("setp.lt.s32 %%p20, %%r60, %%r14; add.s32 %%r62, %%r60, 1; setp.lt.s32 %%p21, %%r60, %%r13; setp.lt.s32 %%p22, %%r62, %%r13;");
+        w("mul.wide.s32 %%rd64, %%r60, 4; add.s64 %%rd64, %%rd4, %%rd64; ld.global.f32 %%f180, [%%rd64]; ld.global.f32 %%f181, [%%rd64+4];");
+        for (int r = 0; r < R; ++r)
+        {
+            const int f = ((r / 2) * NB + j) * 4 + (r % 2) * 2, lab = w.label++;
+            w("mov.u32 %%r63, %%r%d; mov.u32 %%r64, %%r25;", 80 + r);
+            w("setp.lt.s32 %%p23, %%r63, %%r9; setp.lt.s32 %%p24, %%r64, %%r10; and.pred %%p23, %%p23, %%p24; and.pred %%p23, %%p23, %%p20;");
+            w("@!%%p23 bra SKIP%d;", lab);
+            w("mad.lo.s32 %%r65, %%r64, %%r9, %%r63;");
+            w("add.rn.f32 %%f182, %%f%d, %%f180; add.rn.f32 %%f183, %%f%d, %%f181;", f, f + 1);
+            w("mad.lo.s32 %%r66, %%r65, %%r17, %%r18; add.s32 %%r66, %%r66, %%r60; mul.wide.s32 %%rd65, %%r66, 2; add.s64 %%rd65, %%rd5, %%rd65;");
+            w("@%%p4 ld.global.u16 %%h3, [%%rd65]; @%%p4 ld.global.u16 %%h4, [%%rd65+2];");
+            w("@%%p4 cvt.f32.f16 %%f184, %%h3; @%%p4 cvt.f32.f16 %%f185, %%h4; @%%p4 add.rn.f32 %%f182, %%f182, %%f184; @%%p4 add.rn.f32 %%f183, %%f183, %%f185;");
+            for (int e = 0; e < 2; ++e)
+            {
+                const int v = 182 + e;
+                w("setp.gt.f32 %%p25, %%f%d, 0f00000000; mul.rn.f32 %%f186, %%f%d, 0f3E4CCCCD; selp.f32 %%f186, %%f%d, %%f186, %%p25; @%%p1 mov.f32 %%f%d, %%f186;", v, v, v, v);
+                w("max.f32 %%f186, %%f%d, 0f00000000; @%%p2 mov.f32 %%f%d, %%f186;", v, v);
+                w("mov.f32 %%f191, %%f%d;", v);
+                Fp8(w, 191);
+                w("@%%p3 mov.f32 %%f%d, %%f191;", v);
+            }
+            w("selp.f32 %%f182, %%f182, 0f00000000, %%p21; selp.f32 %%f183, %%f183, 0f00000000, %%p22;");
+            w("cvt.rn.f16.f32 %%h5, %%f182; cvt.rn.f16.f32 %%h6, %%f183; mov.b32 %%r72, {%%h5, %%h6};");
+            w("mad.lo.s32 %%r73, %%r65, %%r11, %%r12; add.s32 %%r73, %%r73, %%r60; mul.wide.s32 %%rd66, %%r73, 2; add.s64 %%rd66, %%rd6, %%rd66; st.global.u32 [%%rd66], %%r72;");
+            w("SKIP%d:", lab);
+        }
+    }
+}
+
 
 // A convolution (shape 0-2, no transposed) whose warp makes MT * 16 consecutive pixels of a row (rows of 8: g, g + 8,
 // g + 16, ...) by NB n tiles: each B fragment serves MT products (the loads, not the tensor cores, limit the 16-pixel
@@ -218,37 +282,73 @@ std::string KernelM(int shape, int NB, int MT)
     }
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
-    for (int j = 0; j < NB; ++j)
+    Epilogue(w, NB, R);
+    w("ret;");
+    return w.s + "}\n";
+}
+
+// The 3x3 convolution with shared-memory staging: a block of kCudaWarps warps (one output row each, MT * 16 pixels) stages
+// the rows it needs, (kCudaWarps + 2) x (MT * 16 + 2) pixels by 8 channels (fp16, 0 outside the image / past cin), once a
+// chunk; every tap's A fragment is then one conflict-free shared load per 8-row group. The same products in the same
+// order as KernelM (the same bits). One source, channel pairs word-aligned (the host checks).
+std::string KernelS(int NB, int MT)
+{
+    const int R = 2 * MT, SW = MT * 16 + 2, SH = int(kCudaWarps) + 2;  // staged width / height
+    Ptx w;
+    w.s = std::string(".visible .entry conv3_") + std::to_string(NB) + "s" + std::to_string(MT) + "(.param .align 8 .b8 P[128])\n{\n";
+    w(".reg .b32 %%r<200>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
+    w(".shared .align 16 .b32 sx[%d];", SH * SW * 4);
+    for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
+    for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
+    w("mov.u32 %%r90, %%tid.x; and.b32 %%r21, %%r90, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3; shr.u32 %%r35, %%r90, 5;");  // tid, lane, g, q, warp
+    w("mov.u32 %%r24, %%ctaid.x; mul.lo.u32 %%r24, %%r24, %d; mov.u32 %%r91, %%ctaid.y; mul.lo.u32 %%r91, %%r91, %d; add.u32 %%r25, %%r91, %%r35;", 16 * MT, int(kCudaWarps));
+    w("mov.u32 %%r26, %%ctaid.z; mul.lo.u32 %%r26, %%r26, %d;", NB);
+    w("setp.eq.s32 %%p1, %%r15, 1; setp.eq.s32 %%p2, %%r15, 2; setp.ne.s32 %%p3, %%r16, 0; setp.ne.s32 %%p4, %%r17, 0;");
+    for (int r = 0; r < R; ++r) w("add.u32 %%r%d, %%r24, %%r22; add.u32 %%r%d, %%r%d, %d;", 80 + r, 80 + r, 80 + r, 8 * r);
+    // This lane's shared byte address at staged row warp, pixel g, its channel pair; a tap / group adds (ky SW + kx + 8r) 16.
+    w("mad.lo.u32 %%r92, %%r35, %d, %%r22; shl.b32 %%r92, %%r92, 4; shl.b32 %%r93, %%r23, 2; add.u32 %%r92, %%r92, %%r93; mov.u32 %%r94, sx; add.u32 %%r92, %%r92, %%r94;", SW);
+    for (int i = 0; i < MT * NB * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7;");
+    w("mul.wide.u32 %%rd9, %%r20, 128; mul.lo.u64 %%rd60, %%rd9, 9;");
+    w("sub.u32 %%r95, %%r91, 1; sub.u32 %%r96, %%r24, 1;");  // staged origin (y0 - 1, x0 - 1)
+    w("mov.u32 %%r40, 0;");
+    w("LOOP:");
+    w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
+    w("shl.b32 %%r41, %%r40, 3;");
+    w("bar.sync 0;");
+    w("mov.u32 %%r97, %%r90;");
+    w("STAGE:");
+    w("setp.ge.u32 %%p9, %%r97, %d; @%%p9 bra STAGED;", SH * SW * 4);
+    w("and.b32 %%r98, %%r97, 3; shr.u32 %%r99, %%r97, 2; rem.u32 %%r100, %%r99, %d; div.u32 %%r101, %%r99, %d;", SW, SW);  // pair, pixel, row
+    w("add.u32 %%r102, %%r96, %%r100; add.u32 %%r103, %%r95, %%r101;");  // image x, y (below 0 wraps: the unsigned compare)
+    w("shl.b32 %%r104, %%r98, 1; add.u32 %%r104, %%r104, %%r41;");
+    w("setp.lt.u32 %%p10, %%r102, %%r1; setp.lt.u32 %%p11, %%r103, %%r2; and.pred %%p10, %%p10, %%p11; setp.lt.s32 %%p11, %%r104, %%r8; and.pred %%p10, %%p10, %%p11;");
+    w("mad.lo.u32 %%r105, %%r103, %%r1, %%r102; mad.lo.u32 %%r105, %%r105, %%r3, %%r4; add.u32 %%r105, %%r105, %%r104; mul.wide.u32 %%rd70, %%r105, 2; add.s64 %%rd70, %%rd1, %%rd70;");
+    w("mov.u32 %%r106, 0; @%%p10 ld.global.u32 %%r106, [%%rd70];");
+    w("add.s32 %%r107, %%r104, 1; setp.ge.s32 %%p12, %%r107, %%r8; @%%p12 and.b32 %%r106, %%r106, 0xFFFF;");
+    w("shl.b32 %%r108, %%r97, 2; add.u32 %%r108, %%r108, %%r94; st.shared.u32 [%%r108], %%r106;");
+    w("add.u32 %%r97, %%r97, %d; bra STAGE;", 32 * int(kCudaWarps));
+    w("STAGED:");
+    w("bar.sync 0;");
+    for (int t = 0; t < 9; ++t)
     {
-        w("add.u32 %%r60, %%r26, %d; shl.b32 %%r60, %%r60, 3; shl.b32 %%r61, %%r23, 1; add.s32 %%r60, %%r60, %%r61;", j);
-        w("setp.lt.s32 %%p20, %%r60, %%r14; add.s32 %%r62, %%r60, 1; setp.lt.s32 %%p21, %%r60, %%r13; setp.lt.s32 %%p22, %%r62, %%r13;");
-        w("mul.wide.s32 %%rd64, %%r60, 4; add.s64 %%rd64, %%rd4, %%rd64; ld.global.f32 %%f180, [%%rd64]; ld.global.f32 %%f181, [%%rd64+4];");
-        for (int r = 0; r < R; ++r)
+        const int ky = t / 3, kx = t % 3;
+        for (int r = 0; r < R; ++r) w("ld.shared.u32 %%r%d, [%%r92+%d];", 50 + r, (ky * SW + kx + 8 * r) * 16);
+        w("mul.lo.u64 %%rd63, %%rd9, %d; add.s64 %%rd63, %%rd63, %%rd8;", t);
+        for (int j = 0; j < NB; ++j)
         {
-            const int f = ((r / 2) * NB + j) * 4 + (r % 2) * 2, lab = w.label++;
-            w("mov.u32 %%r63, %%r%d; mov.u32 %%r64, %%r25;", 80 + r);
-            w("setp.lt.s32 %%p23, %%r63, %%r9; setp.lt.s32 %%p24, %%r64, %%r10; and.pred %%p23, %%p23, %%p24; and.pred %%p23, %%p23, %%p20;");
-            w("@!%%p23 bra SKIP%d;", lab);
-            w("mad.lo.s32 %%r65, %%r64, %%r9, %%r63;");
-            w("add.rn.f32 %%f182, %%f%d, %%f180; add.rn.f32 %%f183, %%f%d, %%f181;", f, f + 1);
-            w("mad.lo.s32 %%r66, %%r65, %%r17, %%r18; add.s32 %%r66, %%r66, %%r60; mul.wide.s32 %%rd65, %%r66, 2; add.s64 %%rd65, %%rd5, %%rd65;");
-            w("@%%p4 ld.global.u16 %%h3, [%%rd65]; @%%p4 ld.global.u16 %%h4, [%%rd65+2];");
-            w("@%%p4 cvt.f32.f16 %%f184, %%h3; @%%p4 cvt.f32.f16 %%f185, %%h4; @%%p4 add.rn.f32 %%f182, %%f182, %%f184; @%%p4 add.rn.f32 %%f183, %%f183, %%f185;");
-            for (int e = 0; e < 2; ++e)
+            w("ld.global.u32 %%r49, [%%rd63+%d];", j * 128);
+            for (int m = 0; m < MT; ++m)
             {
-                const int v = 182 + e;
-                w("setp.gt.f32 %%p25, %%f%d, 0f00000000; mul.rn.f32 %%f186, %%f%d, 0f3E4CCCCD; selp.f32 %%f186, %%f%d, %%f186, %%p25; @%%p1 mov.f32 %%f%d, %%f186;", v, v, v, v);
-                w("max.f32 %%f186, %%f%d, 0f00000000; @%%p2 mov.f32 %%f%d, %%f186;", v, v);
-                w("mov.f32 %%f191, %%f%d;", v);
-                Fp8(w, 191);
-                w("@%%p3 mov.f32 %%f%d, %%f191;", v);
+                const int f = (m * NB + j) * 4;
+                w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r49}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, 50 + 2 * m,
+                  51 + 2 * m, f, f + 1, f + 2, f + 3);
             }
-            w("selp.f32 %%f182, %%f182, 0f00000000, %%p21; selp.f32 %%f183, %%f183, 0f00000000, %%p22;");
-            w("cvt.rn.f16.f32 %%h5, %%f182; cvt.rn.f16.f32 %%h6, %%f183; mov.b32 %%r72, {%%h5, %%h6};");
-            w("mad.lo.s32 %%r73, %%r65, %%r11, %%r12; add.s32 %%r73, %%r73, %%r60; mul.wide.s32 %%rd66, %%r73, 2; add.s64 %%rd66, %%rd6, %%rd66; st.global.u32 [%%rd66], %%r72;");
-            w("SKIP%d:", lab);
         }
     }
+    w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
+    w("END:");
+    Epilogue(w, NB, R);
     w("ret;");
     return w.s + "}\n";
 }
@@ -451,6 +551,48 @@ std::string FnKernel8(int C, int P)
     w("ret;");
     return w.s + "}\n";
 }
+// Split-K's second pass: one thread a (pixel, channel pair): the splits' partial sums added in split order (the same bytes
+// every run and on both APIs), then the epilogue of the other kernels. SplitParams; grid x = pixels * pairs / 128.
+std::string ReduceKernel()
+{
+    Ptx w;
+    w.s = ".visible .entry reducek(.param .align 8 .b8 P[144])\n{\n";
+    w(".reg .b32 %%r<200>; .reg .b64 %%rd<100>; .reg .f32 %%f<200>; .reg .pred %%p<60>; .reg .b16 %%h<8>;");
+    for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
+    for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
+    w("ld.param.u64 %%rd70, [P+128]; ld.param.u32 %%r110, [P+140];");  // partials, splits
+    w("setp.eq.s32 %%p1, %%r15, 1; setp.eq.s32 %%p2, %%r15, 2; setp.ne.s32 %%p3, %%r16, 0; setp.ne.s32 %%p4, %%r17, 0;");
+    w("mov.u32 %%r21, %%ctaid.x; mov.u32 %%r22, %%tid.x; mad.lo.u32 %%r21, %%r21, 128, %%r22;");  // item
+    w("shr.u32 %%r23, %%r14, 1; mul.lo.u32 %%r24, %%r9, %%r10; mul.lo.u32 %%r25, %%r24, %%r23; setp.ge.u32 %%p5, %%r21, %%r25; @%%p5 ret;");
+    w("div.u32 %%r26, %%r21, %%r23; rem.u32 %%r60, %%r21, %%r23; shl.b32 %%r60, %%r60, 1;");  // pixel, channel
+    w("add.s32 %%r62, %%r60, 1; setp.lt.s32 %%p21, %%r60, %%r13; setp.lt.s32 %%p22, %%r62, %%r13; shl.b32 %%r27, %%r20, 3;");  // cpad
+    w("mov.f32 %%f182, 0f00000000; mov.f32 %%f183, 0f00000000; mov.u32 %%r30, 0;");
+    w("RED:");
+    w("setp.ge.u32 %%p6, %%r30, %%r110; @%%p6 bra REDDONE;");
+    w("mad.lo.u32 %%r31, %%r30, %%r24, %%r26; mad.lo.u32 %%r31, %%r31, %%r27, %%r60; mul.wide.u32 %%rd7, %%r31, 4; add.s64 %%rd7, %%rd70, %%rd7; ld.global.v2.f32 {%%f184, %%f185}, [%%rd7];");
+    w("setp.eq.u32 %%p7, %%r30, 0; @%%p7 mov.f32 %%f182, %%f184; @%%p7 mov.f32 %%f183, %%f185; @!%%p7 add.rn.f32 %%f182, %%f182, %%f184; @!%%p7 add.rn.f32 %%f183, %%f183, %%f185;");
+    w("add.u32 %%r30, %%r30, 1; bra RED;");
+    w("REDDONE:");
+    w("mul.wide.s32 %%rd64, %%r60, 4; add.s64 %%rd64, %%rd4, %%rd64; ld.global.f32 %%f180, [%%rd64]; ld.global.f32 %%f181, [%%rd64+4];");
+    w("add.rn.f32 %%f182, %%f182, %%f180; add.rn.f32 %%f183, %%f183, %%f181;");
+    w("mad.lo.s32 %%r66, %%r26, %%r17, %%r18; add.s32 %%r66, %%r66, %%r60; mul.wide.s32 %%rd65, %%r66, 2; add.s64 %%rd65, %%rd5, %%rd65;");
+    w("@%%p4 ld.global.u16 %%h3, [%%rd65]; @%%p4 ld.global.u16 %%h4, [%%rd65+2];");
+    w("@%%p4 cvt.f32.f16 %%f184, %%h3; @%%p4 cvt.f32.f16 %%f185, %%h4; @%%p4 add.rn.f32 %%f182, %%f182, %%f184; @%%p4 add.rn.f32 %%f183, %%f183, %%f185;");
+    for (int e = 0; e < 2; ++e)
+    {
+        const int v = 182 + e;
+        w("setp.gt.f32 %%p25, %%f%d, 0f00000000; mul.rn.f32 %%f186, %%f%d, 0f3E4CCCCD; selp.f32 %%f186, %%f%d, %%f186, %%p25; @%%p1 mov.f32 %%f%d, %%f186;", v, v, v, v);
+        w("max.f32 %%f186, %%f%d, 0f00000000; @%%p2 mov.f32 %%f%d, %%f186;", v, v);
+        w("mov.f32 %%f191, %%f%d;", v);
+        Fp8(w, 191);
+        w("@%%p3 mov.f32 %%f%d, %%f191;", v);
+    }
+    w("selp.f32 %%f182, %%f182, 0f00000000, %%p21; selp.f32 %%f183, %%f183, 0f00000000, %%p22;");
+    w("cvt.rn.f16.f32 %%h5, %%f182; cvt.rn.f16.f32 %%h6, %%f183; mov.b32 %%r72, {%%h5, %%h6};");
+    w("mad.lo.s32 %%r73, %%r26, %%r11, %%r12; add.s32 %%r73, %%r73, %%r60; mul.wide.s32 %%rd66, %%r73, 2; add.s64 %%rd66, %%rd6, %%rd66; st.global.u32 [%%rd66], %%r72;");
+    w("ret;");
+    return w.s + "}\n";
+}
 }  // namespace
 
 // kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
@@ -464,6 +606,8 @@ std::string CudaPtx(bool fp8)
         for (int nb : kNbs)
             if (s < 3 || nb <= 4) p += Kernel(s, nb);
     for (int s = 0; s < 3; ++s) p += KernelM(s, 8, 2);
+    p += KernelS(8, 2);
+    p += Kernel(0, 8, true), p += ReduceKernel();
     p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 8, 16, 8);  // the layers' padded n tiles (CudaNb)
     return p;
 }
@@ -488,6 +632,7 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
             if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_conv[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]))) return fail("CUDA function");
     for (int s = 0; s < 3; ++s)
         if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2")) return fail("CUDA function");
+    if (!fn(k->m_convS, "conv3_8s2") || !fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek")) return fail("CUDA function");
     for (int i = 0; i < 2; ++i)
         if (!fn(k->m_fnk[i], i ? "fn64" : "fn48")) return fail("CUDA function");
     for (int i = 0; i < 2 && fp8; ++i)
@@ -499,6 +644,7 @@ CudaKernels::~CudaKernels()
     std::vector<void*> f(m_fnk, m_fnk + 2);
     f.insert(f.end(), m_fn8, m_fn8 + 2);
     f.insert(f.end(), m_convM, m_convM + 3);
+    f.push_back(m_convS), f.push_back(m_splitK), f.push_back(m_reduce);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
     m_dev.CudaDestroy(m_module, f);
 }
@@ -508,9 +654,9 @@ bool CudaKernels::LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bo
     return m_dev.CudaLaunch(fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p) const
+bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged) const
 {
-    return m_dev.CudaLaunch(m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+    return m_dev.CudaLaunch(staged && shape == 0 ? m_convS : m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
 bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
@@ -518,5 +664,14 @@ bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint3
     int i = 0;
     while (i < 5 && kNbs[i] != int(nb)) ++i;
     return kNbs[i] == int(nb) && m_dev.CudaLaunch(m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+}
+}  // namespace nfrux::mlfg
+namespace nfrux::mlfg
+{
+bool CudaKernels::LaunchSplit(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const SplitParams& p, uint32_t pixels) const
+{
+    if (!m_dev.CudaLaunch(m_splitK, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n)) return false;
+    const uint32_t rg[3] = {(pixels * uint32_t(p.c.writeEnd / 2) + 127) / 128, 1, 1};
+    return m_dev.CudaLaunch(m_reduce, rg, 128, &p, sizeof(p), bufs, n);
 }
 }  // namespace nfrux::mlfg

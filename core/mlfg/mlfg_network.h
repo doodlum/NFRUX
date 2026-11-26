@@ -102,7 +102,11 @@ private:
     std::unique_ptr<CudaKernels> m_cuda;
     bool                    m_fused = true;
     bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
-    bool                    m_m2 = true;  // CUDA: 32 pixels a warp (NFRUX_MLFG_NO_M2=1: 16, tests)  // fused FasterNet blocks (NFRUX_MLFG_UNFUSED=1: the layers one by one, tests)
+    bool                    m_m2 = true;
+    bool                    m_staged = false;  // CUDA 3x3: shared-memory staging (NFRUX_MLFG_STAGING=1; measured neutral)
+    bool                    m_splitK = true;   // CUDA: split-K for the low-resolution 3x3 layers (NFRUX_MLFG_NO_SPLITK=1: off)
+    static constexpr uint32_t kPartialFloats = 2u << 20;  // split-K's fp32 partial sums (8 MB)
+    std::unique_ptr<Buffer> m_partial;
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch
     Tensor                  m_t32, m_x48, m_y48, m_skip, m_pc16, m_h96, m_x64, m_y64, m_pc32, m_h128, m_u32;  // stage 2
