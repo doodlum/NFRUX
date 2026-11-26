@@ -63,6 +63,21 @@ for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rg
         passes.append((f"kCompose{suffix}", "shaders/frontend/compose", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
+# AMD FSR Frame Generation 4's hand-written passes (docs/FFX_MLFG.md), HLSL first: DXC -> SPIR-V, then the same pipeline.
+mg_ = "shaders/mlfg/mlfg_"
+MGINV = "MLFG_INVERTED_DEPTH"
+passes += [("kMlfgDilate", mg_ + "dilate.hlsl", [], MGINV, 60),
+           ("kMlfgSplatKey", mg_ + "splat.hlsl", ["-DMLFG_SPLAT_PASS=0"], MGINV, 60),
+           ("kMlfgSplatFlow", mg_ + "splat.hlsl", ["-DMLFG_SPLAT_PASS=1"], MGINV, 60),
+           ("kMlfgForwardMv", mg_ + "forward_mv.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgNetInput", mg_ + "net_input.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgDownsample", mg_ + "downsample.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgRefine", mg_ + "refine.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgFlowOut", mg_ + "flow_out.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgStage2Input", mg_ + "stage2_input.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgSoftmax5", mg_ + "softmax5.hlsl", [], "NFRUX_UNUSED", 60)]
+for suffix, f in [("Rgba16f", "RGBA16F"), ("Rgb10a2", "RGB10A2"), ("Rgba8", "RGBA8")]:
+    passes.append((f"kMlfgComposite{suffix}", mg_ + "composite.hlsl", [f"-DMLFG_OUT_{f}=1"], "NFRUX_UNUSED", 60))
 
 
 def run(cmd):
@@ -72,7 +87,8 @@ def run(cmd):
 
 
 RELAXED = len(sys.argv) < 4 or sys.argv[3] not in ("1", "ON")
-ALWAYS = ("kFiDownsample",)  # strict in every build: they round to a texel, often from an exact half, so a fused product picks another one
+ALWAYS = ("kFiDownsample",  # strict in every build: they round to a texel, often from an exact half, so a fused product picks another one
+          "kMlfg")  # FSR FG4 passes: fp16 rounding points and integer-exact division / conversions must see unfused fp32 results
 FLOAT_OPS = {127, 129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
 
 
@@ -103,8 +119,12 @@ def build(job):
     name, src, defs, inv, sm, v = job
     n = name + ("Inv" if v else "")
     b = os.path.join(out, n)
-    run([GLSLANG, "-V", "--target-env", "vulkan1.1", "-S", "comp", *F32, *defs, f"-D{inv}={v}", "-Igpu", "-Igpu/opticalflow",
-         "-Igpu/frameinterpolation", "-Ishaders/opticalflow", "-o", b + ".spv", src + ".glsl"])
+    if src.endswith(".hlsl"):  # HLSL source (no 16-bit types; the checks below apply to it as to GLSL)
+        run([DXC, "-nologo", "-spirv", "-T", "cs_6_0", "-E", "main", "-O3", "-fspv-target-env=vulkan1.1", "-HV", "2021", *defs,
+             f"-D{inv}={v}", "-I" + os.path.dirname(src), "-Fo", b + ".spv", src])
+    else:
+        run([GLSLANG, "-V", "--target-env", "vulkan1.1", "-S", "comp", *F32, *defs, f"-D{inv}={v}", "-Igpu", "-Igpu/opticalflow",
+             "-Igpu/frameinterpolation", "-Ishaders/opticalflow", "-o", b + ".spv", src + ".glsl"])
     run([tool("spirv-opt"), "--eliminate-dead-functions", b + ".spv", "-o", b + ".spv"])
     precise(b + ".spv", n)
     run([tool("spirv-val"), "--target-env", "vulkan1.1", b + ".spv"])
@@ -137,7 +157,8 @@ def build(job):
     return n, open(b + ".spv", "rb").read(), open(b + ".dxil", "rb").read(), sorted(set(binds)), sm
 
 
-jobs = [(n, s, d, i, sm, v) for n, s, d, i, sm in passes for v in (0, 1)]
+SHARED_INV = {n for n, s, d, i, sm in passes if n.startswith("kMlfg") and i == "NFRUX_UNUSED"}  # no depth: Inv is the same shader
+jobs = [(n, s, d, i, sm, v) for n, s, d, i, sm in passes for v in (0, 1) if not (v and n in SHARED_INV)]
 os.chdir(core)
 with cf.ThreadPoolExecutor() as ex:
     built = list(ex.map(build, jobs))
@@ -178,6 +199,8 @@ with open(tmp, "w") as f:
         f.write(f"inline constexpr uint32_t {n}_spv[]={{{arr(spv)}}};\ninline constexpr uint32_t {n}_dxil[]={{{arr(dxil)}}};\n")
         f.write(f"inline constexpr ShaderBinding {n}_b[]={{" + ",".join(f"{{{b},BindKind::{k}}}" for b, k in binds) + "};\n")
         f.write(f'inline constexpr Shader {n}{{"{n}",{n}_spv,{len(spv)},{n}_dxil,{len(dxil)},{n}_b,{len(binds)},{sm}}};\n')
+        if n in SHARED_INV:
+            f.write(f"inline constexpr Shader {n}Inv = {n};\n")
     f.write("struct ConvShader { int32_t key[9]; bool dot4; uint32_t px, ocb; const uint32_t* dxil; size_t bytes; };\n")
     for l, d, px, ocb, n, b in convs:
         f.write(f"inline constexpr uint32_t {n}[]={{{arr(b)}}};\n")

@@ -9,7 +9,7 @@ add_compile_options(/Zi /MP /EHsc /wd4244 /wd4267)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 option(NFRUX_STRICT_MATH "No fused or reordered shader arithmetic: D3D12 and Vulkan give the same bytes (the proof build). Off: the shipped build" OFF)
 set(GEN ${CMAKE_BINARY_DIR}/shaders)
-file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/ml/*.hlsl)
+file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/shaders/*.hlsl core/shaders/*.hlsli core/ml/*.hlsl)
 add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN} ${NFRUX_STRICT_MATH}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
@@ -36,6 +36,11 @@ target_link_libraries(nvngx_dlssg nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{
 set_target_properties(nvngx_dlssg PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/NFRUX)
 target_link_options(nvngx_dlssg PRIVATE /PDBALTPATH:%_PDB% /OPT:ICF /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll /DELAYLOAD:vulkan-1.dll)
 target_link_libraries(nvngx_dlssg delayimp)
+# FSR FG4 passes (core/shaders/mlfg) in isolation on both APIs, for tests/mlfg_passes.py.
+add_executable(mlfg_passes tests/mlfg_passes.cpp)
+add_dependencies(mlfg_passes nfrux_shaders)
+target_include_directories(mlfg_passes PRIVATE rhi ${GEN} $ENV{VULKAN_SDK}/Include)
+target_link_libraries(mlfg_passes d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 add_executable(ngx_harness tests/ngx_harness.cpp)
 target_link_libraries(ngx_harness nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 set(NFRUX_AGILITY "" CACHE STRING "Agility SDK number (620): ngx_harness then uses .\\D3D12\\D3D12Core.dll and its debug layers")
