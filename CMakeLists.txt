@@ -13,7 +13,11 @@ file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h 
 add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN} ${NFRUX_STRICT_MATH}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)
-add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h)
+# AMD FSR FG4's weights: the compressed blob in the repository expanded into a header (tools/embed_weights.py).
+add_custom_command(OUTPUT ${GEN}/amd_mlfg_weights.h
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/embed_weights.py ${CMAKE_SOURCE_DIR}/core/model/amd_mlfg_weights.xz ${GEN}/amd_mlfg_weights.h
+    DEPENDS core/model/amd_mlfg_weights.xz tools/embed_weights.py VERBATIM)
+add_custom_target(nfrux_shaders DEPENDS ${GEN}/nfrux_shaders.h ${GEN}/amd_mlfg_weights.h)
 set(NRI_DIR "${CMAKE_SOURCE_DIR}/third_party/NRI" CACHE PATH "NRI, from tools/build_nri.ps1")
 add_library(nfrux_core STATIC core/log.cpp core/marker.cpp core/model.cpp core/ml/tosa_graph.cpp core/ml/cpu_reference.cpp core/ml/d3d12_network.cpp core/ml/cuda_network.cpp core/ml/cuda_vulkan.cpp core/ml/vulkan_network.cpp core/interpolator.cpp core/mlfg/mlfg_network.cpp core/mlfg/mlfg_cuda.cpp core/mlfg/mlfg_interpolator.cpp rhi/rhi_nri.cpp)
 add_dependencies(nfrux_core nfrux_shaders)
