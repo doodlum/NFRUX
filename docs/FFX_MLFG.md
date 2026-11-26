@@ -64,7 +64,7 @@ The network is re-implemented, not replayed: AMD's SPIR-V / DXIL are not used. S
 
 | Part | Files | What |
 |---|---|---|
-| Weights | `tools/mlfg_weights.py` -> `core/model/amd_mlfg_weights.h` (10.6 MB blob as `uint64_t`, 25 MB source) | the 105 layers read through `mlfg_net.load_amd` (passes 186 / 188 in its orientation); fp16 weights, fp8 e4m3 bytes for the stage-2 FasterNet layers, fp32 biases. `--bin FILE` writes the same blob as a file: nfrux.ini `[General] AmdWeights=path` (or `NFRUX_AMD_WEIGHTS`) loads a retrained npz of the same shape; the layer list is checked |
+| Weights | `tools/mlfg_weights.py` -> `core/model/amd_mlfg_weights.xz` (the 10.6 MB blob, byte planes + xz: 9.0 MB, in the repository); the build expands it into `amd_mlfg_weights.h` in the build tree (`tools/embed_weights.py`, standard library) | the 105 layers read through `mlfg_net.load_amd` (passes 186 / 188 in its orientation); fp16 weights, fp8 e4m3 bytes for the stage-2 FasterNet layers, fp32 biases. `--bin FILE` writes the same blob as a file: nfrux.ini `[General] AmdWeights=path` (or `NFRUX_AMD_WEIGHTS`) loads a retrained npz of the same shape; the layer list is checked |
 | Hand-written passes | `core/shaders/mlfg/*.hlsl` (cf2393b) | prepass, glue, stage-2 input, softmax, composite; `kMlfgFlowOut` gained `c_scale` (flows times 2t / 2(1-t)), `kMlfgDilate` the jitter cancellation in `c_mvScale.zw` (0 = AMD); composite and stage-2 input do their uniform divisions once a group (same bits; `tests/mlfg_passes.py` 68/68) |
 | Network runtime | `core/mlfg/mlfg_network.*` | encoders, 4 flow blocks, stage 2 over NHWC fp16 tensors; a layer = conv kxk/s or transposed 2x2/2 with bias, optional second source (the FasterNet concatenation), add (residual / skip), LeakyReLU 0.2 / ReLU, fp16 or fp8 rounding of the result (torch's e4m3: round to nearest even, above 448 NaN) |
 | Interpolator | `core/mlfg/mlfg_interpolator.cpp` | `CreateMlfgInterpolator`, behind `Interpolator` (now an interface; NFRU is the other implementation) |
@@ -146,3 +146,60 @@ Stage 1 and the prepass are about half of the 1080p 2x time; each further genera
 1080p and 8 ms at 4K. Vulkan timestamps at 4K (coopmat) put the 1x1 FasterNet convolutions first, then the 3x3 layers.
 AMD quotes 2.2 ms at 4K on an RX 9070 XT (FP8, fused kernels): the fast tiers here are 6x slower, so Model=amd is for
 quality comparison, not the default.
+### Speed work (2026-11-26, second phase)
+
+Same RTX 4070, `parity --bench` (16 frames a submission, median of 30, ms a rendered frame), a training job on the GPU
+throughout (NFRU measured alongside: 0.84-0.88 ms at 1080p 2x against 0.80 idle, so about 5-10% high). Per-pass GPU
+times: NFRUX_TEST_TIMES=1 (each network layer now has its own label; D3D12 timestamps work: the frequency is asked of a
+queue of the device's own).
+
+| Tier | 1080p 2x | 1080p 4x | 4K 2x | 4K 4x |
+|---|---|---|---|---|
+| cuda (D3D12), before | 5.0 | 9.5 | 13.2 | 29.4 |
+| cuda, after | **3.96** | **6.15** | **8.29** | **16.3** |
+| coopmat (Vulkan), before | 6.2 | 11.8 | 16.4 | 37.6 |
+| coopmat, after | 6.2 | 11.5 | 15.9 | 35.7 |
+| generic D3D12, before / after | 27.7 / 21.6 | 59.1 / 43.1 | 100.7 / 67.1 | - |
+| generic Vulkan, before / after | 19.0 / 15.8 | 40.2 / 31.8 | 61.4 / 47.8 | - |
+
+What changed, by payoff on the cuda tier (4K 2x):
+1. Fused FasterNet blocks (CUDA): one warp does pconv -> expand -> project of 16 pixels in registers (an mma
+   accumulator fragment is exactly the next product's A fragment), bit-identical to the three layers; stage 2's 13
+   blocks 3.4 -> 0.8 ms. Coopmat and generic have fused kernels too (`mlfg_fn_coopmat.comp`, `mlfg_conv_fn.hlsl`; both
+   checked, the coopmat one bit-identical to its layers) but they are slower than the layers on the RTX 4070 (coopmat
+   +1.0 ms at 4K: one-subgroup groups and shared-memory round trips; generic D3D12 +7.7 ms at 1080p: register
+   pressure), so they are off unless NFRUX_MLFG_FUSED=1.
+2. Glue: an exact fast fp16 rounding for fp16-normal results (in the fp32 encoding; every kMlfg pass, 320 M random
+   inputs checked against numpy), unrolled per-channel loops (no indexed temporaries), and the composite / stage-2
+   input take their uniform quotients from the host instead of a long division per pixel (a first try that divided once
+   a group and shared the result cost 0.6 ms in barriers): composite 2.3 -> 1.2 ms, refine 0.8 -> 0.6 ms; still
+   bit-exact (`mlfg_passes.py` 68/68).
+3. Convolution tiling (CUDA): 32 pixels a warp where that still gives 256 warps (each B fragment serves two products):
+   the big 3x3 layers 0.10 -> 0.06 ms; 4 warps a block. Measured and not kept: one n tile a warp for low-resolution
+   layers (more warps, but A loads per product rise: stage 1 2.8 -> 5.0 ms) and n tiles that pad nothing (6 for 96
+   outputs: slower, the warps want 8 independent accumulators).
+4. FP8 tensor cores (sm_89+): the fused FasterNet blocks as mma.m16n8k32 e4m3 -> fp32 (k order permuted so accumulator
+   fragments stay A fragments; FasterNet weights packed again as e4m3 B fragments): 0.6 -> 0.46 ms for the eight
+   48-channel blocks, -0.25 ms a generated frame at 4K. Accuracy drops by about 1.5 dB (48.3-49.2 dB against the
+   fp64-summed net, 44.4-44.7 on the second sample; yardstick 50.2 / 45.4 minus 3: passes): Ada's e4m3 units sum more
+   coarsely than its fp16 ones. NFRUX_MLFG_NO_FP8=1 keeps fp16. Not done on Vulkan (VK_EXT_shader_float8 / NV
+   cooperative matrix 2: the KHR coopmat tier is not the fast one on NVIDIA anyway).
+5. Generic tier: staging by 16-byte loads (8 channels a load) and, in the shipped build only, multiply-add fusion of
+   the convolutions' sums (the strict build keeps them strict: still 0 differing bytes between D3D12 and Vulkan).
+6. Weights: no more 25 MB generated header in git (see Architecture).
+
+Where 4K 2x goes now (cuda, 8.3 ms; per-pass sum 7.2 ms): stage 1 layers 2.3 (latency-bound low-resolution layers:
+block 1 / 2 at 30 / 60 pixels wide give 54-144 warps), composite 1.2, stage-2 network 0.9 + 3x3 input / head 0.55,
+refine 0.6, splats 0.43, stage-2 input 0.32, forward motion 0.24, the rest 0.5. A generated frame costs 4.0 ms at 4K
+(composite, stage 2, splats, stage-2 input).
+
+How close to AMD: AMD quotes 2.2 ms at 4K (2x) on an RX 9070 XT. Its dense FP8 rate is about 3.3x the RTX 4070's
+(and 1.3x the memory bandwidth), so the same work on this card would be about 5.5-7 ms if the tensor cores were the
+limit; NFRUX's best is 8.3 ms, roughly 1.2-1.5x off that scaled figure. What limits it here: the glue passes are
+AMD's exact arithmetic in integer code (fp16 rounding, point-sample texel choice, long division in refine / forward
+motion / softmax: 2.8 ms of the 8.3 together with the composite), the stage-1 layers are too small to fill 46 SMs
+(no split-K: an atomic one would not give the same bytes run to run), and each convolution reads its inputs from
+global memory per tap (no shared-memory staging / ldmatrix in the PTX kernels yet). Next steps by expected payoff:
+shared-memory staging for the CUDA 3x3 kernels, a deterministic two-pass split-K for blocks 1-2, CUDA on Vulkan
+(VK_NVX_binary_import: Vulkan on NVIDIA would get the cuda tier's 8.3 instead of coopmat's 15.9 ms), and fusing the
+softmax into the head's epilogue.

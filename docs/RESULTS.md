@@ -507,3 +507,12 @@ ngx_harness with Model=amd: 77/78 a API (RGB10A2 PQ quality 38.2-38.3 dB < 40; N
 56.3 / 57.1 dB (cuda vs coopmat); with NFRUX_MLFG=generic every output byte-identical between the APIs. Model=nfru:
 158/158 (unchanged). Cost (shared GPU, ~10% high): cuda 5.0 / 13.2 ms, coopmat 6.2 / 16.4 ms, generic 19-28 / 61-101 ms
 at 1080p / 4K 2x.
+## FSR FG4 port, speed phase (2026-11-26, commits 13412e5..3988ff4)
+
+parity --bench, RTX 4070 shared with a training job (NFRU alongside 0.84-0.88 ms vs 0.80 idle), ms a rendered frame,
+before -> after: cuda 1080p 2x 5.0 -> 3.96, 4x 9.5 -> 6.15, 4K 2x 13.2 -> 8.29, 4x 29.4 -> 16.3; coopmat 4K 2x 16.4 ->
+15.9; generic 1080p 2x D3D12 27.7 -> 21.6, Vulkan 19.0 -> 15.8. Gates after the last change: mlfg_passes 68/68;
+mlfg_net 58/58 on both samples (cuda with FP8 48.3-49.2 / 44.4-44.7 dB vs the fp64-summed net); parity --strict
+(generic, strict build) 0 differing bytes, fused generic kernel included; ngx_harness Model=amd 77/78 per API (RGB10A2
+PQ quality), Model=nfru 158/158; build-ship and build-strict green. Details and what limits it: docs/FFX_MLFG.md
+"Speed work".

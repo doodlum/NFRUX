@@ -201,7 +201,7 @@ params / gate textures on every path (paths that write images directly are an op
 | Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | NVIDIA: CUDA kernels (VK_NVX_binary_import, the same as D3D12's), then cooperative matrix fp16, int8; elsewhere int8, fp16 (exact, D2) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
-| FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores (NVAPI, crash marker) | - | generic (strict HLSL) |
+| FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores, FP8 for stage 2's FasterNet blocks on RTX 40+ (NVAPI, crash marker) | - | generic (strict HLSL) |
 | FSR FG4 (Model=amd), Vulkan | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA) | - | generic (strict HLSL) |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
