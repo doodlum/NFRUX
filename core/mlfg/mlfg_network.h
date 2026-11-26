@@ -101,11 +101,14 @@ private:
     uint32_t                m_frames = 0;
     std::unique_ptr<Pass>   m_conv[4][2], m_genFn[2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4], m_matN1[2], m_fn[2];  // coopmat: layers; narrow; fused FasterNet 48 / 64
+    std::unique_ptr<Pass>   m_matN2, m_mat1m[2];  // coopmat: 3x3 with 17-32 outputs; 1x1 with 32 / 48 outputs a group
+    uint32_t                m_matMt = 0;  // NFRUX_MLFG_MAT_MT (tests): the 1x1 16-output tiles a group, else by size
     std::unique_ptr<CudaKernels> m_cuda;
     bool                    m_fused = true;
     bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
     bool                    m_m2 = true;
-    bool                    m_m4 = true;  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
+    bool                    m_m4 = true;
+    bool                    m_vec8 = true;  // coopmat: 16-byte staging loads (NFRUX_MLFG_NO_VEC8=1: off)  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
     bool                    m_staged = false;  // CUDA 3x3: shared-memory staging (NFRUX_MLFG_STAGING=1; measured neutral)
     bool                    m_fusedSoftmax = true;  // CUDA: softmax in the head (NFRUX_MLFG_SOFTMAX_PASS=1: the pass)
     bool                    m_splitK = true;   // CUDA: split-K for the low-resolution 3x3 layers (NFRUX_MLFG_NO_SPLITK=1: off)

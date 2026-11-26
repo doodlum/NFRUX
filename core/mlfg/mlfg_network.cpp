@@ -243,6 +243,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     m_staged = EnvFlag("NFRUX_MLFG_STAGING", false);
     m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
     m_m4 = !EnvFlag("NFRUX_MLFG_NO_M4", false);
+    m_vec8 = !EnvFlag("NFRUX_MLFG_NO_VEC8", false);
+    if (const char* e = getenv("NFRUX_MLFG_MAT_MT")) m_matMt = std::min(std::max(atoi(e), 0), 4);  // tests: 1x1 16-output tiles a group (2-4; 0 by size)
     m_fusedSoftmax = !EnvFlag("NFRUX_MLFG_SOFTMAX_PASS", false);
     // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
     // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
@@ -349,6 +351,9 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         made = made && (m_fn[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn64_16 : sg == 32 ? shaders::kMlfgFn64_32 : shaders::kMlfgFn64_64));
         made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
         made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
+        made = made && (m_matN2 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2_16 : sg == 32 ? shaders::kMlfgMat3n2_32 : shaders::kMlfgMat3n2_64));
+        made = made && (m_mat1m[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n2_16 : sg == 32 ? shaders::kMlfgMat1n2_32 : shaders::kMlfgMat1n2_64));
+        made = made && (m_mat1m[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n3_16 : sg == 32 ? shaders::kMlfgMat1n3_32 : shaders::kMlfgMat1n3_64));
         if (!made) return fail("cooperative-matrix passes or weights buffer");
     }
     else
@@ -467,19 +472,29 @@ bool Network::Run(const Conv& c)
     {
         const uint32_t split = std::min(c.split, L.cin);
         const bool     aligned = L.cin % 16 == 0 && split % 16 == 0 && c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && s1.pitch % 8 == 0 && (s1.ch + 16 - split % 16) % 8 == 0 && s1.ch % 8 == 0;
+        // 8-channel staging (one 16-byte load a pixel's 8 channels): 8-aligned pitches, first channels, cin and split.
+        const bool     vec8 = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && L.cin % 8 == 0 && (split >= L.cin || (split % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0)) && m_vec8;
         struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
             {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
             {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
             {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
             {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
             {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 63) & ~63u)},
-            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned ? 1 : 0, 0}};
+            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned ? 1 : 0, vec8 ? 1 : 0}};
         const int shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
         const bool narrow = L.cout <= 16 && (L.kind == 1 || L.k == 3);  // one 16-channel tile a group
         if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
-        return (narrow ? m_matN1[0] : m_mat[shape])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, narrow ? 1 : (L.cout + 63) / 64);
+        if (narrow) return m_matN1[0]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
+        const uint32_t z = (L.cout + 63) / 64;
+        if (shape == 0 && L.cout <= 32) return m_matN2->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);  // 2 tiles of 16 outputs
+        if (shape == 2)  // 1x1: 48 or 32 outputs a group where 64 would compute padding (the stage-2 48 / 96-channel layers)
+        {
+            const uint32_t nb = m_matMt ? m_matMt : L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : L.cout % 32 == 0 && L.cout % 64 != 0 ? 2 : 4;
+            if (nb < 4) return m_mat1m[nb == 3]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 16 * nb - 1) / (16 * nb));
+        }
+        return m_mat[shape]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, z);
     }
     const uint32_t gsplit = std::min(c.split, L.cin);
     const bool vec = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && (gsplit >= L.cin || (gsplit % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0));
