@@ -1,6 +1,6 @@
 // Records what AMD FSR Frame Generation 4 (amd_fidelityfx_framegeneration_vk.dll) does on the GPU, headless.
 //
-//   ffx_capture DLL OUT_DIR [--frames N] [--size WxH] [--spoof-amd] [--validate] [--inputs DIR]
+//   ffx_capture DLL OUT_DIR [--frames N] [--size WxH] [--spoof-amd] [--validate] [--inputs DIR] [--dump-passes F A B] [--dump-images F]
 //
 // The DLL is loaded directly (it exports the FFX API). Its vulkan-1.dll import table is patched and the
 // vkGetDeviceProcAddr it is given is wrapped, so every Vulkan call it makes goes through the hooks below. Written to
@@ -264,11 +264,192 @@ static void RecordDispatch(VkCommandBuffer cb, const char* what)
     st.records.push_back(std::move(r));
 }
 
+// --dump-passes FRAME FIRST LAST: after each ML pass FIRST..LAST of frame FRAME, copy the whole scratch buffer
+// (binding 128) to a host-visible buffer; written as passes/<frame>_<pass>.bin when the frame is done.
+static int gDumpFrame = -1, gDumpFirst = 0, gDumpLast = -1, gFrame = 0;
+static VkDevice gDev;
+static VkPhysicalDeviceMemoryProperties gMemProps;
+struct PassDump { int pass; VkBuffer buf; VkDeviceMemory mem; void* ptr; VkDeviceSize size; };
+static std::vector<PassDump> gPassDumps;
+
+static VkBuffer ScratchOf(CbState& st)
+{
+    for (auto& [si, sp] : st.sets)
+        for (auto& [key, d] : gSets[sp.first])
+            if ((key >> 32) == 128 && d.buffer) return d.buffer;
+    return 0;
+}
+
+static void DumpAfter(VkCommandBuffer cb, int pass)
+{
+    auto& st = gCbs[cb];
+    VkBuffer scratch = ScratchOf(st);
+    if (!scratch) return;
+    VkDeviceSize size = gBuffers[scratch].size;
+    PassDump d{pass, 0, 0, nullptr, size};
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    auto createBuffer = (PFN_vkCreateBuffer)gRealGDPA(gDev, "vkCreateBuffer");
+    CHECK_VK(createBuffer(gDev, &bi, nullptr, &d.buf));
+    VkMemoryRequirements r; vkGetBufferMemoryRequirements(gDev, d.buf, &r);
+    uint32_t type = 0;
+    for (uint32_t i = 0; i < gMemProps.memoryTypeCount; ++i)
+        if ((r.memoryTypeBits & (1u << i)) && (gMemProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+                                                  (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { type = i; break; }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, r.size, type};
+    CHECK_VK(vkAllocateMemory(gDev, &ai, nullptr, &d.mem));
+    CHECK_VK(vkBindBufferMemory(gDev, d.buf, d.mem, 0));
+    CHECK_VK(vkMapMemory(gDev, d.mem, 0, size, 0, &d.ptr));
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    VkBufferCopy c{0, 0, size};
+    r_vkCmdCopyBuffer(cb, scratch, d.buf, 1, &c);
+    VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
+    gPassDumps.push_back(d);
+}
+
+static void WritePassDumps()
+{
+    fs::create_directories(fs::path(gOut) / "passes");
+    for (auto& d : gPassDumps)
+    {
+        char n[48]; snprintf(n, sizeof(n), "%d_%03d.bin", gDumpFrame, d.pass);
+        FILE* f = fopen((fs::path(gOut) / "passes" / n).string().c_str(), "wb");
+        fwrite(d.ptr, 1, size_t(d.size), f); fclose(f);
+        vkDestroyBuffer(gDev, d.buf, nullptr); vkFreeMemory(gDev, d.mem, nullptr);
+    }
+    gPassDumps.clear();
+}
+
+// --dump-images FRAME: around each dispatch of frame FRAME whose entry is "main" or mlfi_*_pass151/152/190, copy every
+// image it binds: inputs (binding < 128) before the dispatch, storage images bound for write (binding >= 128) after it.
+// Written as images/<frame>_<seq>_<entry>_b<binding>.raw (tightly packed mip 0 / layer 0) with images/index.txt.
+static int gImgFrame = -1, gImgSeq = 0;
+struct ImgDump { std::string name, line; VkBuffer buf; VkDeviceMemory mem; void* ptr; VkDeviceSize size; };
+static std::vector<ImgDump> gImgDumps;
+
+static uint32_t TexelBytes(VkFormat f)
+{
+    switch (f)
+    {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_UINT: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_UINT: return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_D32_SFLOAT: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R64_UINT: return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
+    default: return 0;
+    }
+}
+
+static bool WantImages(const std::string& e)
+{
+    if (e == "main") return true;
+    if (e.rfind("mlfi_", 0) != 0) return false;
+    for (const char* s : {"_pass151", "_pass152", "_pass190"})
+        if (e.size() >= strlen(s) && e.compare(e.size() - strlen(s), strlen(s), s) == 0) return true;
+    return false;
+}
+
+static void DumpImages(VkCommandBuffer cb, bool outputs)
+{
+    auto& st = gCbs[cb];
+    auto& pl = gPipelines[st.pipeline];
+    std::vector<std::pair<uint32_t, Desc>> sel;
+    auto take = [&](uint64_t key, const Desc& d) {
+        uint32_t b = uint32_t(key >> 32);
+        if (!d.view || uint32_t(key) != 0) return;
+        if (outputs ? (b >= 128 && d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) : (b < 128)) sel.push_back({b, d});
+    };
+    for (auto& [si, sp] : st.sets) for (auto& [key, d] : gSets[sp.first]) take(key, d);
+    for (auto& [si, m] : st.pushDesc) for (auto& [key, d] : m) take(key, d);
+    if (sel.empty()) return;
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    for (auto& [b, d] : sel)
+    {
+        auto& v = gViews[d.view];
+        auto it = gImages.find(v.image);
+        if (it == gImages.end()) continue;
+        auto& ci = it->second.ci;
+        uint32_t tb = TexelBytes(ci.format);
+        if (!tb || ci.imageType != VK_IMAGE_TYPE_2D) continue;
+        VkDeviceSize size = VkDeviceSize(ci.extent.width) * ci.extent.height * tb;
+        ImgDump o{};
+        o.size = size;
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        auto createBuffer = (PFN_vkCreateBuffer)gRealGDPA(gDev, "vkCreateBuffer");
+        CHECK_VK(createBuffer(gDev, &bi, nullptr, &o.buf));
+        VkMemoryRequirements r; vkGetBufferMemoryRequirements(gDev, o.buf, &r);
+        uint32_t type = 0;
+        for (uint32_t i = 0; i < gMemProps.memoryTypeCount; ++i)
+            if ((r.memoryTypeBits & (1u << i)) && (gMemProps.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+                                                      (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) { type = i; break; }
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, r.size, type};
+        CHECK_VK(vkAllocateMemory(gDev, &ai, nullptr, &o.mem));
+        CHECK_VK(vkBindBufferMemory(gDev, o.buf, o.mem, 0));
+        CHECK_VK(vkMapMemory(gDev, o.mem, 0, size, 0, &o.ptr));
+        VkBufferImageCopy c{};
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        c.imageExtent = {ci.extent.width, ci.extent.height, 1};
+        vkCmdCopyImageToBuffer(cb, v.image, VK_IMAGE_LAYOUT_GENERAL, o.buf, 1, &c);
+        char n[160]; snprintf(n, sizeof(n), "%d_%03d_%s_b%u.raw", gImgFrame, gImgSeq, pl.entry.c_str(), b);
+        o.name = n;
+        char t[320]; snprintf(t, sizeof(t), "%s %ux%u fmt %d viewfmt %d img%u v%u pipe%u %s t%d", n, ci.extent.width, ci.extent.height, int(ci.format),
+                              int(v.format), it->second.id, v.id, pl.id, outputs ? "out" : "in", int(d.type));
+        o.line = t;
+        gImgDumps.push_back(o);
+    }
+    VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
+}
+
+static void WriteImageDumps()
+{
+    fs::create_directories(fs::path(gOut) / "images");
+    FILE* idx = fopen((fs::path(gOut) / "images" / "index.txt").string().c_str(), "a");
+    for (auto& d : gImgDumps)
+    {
+        FILE* f = fopen((fs::path(gOut) / "images" / d.name).string().c_str(), "wb");
+        fwrite(d.ptr, 1, size_t(d.size), f); fclose(f);
+        fprintf(idx, "%s\n", d.line.c_str());
+        vkDestroyBuffer(gDev, d.buf, nullptr); vkFreeMemory(gDev, d.mem, nullptr);
+    }
+    fclose(idx);
+    gImgDumps.clear();
+}
+
 static VKAPI_ATTR void VKAPI_CALL H_vkCmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z)
 {
     char t[64]; snprintf(t, sizeof(t), "D %u,%u,%u", x, y, z);
     RecordDispatch(cb, t);
+    bool imgs = false;
+    if (gFrame == gImgFrame)
+    {
+        std::lock_guard<std::recursive_mutex> l(gLock);
+        imgs = WantImages(gPipelines[gCbs[cb].pipeline].entry);
+        if (imgs) DumpImages(cb, false);
+    }
     r_vkCmdDispatch(cb, x, y, z);
+    if (imgs)
+    {
+        std::lock_guard<std::recursive_mutex> l(gLock);
+        DumpImages(cb, true);
+        ++gImgSeq;
+    }
+    if (gFrame == gDumpFrame)
+    {
+        std::lock_guard<std::recursive_mutex> l(gLock);
+        auto& e = gPipelines[gCbs[cb].pipeline].entry;
+        auto p = e.find("_pass");
+        if (e.rfind("mlfi_", 0) == 0 && p != std::string::npos)
+        {
+            int pass = atoi(e.c_str() + p + 5);
+            if (pass >= gDumpFirst && pass <= gDumpLast) DumpAfter(cb, pass);
+        }
+    }
 }
 
 static VKAPI_ATTR void VKAPI_CALL H_vkCmdDispatchIndirect(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off)
@@ -551,7 +732,7 @@ static Img MakeImage(Ctx& c, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFla
     i.ci.imageType = VK_IMAGE_TYPE_2D, i.ci.format = f, i.ci.extent = {w, h, 1}, i.ci.mipLevels = 1, i.ci.arrayLayers = 1;
     i.ci.samples = VK_SAMPLE_COUNT_1_BIT, i.ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     i.ci.usage = usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    CHECK_VK(vkCreateImage(c.dev, &i.ci, nullptr, &i.image));
+    CHECK_VK(H_vkCreateImage(c.dev, &i.ci, nullptr, &i.image));  // through the hook so the log names host images too
     VkMemoryRequirements r; vkGetImageMemoryRequirements(c.dev, i.image, &r);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, r.size, MemType(c, r.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
     CHECK_VK(vkAllocateMemory(c.dev, &ai, nullptr, &i.mem));
@@ -676,6 +857,14 @@ static Ctx MakeDevice(bool validate)
     vkGetPhysicalDeviceFeatures2(c.pd, &f2);
     printf("float8 coopmat %d, coopmat2 %d, coopmat %d, float16 %d, int8 %d\n", f8.shaderFloat8CooperativeMatrix, cm2.cooperativeMatrixFlexibleDimensions,
            cm.cooperativeMatrix, v12.shaderFloat16, v12.shaderInt8);
+    if (auto props = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(c.inst, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
+    {
+        uint32_t m = 0; props(c.pd, &m, nullptr);
+        std::vector<VkCooperativeMatrixPropertiesKHR> cp(m, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+        props(c.pd, &m, cp.data());
+        for (auto& p : cp)
+            printf("coopmat M%u N%u K%u A%d B%d C%d R%d scope %d\n", p.MSize, p.NSize, p.KSize, int(p.AType), int(p.BType), int(p.CType), int(p.ResultType), int(p.scope));
+    }
     // robustness features change behaviour and cost; leave them off as an application normally would
     f2.features.robustBufferAccess = VK_FALSE;
 
@@ -713,11 +902,14 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--spoof-amd")) gSpoof = true;
         else if (!strcmp(argv[i], "--validate")) validate = true;
         else if (!strcmp(argv[i], "--inputs") && i + 1 < argc) inputs = argv[++i];
+        else if (!strcmp(argv[i], "--dump-passes") && i + 3 < argc) gDumpFrame = atoi(argv[++i]), gDumpFirst = atoi(argv[++i]), gDumpLast = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dump-images") && i + 1 < argc) gImgFrame = atoi(argv[++i]);
     }
     for (const char* d : {"modules", "uploads", "buffers"}) fs::create_directories(fs::path(gOut) / d);
     gLog = fopen((fs::path(gOut) / "log.txt").string().c_str(), "w");
 
     Ctx c = MakeDevice(validate);
+    gDev = c.dev; gMemProps = c.mp;
 
     HMODULE mod = LoadLibraryA(dll);
     if (!mod) { fprintf(stderr, "cannot load %s (%lu)\n", dll, GetLastError()); return 2; }
@@ -772,6 +964,7 @@ int main(int argc, char** argv)
 
     for (int f = 0; f < frames; ++f)
     {
+        gFrame = f;
         std::vector<uint8_t> rgba(size_t(W) * H * 4);
         std::vector<float> d(size_t(W) * H);
         std::vector<uint16_t> m(size_t(W) * H * 2);
@@ -854,6 +1047,8 @@ int main(int argc, char** argv)
         if (rc != FFX_API_RETURN_OK) printf("frame %d generate: %u\n", f, rc);
         End(c, cb);
         fprintf(gLog, "FRAME %d done\n", f);
+        if (f == gDumpFrame) WritePassDumps();
+        if (f == gImgFrame) WriteImageDumps();
 
         auto px = Download(c, out, size_t(W) * H * 4, VK_IMAGE_LAYOUT_GENERAL);
         FILE* o = fopen((fs::path(gOut) / ("output_" + std::to_string(f) + ".rgba")).string().c_str(), "wb");
