@@ -29,7 +29,7 @@ using namespace nfrux;
 using Microsoft::WRL::ComPtr;
 
 #define MLFG_SHADERS(X) X(kMlfgDilate) X(kMlfgSplatKey) X(kMlfgSplatFlow) X(kMlfgForwardMv) X(kMlfgNetInput) X(kMlfgDownsample) \
-    X(kMlfgRefine) X(kMlfgFlowOut) X(kMlfgStage2Input) X(kMlfgSoftmax5) X(kMlfgCompositeRgba8) X(kMlfgCompositeRgb10a2) X(kMlfgCompositeRgba16f)
+    X(kMlfgRefine) X(kMlfgFlowOut) X(kMlfgStage2Input) X(kMlfgSoftmax5) X(kMlfgWeightsH) X(kMlfgCompositeRgba8) X(kMlfgCompositeRgb10a2) X(kMlfgCompositeRgba16f)
 static const Shader* FindShader(const std::string& n)
 {
 #define X(s) if (n == #s) return &shaders::s; if (n == #s "Inv") return &shaders::s##Inv;

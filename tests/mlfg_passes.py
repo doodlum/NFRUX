@@ -330,6 +330,19 @@ def test_151_152_190():
         else:
             ref = composite_at_t(*args, cb, sizes, t).numpy().astype(np.uint8)
         compare(f'pass190 (t={t}) rgb vs transcription', got[..., :3], ref, fp16=False)
+        # NFRUX's split upsample: kMlfgWeightsH's rows, then the composite's vertical mix (c_splat.w = 1): the same bytes.
+        jh = Job(f'wh_{t}', 'kMlfgWeightsH', cbytes(('i', [W, TW, TW, TH])), (W + 63) // 64, TH)
+        jh.buf(1, wbuf).ubuf(2, TH * W * 16, 'rows', np.float16, (TH, W, 8))
+        rows = jh.run()['rows']
+        k2 = cbytes(('i', [W, H, fl0.shape[1], fl0.shape[0]]), ('i', [sp0.shape[1], sp0.shape[0], TW, 1]),
+                    ('i', [TW, TH, cb['reset'], cb['hudlessAttachedFactor']]), ('i', [cb['backBufferTransferFunction'], cb['dispatchFlags']]),
+                    ('f', gr), ('f', lum + [t]), ('f', cb['debugBarColor']))
+        j2 = Job(f'comp2_{t}', 'kMlfgCompositeRgba8', k2, *groups(W, H))
+        j2.buf(1, rows).tex(2, 'rgba8', rgb0).tex(3, 'rgba8', rgb1).tex(4, 'rg16f', fl0).tex(5, 'rg16f', fl1)
+        j2.tex(6, 'r32ui', np.ascontiguousarray(sp0[..., 1:2])).tex(7, 'r32ui', np.ascontiguousarray(sp0[..., 0:1]))
+        j2.tex(8, 'r32ui', np.ascontiguousarray(sp1[..., 1:2])).tex(9, 'r32ui', np.ascontiguousarray(sp1[..., 0:1]))
+        j2.tex(10, 'rgba8', hl).utex(11, 'rgba8', W, H, 'out', np.uint8, 4)
+        report(f'pass190 (t={t}) weights-rows path == one-pass composite', '', bool((j2.run()['out'] == got).all()))
         report(f'pass190 (t={t}) alpha 0', '', bool((got[..., 3] == 0).all()))
         if t == 0.5:
             capture_diff('pass190 rgb vs AMD capture (unorm8 levels)', got[..., :3], ref, imc[(s, 129)][0][..., :3], fp16=False)

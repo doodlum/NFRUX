@@ -75,7 +75,8 @@ passes += [("kMlfgDilate", mg_ + "dilate.hlsl", [], MGINV, 60),
            ("kMlfgRefine", mg_ + "refine.hlsl", [], "NFRUX_UNUSED", 60),
            ("kMlfgFlowOut", mg_ + "flow_out.hlsl", [], "NFRUX_UNUSED", 60),
            ("kMlfgStage2Input", mg_ + "stage2_input.hlsl", [], "NFRUX_UNUSED", 60),
-           ("kMlfgSoftmax5", mg_ + "softmax5.hlsl", [], "NFRUX_UNUSED", 60)]
+           ("kMlfgSoftmax5", mg_ + "softmax5.hlsl", [], "NFRUX_UNUSED", 60),
+           ("kMlfgWeightsH", mg_ + "weights_h.hlsl", [], "NFRUX_UNUSED", 60)]
 for suffix, f in [("Rgba16f", "RGBA16F"), ("Rgb10a2", "RGB10A2"), ("Rgba8", "RGBA8")]:
     passes.append((f"kMlfgComposite{suffix}", mg_ + "composite.hlsl", [f"-DMLFG_OUT_{f}=1"], "NFRUX_UNUSED", 60))
     passes.append((f"kMlfgFinish{suffix}", mg_ + "finish.hlsl", [f"-DMLFG_OUT_{f}=1"], "NFRUX_UNUSED", 60))

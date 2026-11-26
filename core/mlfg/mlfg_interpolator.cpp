@@ -112,9 +112,9 @@ private:
     Settings  set;
     Sizes     sz;
     std::unique_ptr<mlfg::Network> net;
-    PassPtr   dilate, splatKey, splatFlow, forwardMv, netInput, downsample, refine, flowOut, s2input, softmax, composite, finish, clear;
+    PassPtr   dilate, splatKey, splatFlow, forwardMv, netInput, downsample, refine, flowOut, s2input, softmax, weightsH, composite, finish, clear;
     Tex       mv[2], depth[2], key10, word10, fwd, key0, word0, key1, word1, img0, img1, colorTm1[2], outs[kMaxGenerated], gen;
-    mlfg::Tensor netIn, inq, f54, x54, flow54, f83, x83, flow83, f112, x112, flow112, f149, flowout, s2in, logits, weights;
+    mlfg::Tensor netIn, inq, f54, x54, flow54, f83, x83, flow83, f112, x112, flow112, f149, flowout, s2in, logits, weights, rows;  // rows: kMlfgWeightsH's horizontal upsample
     uint32_t  hc = 0;  // mv / depth [hc]: this frame's; [hc ^ 1] the last frame's
     uint64_t  frame = 0;
     float     vp0[16] = {}, vpm1[16] = {};  // frame 0's (the last rendered) and frame -1's view-projection
@@ -130,7 +130,7 @@ bool MlfgInterpolator::Create(std::string* error)
     bool ok = pass(dilate, inv ? shaders::kMlfgDilateInv : shaders::kMlfgDilate) && pass(splatKey, inv ? shaders::kMlfgSplatKeyInv : shaders::kMlfgSplatKey) &&
               pass(splatFlow, inv ? shaders::kMlfgSplatFlowInv : shaders::kMlfgSplatFlow) && pass(forwardMv, shaders::kMlfgForwardMv) &&
               pass(netInput, shaders::kMlfgNetInput) && pass(downsample, shaders::kMlfgDownsample) && pass(refine, shaders::kMlfgRefine) &&
-              pass(flowOut, shaders::kMlfgFlowOut) && pass(s2input, shaders::kMlfgStage2Input) && pass(softmax, shaders::kMlfgSoftmax5) && pass(clear, shaders::kMlfgClear);
+              pass(flowOut, shaders::kMlfgFlowOut) && pass(s2input, shaders::kMlfgStage2Input) && pass(softmax, shaders::kMlfgSoftmax5) && pass(weightsH, shaders::kMlfgWeightsH) && pass(clear, shaders::kMlfgClear);
     switch (set.outputFormat)
     {
     case Format::RGBA8Unorm: case Format::BGRA8Unorm: ok = ok && pass(composite, shaders::kMlfgCompositeRgba8) && pass(finish, shaders::kMlfgFinishRgba8); break;
@@ -154,7 +154,7 @@ bool MlfgInterpolator::Create(std::string* error)
     tensor(netIn, L, Lh, 32), tensor(inq, L / 4, Lh / 4, 32), tensor(f54, L / 4, Lh / 4, 16), tensor(x54, L / 2, Lh / 2, 32), tensor(flow54, L, Lh, 4);
     tensor(f83, L / 2, Lh / 2, 16), tensor(x83, L, Lh, 32), tensor(flow83, L, Lh, 4), tensor(f112, L, Lh, 16), tensor(x112, L, Lh, 32), tensor(flow112, L, Lh, 4);
     tensor(f149, L, Lh, 16), tensor(flowout, L, Lh, 4);
-    tensor(s2in, sz.s2w, sz.s2h, 32), tensor(logits, sz.s2w, sz.s2h, 16), tensor(weights, sz.s2w, sz.s2h, 8);
+    tensor(s2in, sz.s2w, sz.s2h, 32), tensor(logits, sz.s2w, sz.s2h, 16), tensor(weights, sz.s2w, sz.s2h, 8), tensor(rows, sz.W, sz.s2h, 8);
     if (!ok) return fail("out of memory");
     net = mlfg::Network::Create(dev, L, Lh, sz.s2w, sz.s2h, error);
     if (!net) return false;
@@ -278,9 +278,13 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
         }
         const Texture& out = finishing ? *gen : *outs[i];
         {
-            mlfg::CompositeConstants k = {{int32_t(sz.W), int32_t(sz.H), int32_t(sz.livew), int32_t(sz.liveh)}, {int32_t(sz.prew), int32_t(sz.preh), int32_t(sz.s2w), 0},
+            // The weights' horizontal upsample once a column per weight row (same bits; the composite does the vertical mix).
+            const int32_t hk[4] = {int32_t(sz.W), int32_t(sz.s2w), int32_t(sz.s2w), int32_t(sz.s2h)};
+            const Bind    hb[] = {Bind::Data(0, hk, sizeof(hk)), Bind::Buf(1, *weights.buf), Bind::Buf(2, *rows.buf)};
+            if (!weightsH->Dispatch(hb, 3, (sz.W + 63) / 64, sz.s2h)) return false;
+            mlfg::CompositeConstants k = {{int32_t(sz.W), int32_t(sz.H), int32_t(sz.livew), int32_t(sz.liveh)}, {int32_t(sz.prew), int32_t(sz.preh), int32_t(sz.s2w), 1},
                                           {int32_t(sz.s2w), int32_t(sz.s2h), 0, 0}, {0, 0, 0, Bits(0.5f * (float(sz.prew) / float(sz.W)))}, {0, 0, 1, 1}, {0, 0, t, 1.0f / float(sz.W)}, {0, 0, 0, 1.0f / float(sz.H)}};
-            const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *weights.buf), Bind::Tex(2, prev), Bind::Tex(3, color), Bind::Tex(4, *img0), Bind::Tex(5, *img1),
+            const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *rows.buf), Bind::Tex(2, prev), Bind::Tex(3, color), Bind::Tex(4, *img0), Bind::Tex(5, *img1),
                               Bind::Tex(6, *key0), Bind::Tex(7, *word0), Bind::Tex(8, *key1), Bind::Tex(9, *word1), Bind::Tex(10, color), Bind::Tex(11, out)};
             if (!composite->Dispatch(b, 12, G(sz.W), G(sz.H))) return false;
         }

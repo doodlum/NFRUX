@@ -26,7 +26,7 @@
 cbuffer Constants : register(b0)
 {
     int4   c_colour;   // colourSize.xy, flowSize.xy
-    int4   c_splat;    // splatSize.xy, weights width (row pitch), 0
+    int4   c_splat;    // splatSize.xy, weights width (row pitch), NFRUX: 1 = t1 is kMlfgWeightsH's rows (W wide)
     int4   c_weights;  // weight live size tensorSizes[90].xy, reset, hudlessAttachedFactor
     int4   c_misc;     // backBufferTransferFunction, dispatchFlags, 0, NFRUX: asuint(0.5 * splatSize.x / colourSize.x) (with c_lum.w)
     float4 c_genRect;  // generationRectMinUV.xy, generationRectMaxUV.xy
@@ -108,19 +108,32 @@ float4 Quantise(float3 c)
         // fp16 bilinear upsample of the weights (x4, align corners off, clamped to the live size).
         int   x0, x1, y0, y1;
         float fx, fy;
-        ResampleAxis(g.x, c_weights.x, 0.25, x0, x1, fx);
         ResampleAxis(g.y, c_weights.y, 0.25, y0, y1, fy);
+        float w[5];
+        if (c_splat.w != 0)
+        {
+            // t1 holds kMlfgWeightsH's rows: the horizontal mixes already made ([TH][W][8]); the vertical one here.
+            const uint4 ha = t_weights.Load4(TexelBase(int2(g.x, y0), uint(size.x), 8u) << 1), hb = t_weights.Load4(TexelBase(int2(g.x, y1), uint(size.x), 8u) << 1);
+            [unroll] for (uint k = 0u; k < 5u; ++k)
+            {
+                const uint sh = (k & 1u) * 16u;
+                w[k] = F16Round(Mix(F16ToF32((ha[k >> 1] >> sh) & 0xFFFFu), F16ToF32((hb[k >> 1] >> sh) & 0xFFFFu), fy));
+            }
+        }
+        else
+        {
+        ResampleAxis(g.x, c_weights.x, 0.25, x0, x1, fx);
         const uint ww = uint(c_splat.z);
         const uint a = TexelBase(int2(x0, y0), ww, 8u), b = TexelBase(int2(x1, y0), ww, 8u);
         const uint c = TexelBase(int2(x0, y1), ww, 8u), d = TexelBase(int2(x1, y1), ww, 8u);
         // A texel's 8 halves are one 16-byte load (ch 0-4 the weights).
         const uint4 wa = t_weights.Load4(a << 1), wb = t_weights.Load4(b << 1), wc = t_weights.Load4(c << 1), wd = t_weights.Load4(d << 1);
-        float       w[5];
         [unroll] for (uint k = 0u; k < 5u; ++k)
         {
             const uint sh = (k & 1u) * 16u;
             w[k] = Bilerp16(F16ToF32((wa[k >> 1] >> sh) & 0xFFFFu), F16ToF32((wb[k >> 1] >> sh) & 0xFFFFu), F16ToF32((wc[k >> 1] >> sh) & 0xFFFFu),
                             F16ToF32((wd[k >> 1] >> sh) & 0xFFFFu), fx, fy);
+        }
         }
         const int2   ss = c_splat.xy;
         const float  m1 = SplatCoverage(t_key1, t_word1, uv, ss), m0 = SplatCoverage(t_key0, t_word0, uv, ss);
