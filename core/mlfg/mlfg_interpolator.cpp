@@ -268,9 +268,7 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
                               Bind::Tex(6, *word0), Bind::Tex(7, *key1), Bind::Tex(8, *word1), Bind::Buf(9, *s2in.buf)};
             if (!s2input->Dispatch(b, 10, G(sz.s2w), G(sz.s2h))) return false;
         }
-        const mlfg::View wv = weights.v();
-        if (!net->Stage2(s2in.v(), logits.v(), &wv)) return false;
-        if (!net->FusedSoftmax())
+        if (!net->Stage2(s2in.v(), logits.v())) return false;
         {
             const int32_t k[4] = {int32_t(sz.s2w), int32_t(sz.s2h), int32_t(sz.s2w), int32_t(sz.s2w)};
             const Bind    b[] = {Bind::Data(0, k, sizeof(k)), Bind::Buf(1, *logits.buf), Bind::Buf(2, *weights.buf)};

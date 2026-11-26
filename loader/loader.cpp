@@ -272,25 +272,6 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (f12) f12->bufferDeviceAddress = VK_TRUE;
         else { if (!fba) chain(fba = &ba); fba->bufferDeviceAddress = VK_TRUE; }
     }
-    // FP8 cooperative matrices (the coopmat tier's FP8 layers): when the GPU has them and the game's chain has no such
-    // structure of its own (one it enabled counts as it is).
-    VkPhysicalDeviceShaderFloat8FeaturesEXT f8q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT}, f8e = f8q;
-    bool float8 = false, f8game = false;
-    for (auto* s = (const VkBaseInStructure*)ci->pNext; s; s = s->pNext)
-        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT)
-            f8game = true, float8 = has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && ((const VkPhysicalDeviceShaderFloat8FeaturesEXT*)s)->shaderFloat8CooperativeMatrix;
-    if (!f8game && getF && cmS.cooperativeMatrix && device(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME))
-    {
-        VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f8q};
-        getF(pd, &q);
-        if (f8q.shaderFloat8 && f8q.shaderFloat8CooperativeMatrix)
-        {
-            if (!has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) ext.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
-            f8e.shaderFloat8 = f8e.shaderFloat8CooperativeMatrix = VK_TRUE;
-            chain(&f8e);
-            float8 = true;
-        }
-    }
     c.enabledExtensionCount = uint32_t(ext.size()), c.ppEnabledExtensionNames = ext.data();
     VkResult r = g_createDevice(pd, &c, a, out);
     for (size_t i = patches.size(); i--;) patches[i].at->pNext = patches[i].old;
@@ -307,7 +288,6 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
         if (s13.subgroupSizeControl && s13.computeFullSubgroups) ml |= FEATURE_SUBGROUP_SIZE_CONTROL;
         if (cmS.cooperativeMatrix) ml |= FEATURE_COOPERATIVE_MATRIX;
         if (cuda) ml |= nfrux::kFeatureCudaLaunch;
-        if (float8) ml |= nfrux::kFeatureFloat8;
         if (float16) ml |= FEATURE_SHADER_FLOAT16 | FEATURE_STORAGE_BUFFER_16BIT;
     }
     g_ml = ml;

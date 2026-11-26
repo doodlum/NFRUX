@@ -23,7 +23,6 @@ layout(set = 0, binding = 0, std140) uniform Constants
     ivec4 c_cfg;  // cout, act, round (0 fp16, 1 fp8), write end
     ivec4 c_add;  // add pitch (0: none), add first channel, weight offset (halves), coPad
     ivec4 c_x;    // bias offset (floats), ciPad, 16-channel chunks aligned in both sources (1x1 direct loads), 8-channel staging
-    ivec4 c_fmt;  // e4m3 bytes (not fp16) in: src0, src1, add, out (stage 2's tensors; needs 8-channel staging, out 4-aligned)
 };
 layout(set = 0, binding = 1, std430) readonly buffer Src0 { float16_t s0[]; };
 layout(set = 0, binding = 2, std430) readonly buffer Src1 { float16_t s1[]; };
@@ -33,9 +32,6 @@ layout(set = 0, binding = 3, std430) readonly buffer Weights { float16_t wt[]; }
 layout(set = 0, binding = 4, std430) readonly buffer Add { float16_t ad[]; };
 layout(set = 0, binding = 5, std430) buffer Out { uint o[]; };
 layout(set = 0, binding = 6, std430) readonly buffer Bias { float bias[]; };
-layout(set = 0, binding = 1, std430) readonly buffer Src0B { uvec2 s0b[]; };  // e4m3 tensors: 8 channels an element
-layout(set = 0, binding = 2, std430) readonly buffer Src1B { uvec2 s1b[]; };
-layout(set = 0, binding = 4, std430) readonly buffer AddB { uint ab[]; };  // e4m3: 4 channels an element
 
 #ifdef MLFG_CONV_T
 #define TINW 16
@@ -45,16 +41,13 @@ layout(set = 0, binding = 4, std430) readonly buffer AddB { uint ab[]; };  // e4
 #endif
 #define NT 4
 #else
-#ifndef MLFG_MT
-#define MLFG_MT 1  // 16-pixel tiles a group (each B matrix serves MT products)
-#endif
-#define TINW ((16 * MLFG_MT - 1) * MLFG_CONV_S + MLFG_CONV_K)
+#define TINW (15 * MLFG_CONV_S + MLFG_CONV_K)
 #define TINH MLFG_CONV_K
 #define PAD (MLFG_CONV_K == 3 ? 1 : 0)
 #ifndef MLFG_NB
 #define MLFG_NB 4
 #endif
-#define NT MLFG_MT
+#define NT 1
 #endif
 #define NB MLFG_NB  // 16-channel tiles a group (1: the layers with at most 16 outputs)
 shared uvec4 sIn[TINW * TINH * 2];  // the patch, 16 channels a pixel (fp16, 8 an element)
@@ -110,35 +103,6 @@ float F8Round(float x)  // as mlfg_conv.hlsl
     if (rem > half_ || (rem == half_ && (q & 1u) != 0u)) q += 1u;
     return uintBitsToFloat(s | floatBitsToUint(float(q) * 0.001953125));
 }
-// e4m3 byte -> fp16 bits (exact: every e4m3 value is an fp16 normal or 0; the conversion below has nothing to round).
-uint H8(uint b)  // e4m3 byte -> fp16 bits, exact, integer code: normals move their fields; subnormals normalise; NaN
-{
-    const uint a = b & 0x7Fu, s = (b & 0x80u) << 8;
-    if (a >= 8u) return s | (a == 0x7Fu ? 0x7E00u : (a << 7) + 0x2000u);
-    if (a == 0u) return s;
-    const int msb = findMSB(a);  // m * 2^-9 = 2^(msb - 9) * (1 + ...)
-    return s | (uint(6 + msb) << 10) | ((a << uint(10 - msb)) & 0x3FFu);
-}
-uvec4 H8x8(uvec2 b)  // 8 e4m3 bytes -> 8 fp16 (packed pairs)
-{
-    uvec4 v;
-    [[unroll]] for (int k = 0; k < 4; ++k)
-    {
-        const uint w = b[k >> 1] >> ((k & 1) * 16);
-        v[k] = H8(w & 255u) | (H8((w >> 8) & 255u) << 16);
-    }
-    return v;
-}
-// fp16 bits holding an e4m3 value -> its byte (as mlfg_conv_fp8.comp).
-uint E4m3(uint h)
-{
-    const uint s = (h >> 8) & 0x80u, e = (h >> 10) & 31u, m = h & 1023u;
-    if (e == 31u) return s | 0x7Fu;
-    if (e == 0u) return s;
-    const int ue = int(e) - 15;
-    if (ue >= -6) return s | (uint(ue + 7) << 3) | (m >> 7);
-    return s | (ue >= -9 ? (1024u + m) >> uint(1 - ue) : 0u);
-}
 float16_t LoadIn(ivec2 p, int c)
 {
     if (p.x < 0 || p.y < 0 || p.x >= c_in.x || p.y >= c_in.y || c >= c_in2.w) return float16_t(0);
@@ -148,12 +112,7 @@ float16_t LoadIn(ivec2 p, int c)
 }
 float Finish(float y, int c, uint pix)
 {
-    if (c_add.x != 0 && c_fmt.z != 0)
-    {
-        const uint i = pix * uint(c_add.x) + uint(c_add.y + c);
-        y += unpackHalf2x16(H8((ab[i >> 2] >> ((i & 3u) * 8u)) & 255u)).x;
-    }
-    else if (c_add.x != 0) y += float(ad[pix * uint(c_add.x) + uint(c_add.y + c)]);
+    if (c_add.x != 0) y += float(ad[pix * uint(c_add.x) + uint(c_add.y + c)]);
     if (c_cfg.y == 1) y = y > 0.0 ? y : y * 0.2;
     else if (c_cfg.y == 2) y = max(y, 0.0);
     return c_cfg.z == 1 ? F8Round(y) : y;
@@ -165,7 +124,7 @@ void main()
 #ifdef MLFG_CONV_T
     const ivec2 tile = ivec2(gl_WorkGroupID.xy) * ivec2(16, 1);  // input pixels
 #else
-    const ivec2 tile = ivec2(gl_WorkGroupID.xy) * ivec2(16 * MLFG_MT, 1);  // output pixels
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy) * ivec2(16, 1);  // output pixels
 #endif
     const int n0 = int(gl_WorkGroupID.z) * 16 * NB;
     const int cin = c_in2.w, ciPad = c_x.y, coP = c_add.w;
@@ -181,7 +140,7 @@ void main()
 #if MLFG_CONV_K == 1 && !defined(MLFG_CONV_T)
     // 1x1: the A matrices straight from the tensors when the 16 pixels are inside and the 16-channel chunks are aligned
     // (c_x.z, from the host): no staging.
-    if (c_x.z != 0 && tile.x + 16 * MLFG_MT <= c_in.x)
+    if (c_x.z != 0 && tile.x + 16 <= c_in.x)
     {
         const uint pix0 = uint(tile.y) * uint(c_in.x) + uint(tile.x);
         for (int c0 = 0; c0 < cin; c0 += 16)
@@ -220,16 +179,7 @@ void main()
                 if (q.x >= 0 && q.y >= 0 && q.x < c_in.x && q.y < c_in.y && c < cin)
                 {
                     const uint base = uint(q.y) * uint(c_in.x) + uint(q.x);
-                    if (c < c_in.w)
-                    {
-                        const uint e = (base * uint(c_in.z) + uint(c_in2.x + c)) >> 3;
-                        v = c_fmt.x != 0 ? H8x8(s0b[e]) : s0v[e];
-                    }
-                    else
-                    {
-                        const uint e = (base * uint(c_in2.y) + uint(c - c_in.w + c_in2.z)) >> 3;
-                        v = c_fmt.y != 0 ? H8x8(s1b[e]) : s1v[e];
-                    }
+                    v = c < c_in.w ? s0v[(base * uint(c_in.z) + uint(c_in2.x + c)) >> 3] : s1v[(base * uint(c_in2.y) + uint(c - c_in.w + c_in2.z)) >> 3];
                 }
             }
             else
@@ -249,15 +199,6 @@ void main()
                 acc[t][b] = coopMatMulAdd(a, w, acc[t][b]);
             }
 #else
-#ifdef MLFG_ACC16  // fp16 sums within the 16-channel chunk (all taps), added into the fp32 accumulators after it
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc16[NT][NB];
-        [[unroll]] for (int m = 0; m < NT; ++m)
-            [[unroll]] for (int b = 0; b < NB; ++b)
-                acc16[m][b] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-#define MLFG_ACC acc16
-#else
-#define MLFG_ACC acc
-#endif
         [[unroll]] for (int t = 0; t < MLFG_CONV_K * MLFG_CONV_K; ++t)
         {
             const int ky = t / MLFG_CONV_K, kx = t % MLFG_CONV_K;
@@ -269,14 +210,9 @@ void main()
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
                 coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (int m = 0; m < NT; ++m)
-                    MLFG_ACC[m][b] = coopMatMulAdd(a[m], w, MLFG_ACC[m][b]);
+                    acc[m][b] = coopMatMulAdd(a[m], w, acc[m][b]);
             }
         }
-#ifdef MLFG_ACC16
-        [[unroll]] for (int m = 0; m < NT; ++m)
-            [[unroll]] for (int b = 0; b < NB; ++b)
-                acc[m][b] = acc[m][b] + coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc16[m][b]);
-#endif
 #endif
     }
     // Epilogue: bias, add, activation, rounding; two channels a word.
@@ -286,26 +222,6 @@ void main()
         [[unroll]] for (int b = 0; b < NB; ++b)
             coopMatStore(acc[t][b], sC, uint(b * 16), uint(16 * NB), gl_CooperativeMatrixLayoutRowMajor);
         barrier();
-        if (c_fmt.w != 0)  // e4m3 out: four channels a word (values already e4m3: c_cfg.z, the host checks)
-        {
-            for (uint i = li; i < uint(16 * 4 * NB); i += uint(MLFG_SG))
-            {
-                const uint px = i / uint(4 * NB), cp = (i % uint(4 * NB)) * 4u;
-                const int  c = n0 + int(cp);
-#ifdef MLFG_CONV_T
-                const ivec2 op = (tile + ivec2(int(px), 0)) * 2 + ivec2(t & 1, t >> 1);
-#else
-                const ivec2 op = tile + ivec2(16 * t + int(px), 0);
-#endif
-                if (op.x >= c_out.x || op.y >= c_out.y || c >= c_cfg.w) continue;
-                const uint pix = uint(op.y) * uint(c_out.x) + uint(op.x);
-                uint word = 0u;
-                [[unroll]] for (int k = 0; k < 4; ++k)
-                    if (c + k < c_cfg.x) word |= E4m3(F32ToF16(Finish(sC[px * uint(16 * NB) + cp + uint(k)] + bias[c_x.x + c + k], c + k, pix))) << (8 * k);
-                o[(pix * uint(c_out.z) + uint(c_out.w + c)) >> 2] = word;
-            }
-            continue;
-        }
         for (uint i = li; i < uint(16 * 8 * NB); i += uint(MLFG_SG))
         {
             const uint px = i / uint(8 * NB), cp = (i % uint(8 * NB)) * 2u;

@@ -280,16 +280,11 @@ public:
                 std::vector<VkCooperativeMatrixPropertiesKHR> v(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
                 props(h.physicalDevice, &n, v.data());
                 for (auto& s : v)
-                {
-                    // FP8: e4m3 x e4m3 -> fp32, 16 x 16 x 32 (the extension and its feature enabled on the device)
-                    c.coopMatF8 = c.coopMatF8 || ((h.mlFeatures & kFeatureFloat8) && s.MSize == 16 && s.NSize == 16 && s.KSize == 32 && s.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
-                                                  s.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT && s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.scope == VK_SCOPE_SUBGROUP_KHR);
                     c.coopMatF16 = c.coopMatF16 || (s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
                                                     s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.scope == VK_SCOPE_SUBGROUP_KHR);
-                }
             }
         }
-        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d (fp16 16x16x16 %d, fp8 16x16x32 %d), subgroup %u", c.name.c_str(), c.dot4, c.cooperativeMatrix, c.coopMatF16, c.coopMatF8, c.subgroupSize);
+        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d (fp16 16x16x16 %d), subgroup %u", c.name.c_str(), c.dot4, c.cooperativeMatrix, c.coopMatF16, c.subgroupSize);
         return true;
     }
 

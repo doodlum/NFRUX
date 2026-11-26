@@ -202,9 +202,7 @@ static bool RunVulkan()
     std::vector<const char*> ext;
     uint32_t ml = ffx_ml::QueryDeviceFeatures(inst, pd, vkGetInstanceProcAddr, &ext);
     ml |= AddCudaExtension(pd, ext);
-    VkPhysicalDeviceShaderFloat8FeaturesEXT f8;
-    ml |= AddFloat8Extension(pd, ext, f8);
-    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR, (ml & kFeatureFloat8) ? &f8 : nullptr};
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features v13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &cm};
     VkPhysicalDeviceVulkan12Features v12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &v13};
     VkPhysicalDeviceVulkan11Features v11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &v12};

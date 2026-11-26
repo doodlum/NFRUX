@@ -61,7 +61,7 @@ float Half(uint16_t h)
 uint32_t CudaNb(const LayerWeights& L)
 {
     if (L.cout <= 16 && (L.kind == 1 || L.k == 3)) return 1;
-    return L.kind == 1 || L.cout <= 32 ? 4 : 8;  // 17-32 outputs: 4 (8 computed half zeros)
+    return L.kind == 1 ? 4 : 8;
 }
 uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
 {
@@ -160,7 +160,7 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? (m_mat8[0] ? "cooperative matrices fp16, FP8 for stage 2's 1x1 layers (Vulkan)" : "cooperative matrices fp16 (Vulkan)") : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
+    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
 }
 
 bool Network::SelectTier(std::string* error)
@@ -238,46 +238,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     if (!SelectTier(error)) return false;
     m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
     m_m2 = !EnvFlag("NFRUX_MLFG_NO_M2", false);
-    // Shared-memory staging of the 3x3 inputs: measured neutral on the RTX 4070 (the per-tap loads hit L1); off unless
-    // NFRUX_MLFG_STAGING=1.
-    m_staged = EnvFlag("NFRUX_MLFG_STAGING", false);
-    m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
-    m_m4 = !EnvFlag("NFRUX_MLFG_NO_M4", false);
-    m_vec8 = !EnvFlag("NFRUX_MLFG_NO_VEC8", false);
-    // e4m3 stage-2 tensors: with the FP8 matrices only (the fp16 matrices would convert every staged byte and lose the direct
-    // 1x1 loads: stage 2 4.48 -> 5.23 ms); bit-identical either way.
-    m_s2e8 = m_tier == Tier::CoopMat && m_vec8 && m_dev.caps().coopMatF8 && !EnvFlag("NFRUX_MLFG_NO_FP8", false) && !EnvFlag("NFRUX_MLFG_S2_FP16", false) &&
-             !EnvFlag("NFRUX_MLFG_FUSED", false);  // (the fused kernel reads fp16)
-    // CUDA, shipped build: the layers whose sums run in fp16 within each 8-channel chunk (all taps; the chunks added in
-    // fp32), measured per layer at 4K (docs/FFX_MLFG.md): only where it is faster; short chunks keep the error small.
-    // NFRUX_MLFG_ACC16_LAYERS=a,b,... (tests) replaces the list; NFRUX_MLFG_NO_ACC16=1 none.
-    m_acc16.assign(kLayers, false), m_matAcc16.assign(kLayers, false);
-#ifndef NFRUX_STRICT_MATH
-    if (const char* e = getenv("NFRUX_MLFG_MAT_ACC16_LAYERS"))  // coopmat (tests): the layers with fp16 sums a chunk
-        for (const char* q = e; *q; ++q)
-            if ((q == e || q[-1] == ',') && *q >= '0' && *q <= '9' && uint32_t(atoi(q)) < kLayers) m_matAcc16[atoi(q)] = true;
-            else if (*q == '*') m_matAcc16.assign(kLayers, true);
-#endif
-#ifndef NFRUX_STRICT_MATH
-    if (!EnvFlag("NFRUX_MLFG_NO_ACC16", false))
-    {
-        std::string list = "1,2,5,6,10,23,48";  // not 60 (stage-2 input: -0.5 to -1.4 dB for 0.017 ms)
-        if (const char* e = getenv("NFRUX_MLFG_ACC16_LAYERS")) list = e;
-        for (size_t i = 0; i < list.size();)
-        {
-            const uint32_t l = uint32_t(atoi(list.c_str() + i));
-            if (l < kLayers && list[i] >= '0' && list[i] <= '9') m_acc16[l] = true;
-            const size_t c = list.find(',', i);
-            i = c == std::string::npos ? list.size() : c + 1;
-        }
-    }
-#endif
-    if (const char* e = getenv("NFRUX_MLFG_MAT_MT")) m_matMt = std::min(std::max(atoi(e), 0), 4);  // tests: 1x1 16-output tiles a group (2-4; 0 by size)
-    m_fusedSoftmax = !EnvFlag("NFRUX_MLFG_SOFTMAX_PASS", false);
-    // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
-    // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
-    // untested elsewhere. Off unless NFRUX_MLFG_FUSED=1. CUDA's is on (NFRUX_MLFG_UNFUSED=1 turns every one off).
-    m_fusedMat = m_fused && EnvFlag("NFRUX_MLFG_FUSED", false);
+    // CUDA (NFRUX_MLFG_UNFUSED=1, tests: the FasterNet layers one by one); coopmat and generic run the layers.
     m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers), m_off8.resize(kLayers);
     if (m_tier == Tier::Cuda)
     {
@@ -341,7 +302,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
         m_gpuWeights = m_dev.CreateBuffer(m_blob.size(), true), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size(), true);
         if (!m_gpuWeights || !m_gpuBias) return fail("weights buffer");
-        if (m_splitK && !(m_partial = m_dev.CreateBuffer(kPartialFloats * 4, true))) return fail("split-K buffer");
+        if (!(m_partial = m_dev.CreateBuffer(kPartialFloats * 4, true))) return fail("split-K buffer");
     }
     else if (m_tier == Tier::CoopMat)
     {
@@ -365,31 +326,6 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                     }
             for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
         }
-        // FP8 cooperative matrices (Caps.coopMatF8): the fp8 1x1 layers' weights again as e4m3 bytes [ciPad32][coPad64]
-        // (m_off8 in 16-byte units). With stage 2's tensors in e4m3 bytes (m_s2e8) the default where the device has FP8 matrices:
-        // RTX 4070 stage 2 4.48 -> 4.41 ms (on fp16 tensors FP8 was slower: 4.75). NFRUX_MLFG_NO_FP8=1: fp16 matrices and tensors.
-        std::fill(m_off8.begin(), m_off8.end(), ~0u);
-        if (m_dev.caps().coopMatF8 && !EnvFlag("NFRUX_MLFG_NO_FP8", false))
-        {
-            for (uint32_t l = 0; l < kLayers; ++l)
-            {
-                const LayerWeights& L = m_weights.layers[l];
-                if (L.kind != 0 || L.k != 1 || !L.fp8) continue;
-                const uint32_t ciP = (L.cin + 31) & ~31u, coP = (L.cout + 63) & ~63u;
-                m_off8[l] = uint32_t(m_blob8.size() / 16);
-                m_blob8.resize(m_blob8.size() + size_t(ciP) * coP, 0);
-                for (uint32_t o = 0; o < L.cout; ++o)
-                    for (uint32_t i = 0; i < L.cin; ++i) m_blob8[size_t(m_off8[l]) * 16 + size_t(i) * coP + o] = m_weights.data[L.weights + size_t(o) * L.cin + i];
-            }
-            const uint32_t sg = m_dev.caps().subgroupSize;
-            m_gpuW8 = m_blob8.empty() ? nullptr : m_dev.CreateBuffer(m_blob8.size());
-            if (m_gpuW8)
-            {
-                m_mat8[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat8n3_16 : sg == 32 ? shaders::kMlfgMat8n3_32 : shaders::kMlfgMat8n3_64);
-                m_mat8[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat8n4_16 : sg == 32 ? shaders::kMlfgMat8n4_32 : shaders::kMlfgMat8n4_64);
-            }
-            if (!m_mat8[0] || !m_mat8[1]) m_mat8[0].reset(), m_mat8[1].reset(), Log("MLFG: the FP8 cooperative-matrix passes failed; fp16 for every layer");
-        }
         m_blob.resize(h.size() * 2), memcpy(m_blob.data(), h.data(), m_blob.size());
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
         m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
@@ -400,17 +336,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                                sg == 16 ? &shaders::kMlfgMatT_16 : sg == 32 ? &shaders::kMlfgMatT_32 : &shaders::kMlfgMatT_64};
         bool made = m_gpuWeights && m_gpuBias;
         for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = m_dev.CreatePass(*sh[i]));
-        made = made && (m_fn[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn48_16 : sg == 32 ? shaders::kMlfgFn48_32 : shaders::kMlfgFn48_64));
-        made = made && (m_fn[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn64_16 : sg == 32 ? shaders::kMlfgFn64_32 : shaders::kMlfgFn64_64));
+        made = made && (m_matN2 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2_16 : sg == 32 ? shaders::kMlfgMat3n2_32 : shaders::kMlfgMat3n2_64));
         made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
         made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
-        made = made && (m_matH[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3h_16 : sg == 32 ? shaders::kMlfgMat3h_32 : shaders::kMlfgMat3h_64));
-        made = made && (m_matH[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat2h_16 : sg == 32 ? shaders::kMlfgMat2h_32 : shaders::kMlfgMat2h_64));
-        made = made && (m_matH[2] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2h_16 : sg == 32 ? shaders::kMlfgMat3n2h_32 : shaders::kMlfgMat3n2h_64));
-        made = made && (m_matH[3] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1h_16 : sg == 32 ? shaders::kMlfgMat3n1h_32 : shaders::kMlfgMat3n1h_64));
-        made = made && (m_matN2 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2_16 : sg == 32 ? shaders::kMlfgMat3n2_32 : shaders::kMlfgMat3n2_64));
-        made = made && (m_mat1m[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n2_16 : sg == 32 ? shaders::kMlfgMat1n2_32 : shaders::kMlfgMat1n2_64));
-        made = made && (m_mat1m[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n3_16 : sg == 32 ? shaders::kMlfgMat1n3_32 : shaders::kMlfgMat1n3_64));
+        made = made && (m_mat1n3 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n3_16 : sg == 32 ? shaders::kMlfgMat1n3_32 : shaders::kMlfgMat1n3_64));
         if (!made) return fail("cooperative-matrix passes or weights buffer");
     }
     else
@@ -442,7 +371,6 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     bool made = m_gpuWeights != nullptr;
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j) made = made && (m_conv[i][j] = m_dev.CreatePass(*sh[i][j]));
-    made = made && (m_genFn[0] = m_dev.CreatePass(shaders::kMlfgConvFn48)) && (m_genFn[1] = m_dev.CreatePass(shaders::kMlfgConvFn64));
     if (!made) return fail("network passes or weights buffer");
     }
     bool ok = true;
@@ -495,24 +423,17 @@ bool Network::Run(const Conv& c)
         const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, ((L.kind == 1 ? c.src.h : c.out.h) + kCudaWarps - 1) / kCudaWarps, ntp / nb};
         // 32 pixels a warp (each B fragment twice) for the 8-tile convolutions without a second source on 3x3 / 2x2.
         // Only where that still gives 256 warps or more (measured: the 30- and 60-pixel-wide stage-1 layers get slower).
-        const bool m2 = (nb == 8 || nb == 4) && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
+        const bool m2 = nb == 8 && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
         const uint32_t gridM[3] = {(c.out.w + 31) / 32, grid[1], grid[2]};
-        // One n tile on 3x3 (the stage-2 head, narrow outputs): 64 pixels a warp.
-        const bool     m4 = nb == 1 && ntp == 1 && shape == 0 && split >= L.cin && m_m4;
-        const uint32_t gridM4[3] = {(c.out.w + 63) / 64, grid[1], 1};
-        const bool staged = m_staged && L.k == 3 && split >= L.cin && c.src.pitch % 2 == 0 && c.src.ch % 2 == 0;  // shared-memory staging
         // Split-K for the low-resolution 3x3 layers that fill few warps: S splits of the channel chunks each write fp32 sums,
         // a second pass adds them in split order (the same bytes every run, on both APIs) and runs the epilogue.
         const uint32_t warps = grid[0] * c.out.h * grid[2], kc = (L.cin + 7) / 8, pixels = c.out.w * c.out.h;
         uint32_t       splits = 1;
-        if (m_partial && !m2 && nb == 8 && L.kind == 0 && L.k == 3 && warps < 256 && kc >= 4 && writeEnd <= ntp * 8)
+        if (!m2 && nb == 8 && L.kind == 0 && L.k == 3 && warps < 256 && kc >= 4 && writeEnd <= ntp * 8)
             splits = std::min({4u, (256 + warps - 1) / warps, kc / 2});
         while (splits > 1 && uint64_t(splits) * pixels * ntp * 8 > kPartialFloats) --splits;
-        const bool h16 = c.layer < m_acc16.size() && m_acc16[c.layer];  // fp16 sums within each chunk (shipped build)
         bool ok;
-        if (c.act == Softmax)  // the head with the softmax epilogue (Stage2's weights)
-            ok = shape == 0 && nb == 1 && ntp == 1 && L.cout == 5 && m_cuda->LaunchSoftmax(bufs, 6, m4 ? gridM4 : grid, p, m4);
-        else if (splits > 1)
+        if (splits > 1)
         {
             const uint32_t per = (kc + splits - 1) / splits;
             splits = (kc + per - 1) / per;
@@ -521,8 +442,7 @@ bool Network::Run(const Conv& c)
             const uint32_t sg[3] = {grid[0], grid[1], grid[2] * splits};
             ok = m_cuda->LaunchSplit(sb, 7, sg, sp, pixels);
         }
-        else if (m4) ok = m_cuda->LaunchM4(bufs, 6, gridM4, p);
-        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged && nb == 8, nb == 4, h16) : m_cuda->Launch(bufs, 6, shape, nb, grid, p, h16);
+        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }
@@ -531,42 +451,24 @@ bool Network::Run(const Conv& c)
         const uint32_t split = std::min(c.split, L.cin);
         const bool     aligned = L.cin % 16 == 0 && split % 16 == 0 && c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && s1.pitch % 8 == 0 && (s1.ch + 16 - split % 16) % 8 == 0 && s1.ch % 8 == 0;
         // 8-channel staging (one 16-byte load a pixel's 8 channels): 8-aligned pitches, first channels, cin and split.
-        const bool     vec8 = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && L.cin % 8 == 0 && (split >= L.cin || (split % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0)) && m_vec8;
-        const bool e8in = c.src.e8 || (split < L.cin && s1.e8) || (c.add && c.add.e8);
-        if ((e8in && !vec8) || (c.out.e8 && (!c.fp8 || writeEnd % 4 || c.out.ch % 4 || c.out.pitch % 4))) return false;  // e4m3 tensors: 8-channel staging, 4-aligned out
-        struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4], fmt[4]; } k = {
+        const bool     vec8 = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && L.cin % 8 == 0 && (split >= L.cin || (split % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0));
+        struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
             {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
             {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
             {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
             {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
             {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 63) & ~63u)},
-            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned && !e8in ? 1 : 0, vec8 ? 1 : 0},
-            {c.src.e8 ? 1 : 0, s1.e8 ? 1 : 0, c.add && c.add.e8 ? 1 : 0, c.out.e8 ? 1 : 0}};
+            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), aligned ? 1 : 0, vec8 ? 1 : 0}};
         const int shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
         const bool narrow = L.cout <= 16 && (L.kind == 1 || L.k == 3);  // one 16-channel tile a group
         if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
-        if (m_mat8[0] && m_off8[c.layer] != ~0u && vec8)  // FP8 cooperative matrices: e4m3 inputs and weights, fp32 sums
-        {
-            k.add[2] = int32_t(m_off8[c.layer]), k.x[1] = int32_t((L.cin + 31) & ~31u), k.x[2] = k.x[3] = 0;
-            if (c.src.e8 && c.src.pitch % 16 == 0 && c.src.ch % 16 == 0) k.fmt[0] = 2;  // e4m3, 16-byte rows: direct A loads
-            if (s1.e8 && s1.pitch % 16 == 0 && s1.ch % 16 == 0) k.fmt[1] = 2;
-            const Bind b8[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuW8),
-                               Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
-            const uint32_t nb = L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : 4;
-            return m_mat8[nb == 4]->Dispatch(b8, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 16 * nb - 1) / (16 * nb));
-        }
-        const bool h16 = c.layer < m_matAcc16.size() && m_matAcc16[c.layer];  // fp16 sums a chunk (shipped build)
-        if (narrow) return (h16 ? m_matH[3] : m_matN1[0])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
-        const uint32_t z = (L.cout + 63) / 64;
-        if (shape == 0 && L.cout <= 32) return (h16 ? m_matH[2] : m_matN2)->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);  // 2 tiles of 16 outputs
-        if (shape == 2)  // 1x1: 48 or 32 outputs a group where 64 would compute padding (the stage-2 48 / 96-channel layers)
-        {
-            const uint32_t nb = m_matMt ? m_matMt : L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : L.cout % 32 == 0 && L.cout % 64 != 0 ? 2 : 4;
-            if (nb < 4) return m_mat1m[nb == 3]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 16 * nb - 1) / (16 * nb));
-        }
-        return (h16 && shape < 2 ? m_matH[shape] : m_mat[shape])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, z);
+        if (narrow) return m_matN1[0]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
+        if (shape == 0 && L.cout <= 32) return m_matN2->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);  // 2 tiles of 16 outputs
+        // 1x1 with 48 / 96 outputs (stage 2): 3 tiles a group, no padded ones.
+        if (shape == 2 && L.cout % 48 == 0 && L.cout % 64 != 0) return m_mat1n3->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, L.cout / 48);
+        return m_mat[shape]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 63) / 64);
     }
     const uint32_t gsplit = std::min(c.split, L.cin);
     const bool vec = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && (gsplit >= L.cin || (gsplit % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0));
@@ -657,30 +559,6 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
         c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
         return Run(c);
     }
-    if (m_tier == Tier::Generic && m_fusedMat && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
-    {
-        auto pad = [&](uint32_t l) { return int32_t((m_weights.layers[l].cout + 7) & ~7u); };
-        const int32_t k[12] = {int32_t(x.w), int32_t(x.h), 0, 0, int32_t(m_offset[first]), int32_t(m_offset[first + 1]), int32_t(m_offset[first + 2]), 0,
-                               pad(first), pad(first + 1), pad(first + 2), 0};
-        const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Buf(1, *x.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(5, *y.buf)};
-        if (m_dev.Timing()) m_dev.Label(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
-        if (!m_genFn[C == 48 ? 0 : 1]->Dispatch(b, 4, (x.w + 7) / 8, (x.h + 7) / 8, 1)) return false;
-        if (!skip) return true;
-        c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
-        return Run(c);
-    }
-    if (m_tier == Tier::CoopMat && m_fusedMat && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
-    {
-        auto pad = [&](uint32_t l) { return int32_t((m_weights.layers[l].cout + 63) & ~63u); };
-        const int32_t k[16] = {int32_t(x.w), int32_t(x.h), 0, 0, int32_t(m_offset[first]), int32_t(m_offset[first + 1]), int32_t(m_offset[first + 2]), 0,
-                               int32_t(m_biasOffset[first]), int32_t(m_biasOffset[first + 1]), int32_t(m_biasOffset[first + 2]), 0, pad(first), pad(first + 1), pad(first + 2), 0};
-        const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Buf(1, *x.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(5, *y.buf), Bind::Buf(6, *m_gpuBias)};
-        if (m_dev.Timing()) m_dev.Label(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
-        if (!m_fn[C == 48 ? 0 : 1]->Dispatch(b, 5, (x.w + 15) / 16, x.h, 1)) return false;
-        if (!skip) return true;
-        c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
-        return Run(c);
-    }
     c.layer = first, c.src = x, c.out = pc, c.fp8 = true;
     if (!Run(c)) return false;
     c = {}, c.layer = first + 1, c.src = pc, c.src1 = x.At(P), c.split = P, c.out = h, c.act = Relu, c.fp8 = true;
@@ -692,14 +570,12 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
     return Run(c);
 }
 
-bool Network::Stage2(const View& in, const View& logits, const View* weights)
+bool Network::Stage2(const View& in, const View& logits)
 {
     const uint32_t W = in.w, H = in.h;
     const View t32 = Sized(m_t32, W, H, 32);
-    View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), pc16 = Sized(m_pc16, W / 2, H / 2, 16), h96 = Sized(m_h96, W / 2, H / 2, 96);
-    View x64 = Sized(m_x64, W / 4, H / 4, 64), y64 = Sized(m_y64, W / 4, H / 4, 64), pc32 = Sized(m_pc32, W / 4, H / 4, 32), h128 = Sized(m_h128, W / 4, H / 4, 128);
-    if (m_s2e8)  // the fp8 tensors as e4m3 bytes (exact): half the traffic
-        for (View* v : {&x48, &y48, &pc16, &h96, &x64, &y64, &pc32, &h128}) v->e8 = true;
+    const View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), pc16 = Sized(m_pc16, W / 2, H / 2, 16), h96 = Sized(m_h96, W / 2, H / 2, 96);
+    const View x64 = Sized(m_x64, W / 4, H / 4, 64), y64 = Sized(m_y64, W / 4, H / 4, 64), pc32 = Sized(m_pc32, W / 4, H / 4, 32), h128 = Sized(m_h128, W / 4, H / 4, 128);
     Conv c;
     c.layer = kS2Inp, c.src = in, c.out = t32, c.act = Relu;  // fp16
     if (!Run(c)) return false;
@@ -716,11 +592,6 @@ bool Network::Stage2(const View& in, const View& logits, const View* weights)
         if (!FasterNet(kS2B3 + 3 * j, 48, 16, j % 2 ? x48 : y48, j % 2 ? y48 : x48, pc16, h96, nullptr, nullptr)) return false;
     c = {}, c.layer = kS2Up, c.src = y48, c.out = t32;  // fp16
     if (!Run(c)) return false;
-    if (weights && FusedSoftmax())  // CUDA: the softmax in the head's epilogue, straight to the blend weights
-    {
-        c = {}, c.layer = kS2Head, c.src = t32, c.out = *weights, c.act = Softmax, c.writeEnd = 8;
-        return Run(c);
-    }
     c = {}, c.layer = kS2Head, c.src = t32, c.out = logits;  // fp16 logits (the softmax pass follows)
     return Run(c);
 }

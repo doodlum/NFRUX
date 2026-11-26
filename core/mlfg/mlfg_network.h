@@ -42,7 +42,6 @@ struct View
 {
     const Buffer* buf = nullptr;
     uint32_t      w = 0, h = 0, pitch = 0, ch = 0;
-    bool          e8 = false;  // e4m3 bytes, not fp16 (coopmat's stage-2 tensors: their values are e4m3 anyway)
     explicit operator bool() const { return buf != nullptr; }
     View At(uint32_t c) const { View v = *this; v.ch = c; return v; }
 };
@@ -56,7 +55,7 @@ struct Tensor
 class Network
 {
 public:
-    enum Act { None = 0, Leaky = 1, Relu = 2, Softmax = 3 };  // Softmax: CUDA's stage-2 head only (FusedSoftmax)
+    enum Act { None = 0, Leaky = 1, Relu = 2 };
     // l0: the stage-1 level-0 tensor size (mlfg_sizes 'l0'); s2: the stage-2 tensor size ('s2').
     static std::unique_ptr<Network> Create(Device& dev, uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error);
     ~Network();
@@ -69,10 +68,8 @@ public:
     bool Encoders(const View& netIn);
     // One flow block (0-3) of stage 1: in (its size S) -> out13 (13 channels, size S).
     bool FlowBlock(uint32_t block, const View& in, const View& out13);
-    // Stage 2 (passes 154-188 up to the softmax): the 24-channel input -> 5 fp16 logits. With weights and FusedSoftmax():
-    // the head's epilogue is kMlfgSoftmax5 and writes the [H][W][8] blend weights instead (the softmax pass is skipped).
-    bool Stage2(const View& in, const View& logits, const View* weights = nullptr);
-    bool FusedSoftmax() const { return m_tier == Tier::Cuda && m_fusedSoftmax; }
+    // Stage 2 (passes 154-188 up to the softmax): the 24-channel input -> 5 fp16 logits.
+    bool Stage2(const View& in, const View& logits);
     // One layer (exposed for tests): out = round(act(conv(src | src1) + bias + add)).
     struct Conv
     {
@@ -100,25 +97,14 @@ private:
     std::unique_ptr<Buffer> m_gpuWeights, m_gpuBias;
     std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames
     uint32_t                m_frames = 0;
-    std::unique_ptr<Pass>   m_conv[4][2], m_genFn[2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
-    std::unique_ptr<Pass>   m_mat[4], m_matN1[2], m_fn[2];  // coopmat: layers; narrow; fused FasterNet 48 / 64
-    std::unique_ptr<Pass>   m_matN2, m_mat1m[2];  // coopmat: 3x3 with 17-32 outputs; 1x1 with 32 / 48 outputs a group
-    uint32_t                m_matMt = 0;  // NFRUX_MLFG_MAT_MT (tests): the 1x1 16-output tiles a group, else by size
+    std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
+    std::unique_ptr<Pass>   m_mat[4], m_matN1[2];  // coopmat: layers; narrow (one 16-output tile)
+    std::unique_ptr<Pass>   m_matN2, m_mat1n3;  // coopmat: 3x3 with 17-32 outputs (2 tiles); 1x1 with 48 / 96 outputs (3 tiles)
     std::unique_ptr<CudaKernels> m_cuda;
     bool                    m_fused = true;
-    bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
     bool                    m_m2 = true;
-    bool                    m_m4 = true;
-    bool                    m_vec8 = true;
-    bool                    m_s2e8 = false;  // coopmat: stage 2's fp8 tensors stored as e4m3 bytes (NFRUX_MLFG_S2_FP16=1: fp16)
-    std::vector<bool>       m_acc16, m_matAcc16;  // coopmat: the same idea (3x3 / 2x2 / 3x3 2 tiles / 3x3 1 tile: m_matH)
-    std::unique_ptr<Pass>   m_matH[4];
-    std::unique_ptr<Pass>   m_mat8[2];  // coopmat FP8 1x1 (48 / 96, 64 / 128 outputs)  // CUDA: layers with fp16 sums a chunk (shipped build)  // coopmat: 16-byte staging loads (NFRUX_MLFG_NO_VEC8=1: off)  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
-    bool                    m_staged = false;  // CUDA 3x3: shared-memory staging (NFRUX_MLFG_STAGING=1; measured neutral)
-    bool                    m_fusedSoftmax = true;  // CUDA: softmax in the head (NFRUX_MLFG_SOFTMAX_PASS=1: the pass)
-    bool                    m_splitK = true;   // CUDA: split-K for the low-resolution 3x3 layers (NFRUX_MLFG_NO_SPLITK=1: off)
     static constexpr uint32_t kPartialFloats = 2u << 20;  // split-K's fp32 partial sums (8 MB)
-    std::unique_ptr<Buffer> m_partial;
+    std::unique_ptr<Buffer> m_partial;  // CUDA split-K: the fp32 partial sums
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch
     Tensor                  m_t32, m_x48, m_y48, m_skip, m_pc16, m_h96, m_x64, m_y64, m_pc32, m_h128, m_u32;  // stage 2

@@ -33,40 +33,20 @@ struct Ptx
     }
 };
 
-void SoftmaxEpilogue(Ptx& w, int R, int xr);
-
-// Accumulation of the fp16 convolutions: 0 fp32 (mma f32 += f16 x f16), 1 fp16 within each 8-channel chunk (all its
-// taps) and the chunks added into fp32, 2 fp16 over the whole reduction. GeForce runs f16-accumulate mma at twice the
-// f32 rate. The fp16 accumulators of accumulator f (f, f + 1, f + 2, f + 3 in fp32) are r(200 + f / 2), r(201 + f / 2):
-// the same fragment layout, two halves a register (rows g / g + 8, columns 2q, 2q + 1).
-int g_acc = 0;
-void Mma(Ptx& w, int f, int a0, int a1, int b)
+void Mma(Ptx& w, int f, int a0, int a1, int b)  // accumulator f .. f + 3 (fp32) += A (a0, a1) x B (b)
 {
-    if (g_acc)
-        w("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%%r%d, %%r%d}, {%%r%d, %%r%d}, {%%r%d}, {%%r%d, %%r%d};", 200 + f / 2, 201 + f / 2, a0, a1, b, 200 + f / 2, 201 + f / 2);
-    else
-        w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r%d}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, a0, a1, b, f, f + 1, f + 2, f + 3);
-}
-void AccZero(Ptx& w, int n)  // n fp32 accumulators' fp16 registers
-{
-    for (int i = 0; i < n / 2; ++i) w("mov.b32 %%r%d, 0;", 200 + i);
-}
-void AccFlush(Ptx& w, int n)  // fp32 += the fp16 sums
-{
-    for (int i = 0; i < n / 2; ++i)
-        w("mov.b32 {%%h1, %%h2}, %%r%d; cvt.f32.f16 %%f196, %%h1; cvt.f32.f16 %%f197, %%h2; add.rn.f32 %%f%d, %%f%d, %%f196; add.rn.f32 %%f%d, %%f%d, %%f197;", 200 + i, 2 * i, 2 * i, 2 * i + 1,
-          2 * i + 1);
+    w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r%d}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, a0, a1, b, f, f + 1, f + 2, f + 3);
 }
 // One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2; NB n tiles (8 channels each) a warp.
-std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
+std::string Kernel(int shape, int NB, bool split = false)
 {
     const bool T = shape == 3;
     const int  K = shape == 0 ? 3 : shape == 1 ? 2 : shape == 2 ? 1 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0;
     const int  taps = K * K, NA = T ? 4 : 1;  // accumulator sets (transposed: one per output phase)
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : softmax ? "x" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
-    w(".reg .b32 %%r<300>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
+    w(".reg .b32 %%r<200>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // s0 s1 w b add out
     // r1 inW r2 inH r3 p0 r4 ch0 r5 p1 r6 ch1m r7 split r8 cin r9 outW r10 outH r11 po r12 cho r13 cout r14 writeEnd r15 act
     // r16 fp8 r17 pa r18 cha r19 kc r20 ntp
@@ -107,9 +87,7 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
     }
     else
         w("mov.u32 %%r40, 0;");  // kc
-    if (g_acc == 2) AccZero(w, NA * NB * 4);
     w("LOOP:");
-    if (g_acc == 1) AccZero(w, NA * NB * 4);
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3; setp.lt.s32 %%p9, %%r41, %%r7;");  // chunk's first channel, from src0
     w("shl.b32 %%r42, %%r23, 1; add.s32 %%r42, %%r41, %%r42; add.s32 %%r43, %%r42, 1;");  // c, c + 1
@@ -138,10 +116,8 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
             }
         }
     }
-    if (g_acc == 1) AccFlush(w, NA * NB * 4);
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
-    if (g_acc == 2) AccFlush(w, NA * NB * 4);
     if (split)  // the raw sums: part[split][pixel][ntp * 8] fp32
     {
         w("mul.lo.u32 %%r116, %%r9, %%r10; mul.lo.u32 %%r116, %%r116, %%r114; shl.b32 %%r117, %%r20, 3;");  // split * pixels, cpad
@@ -157,12 +133,6 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
                 w("SKIP%d:", lab);
             }
         }
-        w("ret;");
-        return w.s + "}\n";
-    }
-    if (softmax)  // the stage-2 head (5 logits, one n tile) with kMlfgSoftmax5 as its epilogue: the same bits as the two passes
-    {
-        SoftmaxEpilogue(w, 2, 0);
         w("ret;");
         return w.s + "}\n";
     }
@@ -208,7 +178,7 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
 }
 void Fp8(Ptx& w, int v);
 
-// The 8-row-group convolutions' epilogue (KernelM / KernelS): bias, add, activation, rounding, two channels a word.
+// The 8-row-group convolutions' epilogue (KernelM): bias, add, activation, rounding, two channels a word.
 void Epilogue(Ptx& w, int NB, int R)
 {
     for (int j = 0; j < NB; ++j)
@@ -249,13 +219,13 @@ void Epilogue(Ptx& w, int NB, int R)
 // g + 16, ...) by NB n tiles: each B fragment serves MT products (the loads, not the tensor cores, limit the 16-pixel
 // kernel). Addresses: a base per 8-row group plus a per-tap offset; zero padding by predicates (x per kx and group, y per
 // ky). A second source only for 1x1 (the FasterNet concatenation). Same products per output, same order: same bits.
-std::string KernelM(int shape, int NB, int MT, bool softmax = false)
+std::string KernelM(int shape, int NB, int MT)
 {
     const int K = shape == 0 ? 3 : shape == 1 ? 2 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0, taps = K * K, R = 2 * MT;
     static const char* names[3] = {"conv3", "conv2", "conv1"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "m" + std::to_string(MT) + (softmax ? "x" : "") + "(.param .align 8 .b8 P[128])\n{\n";
-    w(".reg .b32 %%r<300>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "m" + std::to_string(MT) + "(.param .align 8 .b8 P[128])\n{\n";
+    w(".reg .b32 %%r<200>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
     for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
     w("mov.u32 %%r21, %%tid.x; and.b32 %%r21, %%r21, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3;");
@@ -283,9 +253,7 @@ std::string KernelM(int shape, int NB, int MT, bool softmax = false)
     w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7;");
     w("mul.wide.u32 %%rd9, %%r20, 128; mul.lo.u64 %%rd60, %%rd9, %d;", taps);
     w("mov.u32 %%r40, 0;");
-    if (g_acc == 2) AccZero(w, MT * NB * 4);
     w("LOOP:");
-    if (g_acc == 1) AccZero(w, MT * NB * 4);
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3; setp.lt.s32 %%p9, %%r41, %%r7;");
     w("shl.b32 %%r42, %%r23, 1; add.s32 %%r42, %%r41, %%r42; add.s32 %%r43, %%r42, 1;");
@@ -314,80 +282,8 @@ std::string KernelM(int shape, int NB, int MT, bool softmax = false)
             }
         }
     }
-    if (g_acc == 1) AccFlush(w, MT * NB * 4);
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
-    if (g_acc == 2) AccFlush(w, MT * NB * 4);
-    if (softmax) SoftmaxEpilogue(w, R, 80);
-    else Epilogue(w, NB, R);
-    w("ret;");
-    return w.s + "}\n";
-}
-
-// The 3x3 convolution with shared-memory staging: a block of kCudaWarps warps (one output row each, MT * 16 pixels) stages
-// the rows it needs, (kCudaWarps + 2) x (MT * 16 + 2) pixels by 8 channels (fp16, 0 outside the image / past cin), once a
-// chunk; every tap's A fragment is then one conflict-free shared load per 8-row group. The same products in the same
-// order as KernelM (the same bits). One source, channel pairs word-aligned (the host checks).
-std::string KernelS(int NB, int MT)
-{
-    const int R = 2 * MT, SW = MT * 16 + 2, SH = int(kCudaWarps) + 2;  // staged width / height
-    Ptx w;
-    w.s = std::string(".visible .entry conv3_") + std::to_string(NB) + "s" + std::to_string(MT) + "(.param .align 8 .b8 P[128])\n{\n";
-    w(".reg .b32 %%r<300>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
-    w(".shared .align 16 .b32 sx[%d];", SH * SW * 4);
-    for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
-    for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
-    w("mov.u32 %%r90, %%tid.x; and.b32 %%r21, %%r90, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3; shr.u32 %%r35, %%r90, 5;");  // tid, lane, g, q, warp
-    w("mov.u32 %%r24, %%ctaid.x; mul.lo.u32 %%r24, %%r24, %d; mov.u32 %%r91, %%ctaid.y; mul.lo.u32 %%r91, %%r91, %d; add.u32 %%r25, %%r91, %%r35;", 16 * MT, int(kCudaWarps));
-    w("mov.u32 %%r26, %%ctaid.z; mul.lo.u32 %%r26, %%r26, %d;", NB);
-    w("setp.eq.s32 %%p1, %%r15, 1; setp.eq.s32 %%p2, %%r15, 2; setp.ne.s32 %%p3, %%r16, 0; setp.ne.s32 %%p4, %%r17, 0;");
-    for (int r = 0; r < R; ++r) w("add.u32 %%r%d, %%r24, %%r22; add.u32 %%r%d, %%r%d, %d;", 80 + r, 80 + r, 80 + r, 8 * r);
-    // This lane's shared byte address at staged row warp, pixel g, its channel pair; a tap / group adds (ky SW + kx + 8r) 16.
-    w("mad.lo.u32 %%r92, %%r35, %d, %%r22; shl.b32 %%r92, %%r92, 4; shl.b32 %%r93, %%r23, 2; add.u32 %%r92, %%r92, %%r93; mov.u32 %%r94, sx; add.u32 %%r92, %%r92, %%r94;", SW);
-    for (int i = 0; i < MT * NB * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
-    w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7;");
-    w("mul.wide.u32 %%rd9, %%r20, 128; mul.lo.u64 %%rd60, %%rd9, 9;");
-    w("sub.u32 %%r95, %%r91, 1; sub.u32 %%r96, %%r24, 1;");  // staged origin (y0 - 1, x0 - 1)
-    w("mov.u32 %%r40, 0;");
-    if (g_acc == 2) AccZero(w, MT * NB * 4);
-    w("LOOP:");
-    if (g_acc == 1) AccZero(w, MT * NB * 4);
-    w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
-    w("shl.b32 %%r41, %%r40, 3;");
-    w("bar.sync 0;");
-    w("mov.u32 %%r97, %%r90;");
-    w("STAGE:");
-    w("setp.ge.u32 %%p9, %%r97, %d; @%%p9 bra STAGED;", SH * SW * 4);
-    w("and.b32 %%r98, %%r97, 3; shr.u32 %%r99, %%r97, 2; rem.u32 %%r100, %%r99, %d; div.u32 %%r101, %%r99, %d;", SW, SW);  // pair, pixel, row
-    w("add.u32 %%r102, %%r96, %%r100; add.u32 %%r103, %%r95, %%r101;");  // image x, y (below 0 wraps: the unsigned compare)
-    w("shl.b32 %%r104, %%r98, 1; add.u32 %%r104, %%r104, %%r41;");
-    w("setp.lt.u32 %%p10, %%r102, %%r1; setp.lt.u32 %%p11, %%r103, %%r2; and.pred %%p10, %%p10, %%p11; setp.lt.s32 %%p11, %%r104, %%r8; and.pred %%p10, %%p10, %%p11;");
-    w("mad.lo.u32 %%r105, %%r103, %%r1, %%r102; mad.lo.u32 %%r105, %%r105, %%r3, %%r4; add.u32 %%r105, %%r105, %%r104; mul.wide.u32 %%rd70, %%r105, 2; add.s64 %%rd70, %%rd1, %%rd70;");
-    w("mov.u32 %%r106, 0; @%%p10 ld.global.u32 %%r106, [%%rd70];");
-    w("add.s32 %%r107, %%r104, 1; setp.ge.s32 %%p12, %%r107, %%r8; @%%p12 and.b32 %%r106, %%r106, 0xFFFF;");
-    w("shl.b32 %%r108, %%r97, 2; add.u32 %%r108, %%r108, %%r94; st.shared.u32 [%%r108], %%r106;");
-    w("add.u32 %%r97, %%r97, %d; bra STAGE;", 32 * int(kCudaWarps));
-    w("STAGED:");
-    w("bar.sync 0;");
-    for (int t = 0; t < 9; ++t)
-    {
-        const int ky = t / 3, kx = t % 3;
-        for (int r = 0; r < R; ++r) w("ld.shared.u32 %%r%d, [%%r92+%d];", 50 + r, (ky * SW + kx + 8 * r) * 16);
-        w("mul.lo.u64 %%rd63, %%rd9, %d; add.s64 %%rd63, %%rd63, %%rd8;", t);
-        for (int j = 0; j < NB; ++j)
-        {
-            w("ld.global.u32 %%r49, [%%rd63+%d];", j * 128);
-            for (int m = 0; m < MT; ++m)
-            {
-                const int f = (m * NB + j) * 4;
-                Mma(w, f, 50 + 2 * m, 51 + 2 * m, 49);
-            }
-        }
-    }
-    if (g_acc == 1) AccFlush(w, MT * NB * 4);
-    w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
-    w("END:");
-    if (g_acc == 2) AccFlush(w, MT * NB * 4);
     Epilogue(w, NB, R);
     w("ret;");
     return w.s + "}\n";
@@ -633,81 +529,22 @@ std::string ReduceKernel()
     w("ret;");
     return w.s + "}\n";
 }
-// kMlfgSoftmax5 after the head layer (one n tile: lanes 4g + q hold channels 2q, 2q + 1 of pixels g, g + 8): the logits
-// rounded to fp16 as the layer stores them, gathered from the quad's lanes 0-2 (shuffles, before any branch); every lane
-// computes the five weights as the shader does (max from 0, FExp's Cody-Waite + polynomial, the sum in order, IEEE
-// division) and stores its pair of the [H][W][8] weights: q 0 (w0, w1), 1 (w2, w3), 2 (w4, 0), 3 (0, 0).
-void SoftmaxEpilogue(Ptx& w, int R, int xr)  // R rows of 8 pixels, x in r(xr + r) (xr 0: Kernel's r27 / r28)
-{
-    w("shl.b32 %%r60, %%r23, 1; and.b32 %%r76, %%r21, 28;");  // c = 2q, the quad's lane 0
-    w("mul.wide.s32 %%rd64, %%r60, 4; add.s64 %%rd64, %%rd4, %%rd64; ld.global.f32 %%f180, [%%rd64]; ld.global.f32 %%f181, [%%rd64+4];");
-    w("setp.eq.u32 %%p80, %%r23, 0; setp.eq.u32 %%p81, %%r23, 1; setp.eq.u32 %%p82, %%r23, 2;");
-    for (int r = 0; r < R; ++r)
-    {
-        const int x = xr ? xr + r : r ? 28 : 27;
-        w("add.rn.f32 %%f100, %%f%d, %%f180; add.rn.f32 %%f101, %%f%d, %%f181;", r * 2, r * 2 + 1);
-        w("cvt.rn.f16.f32 %%h5, %%f100; cvt.rn.f16.f32 %%h6, %%f101; cvt.f32.f16 %%f100, %%h5; cvt.f32.f16 %%f101, %%h6;");
-        w("add.u32 %%r77, %%r76, 1; add.u32 %%r78, %%r76, 2;");
-        w("shfl.sync.idx.b32 %%f110, %%f100, %%r76, 31, 0xffffffff; shfl.sync.idx.b32 %%f111, %%f101, %%r76, 31, 0xffffffff;");
-        w("shfl.sync.idx.b32 %%f112, %%f100, %%r77, 31, 0xffffffff; shfl.sync.idx.b32 %%f113, %%f101, %%r77, 31, 0xffffffff;");
-        w("shfl.sync.idx.b32 %%f114, %%f100, %%r78, 31, 0xffffffff;");
-        w("mov.f32 %%f115, 0f00000000;");
-        for (int k = 0; k < 5; ++k) w("max.f32 %%f115, %%f115, %%f%d;", 110 + k);
-        for (int k = 0; k < 5; ++k)
-        {
-            const int x = 120, e = 130 + k;
-            w("sub.rn.f32 %%f%d, %%f%d, %%f115;", x, 110 + k);
-            w("mul.rn.f32 %%f121, %%f%d, 0f3FB8AA3B; add.rn.f32 %%f121, %%f121, 0f3F000000; cvt.rmi.f32.f32 %%f122, %%f121;", x);  // k
-            w("mul.rn.f32 %%f121, %%f122, 0f3F317200; sub.rn.f32 %%f123, %%f%d, %%f121; mul.rn.f32 %%f121, %%f122, 0f35BFBE8E; sub.rn.f32 %%f123, %%f123, %%f121;", x);  // r
-            w("mov.f32 %%f124, 0f39500D01;");
-            for (const char* c : {"0f3AB60B61", "0f3C088889", "0f3D2AAAAB", "0f3E2AAAAB", "0f3F000000"})
-                w("mul.rn.f32 %%f124, %%f124, %%f123; add.rn.f32 %%f124, %%f124, %s;", c);
-            w("mul.rn.f32 %%f125, %%f123, %%f123; mul.rn.f32 %%f125, %%f124, %%f125; add.rn.f32 %%f125, %%f125, %%f123; add.rn.f32 %%f125, %%f125, 0f3F800000;");
-            // LdExp(e, k): below 2^-126 in two steps
-            w("cvt.rzi.s32.f32 %%r79, %%f122; setp.lt.s32 %%p83, %%r79, -126; mul.rn.f32 %%f126, %%f125, 0f00800000; @%%p83 mov.f32 %%f125, %%f126; @%%p83 add.s32 %%r79, %%r79, 126;");
-            w("max.s32 %%r79, %%r79, -126; min.s32 %%r79, %%r79, 127; add.s32 %%r79, %%r79, 127; shl.b32 %%r79, %%r79, 23; mov.b32 %%f126, %%r79; mul.rn.f32 %%f%d, %%f125, %%f126;", e);
-            w("setp.gt.f32 %%p84, %%f%d, 0f42B17218; @%%p84 mov.f32 %%f%d, 0f7F800000; setp.lt.f32 %%p84, %%f%d, 0fC2CFF1B4; @%%p84 mov.f32 %%f%d, 0f00000000;", x, e, x, e);
-            w("setp.nan.f32 %%p84, %%f%d, %%f%d; @%%p84 mov.f32 %%f%d, %%f%d;", x, x, e, x);
-        }
-        w("mov.f32 %%f140, %%f130; add.rn.f32 %%f140, %%f140, %%f131; add.rn.f32 %%f140, %%f140, %%f132; add.rn.f32 %%f140, %%f140, %%f133; add.rn.f32 %%f140, %%f140, %%f134;");
-        for (int k = 0; k < 5; ++k) w("div.rn.f32 %%f%d, %%f%d, %%f140;", 130 + k, 130 + k);
-        w("mov.f32 %%f141, 0f00000000; mov.f32 %%f142, 0f00000000;");
-        w("@%%p80 mov.f32 %%f141, %%f130; @%%p80 mov.f32 %%f142, %%f131; @%%p81 mov.f32 %%f141, %%f132; @%%p81 mov.f32 %%f142, %%f133; @%%p82 mov.f32 %%f141, %%f134;");
-        const int lab = w.label++;
-        w("setp.lt.s32 %%p23, %%r%d, %%r9; setp.lt.s32 %%p24, %%r25, %%r10; and.pred %%p23, %%p23, %%p24; @!%%p23 bra SKIP%d;", x, lab);
-        w("mad.lo.s32 %%r65, %%r25, %%r9, %%r%d;", x);
-        w("cvt.rn.f16.f32 %%h5, %%f141; cvt.rn.f16.f32 %%h6, %%f142; mov.b32 %%r72, {%%h5, %%h6};");
-        w("mad.lo.s32 %%r73, %%r65, %%r11, %%r12; add.s32 %%r73, %%r73, %%r60; mul.wide.s32 %%rd66, %%r73, 2; add.s64 %%rd66, %%rd6, %%rd66; st.global.u32 [%%rd66], %%r72;");
-        w("SKIP%d:", lab);
-    }
-}
+
 }  // namespace
 
 // kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
 int Fp8Channel(int kp) { return (kp >= 16 ? 16 : 0) + 8 * ((kp % 4) / 2) + 2 * ((kp % 16) / 4) + (kp % 2); }
 
-std::string CudaPtx(bool fp8, int acc)
+std::string CudaPtx(bool fp8)
 {
-    g_acc = 0;
     std::string p = fp8 ? ".version 8.4\n.target sm_89\n.address_size 64\n" : ".version 7.0\n.target sm_75\n.address_size 64\n";
     if (fp8) p += FnKernel8(48, 16), p += FnKernel8(64, 32);
     for (int s = 0; s < 4; ++s)
         for (int nb : kNbs)
             if (s < 3 || nb <= 4) p += Kernel(s, nb);
-    for (int s = 0; s < 3; ++s) p += KernelM(s, 8, 2), p += KernelM(s, 4, 2);
-    p += KernelS(8, 2);
-    p += Kernel(0, 8, true), p += ReduceKernel(), p += Kernel(0, 1, false, true), p += KernelM(0, 1, 4), p += KernelM(0, 1, 4, true);
-    p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 4, 16, 8);  // the layers' padded n tiles (CudaNb)
-    if (acc)  // the plain convolutions again with fp16 sums within each chunk: names + "h" (the layers Network picks)
-    {
-        g_acc = acc;
-        auto h = [](std::string k) { return k.replace(k.find("(.param"), 0, "h"); };
-        for (int s = 0; s < 4; ++s)
-            for (int nb : kNbs)
-                if (s < 3 || nb <= 4) p += h(Kernel(s, nb));
-        for (int s = 0; s < 3; ++s) p += h(KernelM(s, 8, 2)), p += h(KernelM(s, 4, 2));
-        g_acc = 0;
-    }
+    for (int s = 0; s < 3; ++s) p += KernelM(s, 8, 2);
+    p += Kernel(0, 8, true), p += ReduceKernel();
+    p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 8, 16, 8);  // the layers' padded n tiles (CudaNb)
     return p;
 }
 
@@ -720,12 +557,7 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
     if (!cc) return nullptr;
     // FP8 tensor cores from sm_89 (RTX 40): the module for that target with the e4m3 FasterNet kernels.
     const bool fp8 = cc >= 89 && !EnvFlag("NFRUX_MLFG_NO_FP8", false);
-#ifdef NFRUX_STRICT_MATH
-    const int acc = 0;  // the strict build: fp32 sums only
-#else
-    const int acc = EnvFlag("NFRUX_MLFG_NO_ACC16", false) ? 0 : 1;  // fp16-sum variants (chunked) for the layers that gain
-#endif
-    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8, acc), luid, error);
+    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8), luid, error);
     if (cubin.empty()) return nullptr;
     std::unique_ptr<CudaKernels> k(new CudaKernels(dev));
     if (!(k->m_module = dev.CudaModule(cubin))) return fail("CUDA module");
@@ -735,13 +567,8 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
         for (int i = 0; i < 6; ++i)
             if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_conv[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]))) return fail("CUDA function");
     for (int s = 0; s < 3; ++s)
-        if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2") || !fn(k->m_convM4[s], std::string(names[s]) + "_4m2")) return fail("CUDA function");
-    for (int s = 0; s < 4 && acc; ++s)
-        for (int i = 0; i < 6; ++i)
-            if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_convH[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]) + "h")) return fail("CUDA function");
-    for (int s = 0; s < 3 && acc; ++s)
-        if (!fn(k->m_convMH[s], std::string(names[s]) + "_8m2h") || !fn(k->m_convM4H[s], std::string(names[s]) + "_4m2h")) return fail("CUDA function");
-    if (!fn(k->m_convS, "conv3_8s2") || !fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek") || !fn(k->m_softmax, "conv3_1x") || !fn(k->m_conv1m4, "conv3_1m4") || !fn(k->m_softmaxM4, "conv3_1m4x")) return fail("CUDA function");
+        if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2")) return fail("CUDA function");
+    if (!fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek")) return fail("CUDA function");
     for (int i = 0; i < 2; ++i)
         if (!fn(k->m_fnk[i], i ? "fn64" : "fn48")) return fail("CUDA function");
     for (int i = 0; i < 2 && fp8; ++i)
@@ -752,11 +579,9 @@ CudaKernels::~CudaKernels()
 {
     std::vector<void*> f(m_fnk, m_fnk + 2);
     f.insert(f.end(), m_fn8, m_fn8 + 2);
-    f.insert(f.end(), m_convM, m_convM + 3), f.insert(f.end(), m_convM4, m_convM4 + 3);
-    f.push_back(m_convS), f.push_back(m_splitK), f.push_back(m_reduce), f.push_back(m_softmax), f.push_back(m_conv1m4), f.push_back(m_softmaxM4);
+    f.insert(f.end(), m_convM, m_convM + 3);
+    f.push_back(m_splitK), f.push_back(m_reduce);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
-    for (auto& s : m_convH) f.insert(f.end(), s, s + 6);
-    f.insert(f.end(), m_convMH, m_convMH + 3), f.insert(f.end(), m_convM4H, m_convM4H + 3);
     m_dev.CudaDestroy(m_module, f);
 }
 
@@ -765,39 +590,22 @@ bool CudaKernels::LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bo
     return m_dev.CudaLaunch(fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged, bool nb4, bool h) const
+bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p) const
 {
-    if (h && m_convMH[shape]) return m_dev.CudaLaunch(nb4 ? m_convM4H[shape] : m_convMH[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
-    return m_dev.CudaLaunch(nb4 ? m_convM4[shape] : staged && shape == 0 ? m_convS : m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+    return m_dev.CudaLaunch(m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p, bool h) const
+bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
 {
     int i = 0;
     while (i < 5 && kNbs[i] != int(nb)) ++i;
-    return kNbs[i] == int(nb) && m_dev.CudaLaunch(h && m_convH[shape][i] ? m_convH[shape][i] : m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+    return kNbs[i] == int(nb) && m_dev.CudaLaunch(m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
-}  // namespace nfrux::mlfg
-namespace nfrux::mlfg
-{
+
 bool CudaKernels::LaunchSplit(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const SplitParams& p, uint32_t pixels) const
 {
     if (!m_dev.CudaLaunch(m_splitK, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n)) return false;
     const uint32_t rg[3] = {(pixels * uint32_t(p.c.writeEnd / 2) + 127) / 128, 1, 1};
     return m_dev.CudaLaunch(m_reduce, rg, 128, &p, sizeof(p), bufs, n);
-}
-}  // namespace nfrux::mlfg
-namespace nfrux::mlfg
-{
-bool CudaKernels::LaunchSoftmax(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const CudaParams& p, bool m4) const
-{
-    return m_dev.CudaLaunch(m4 ? m_softmaxM4 : m_softmax, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
-}
-}  // namespace nfrux::mlfg
-namespace nfrux::mlfg
-{
-bool CudaKernels::LaunchM4(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const CudaParams& p) const
-{
-    return m_dev.CudaLaunch(m_conv1m4, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 }  // namespace nfrux::mlfg
