@@ -146,7 +146,10 @@ std::unique_ptr<Network> Network::Create(Device& dev, uint32_t l0w, uint32_t l0h
         return nullptr;
     return n;
 }
-Network::~Network() = default;
+Network::~Network()
+{
+    if (!m_marker.empty() && m_frames) MarkerOk(m_marker);  // an orderly end after frames were made: as the int8 runtime's markers
+}
 
 std::string Network::Describe() const
 {
