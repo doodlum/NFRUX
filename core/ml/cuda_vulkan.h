@@ -18,7 +18,28 @@ inline uint32_t AddCudaExtension(VkPhysicalDevice pd, std::vector<const char*>& 
     for (auto& x : all) if (!strcmp(x.extensionName, VK_NVX_BINARY_IMPORT_EXTENSION_NAME)) return ext.push_back(VK_NVX_BINARY_IMPORT_EXTENSION_NAME), kFeatureCudaLaunch;
     return 0;
 }
-class CudaVulkanGraph
+// FP8 cooperative matrices (VK_EXT_shader_float8 with shaderFloat8CooperativeMatrix) are enabled on the device: the
+// coopmat tier's FP8 layers (core/mlfg).
+constexpr uint32_t kFeatureFloat8 = 1u << 29;
+// For hosts that make the device (tests): the extension added and f8 filled (to chain into the device's features) when
+// the GPU has FP8 cooperative matrices; kFeatureFloat8 or 0.
+inline uint32_t AddFloat8Extension(VkPhysicalDevice pd, std::vector<const char*>& ext, VkPhysicalDeviceShaderFloat8FeaturesEXT& f8)
+{
+    uint32_t n = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> all(n);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, all.data());
+    bool has = false;
+    for (auto& x : all) has = has || !strcmp(x.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    f8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+    if (!has) return 0;
+    VkPhysicalDeviceFeatures2 q = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f8};
+    vkGetPhysicalDeviceFeatures2(pd, &q);
+    f8.pNext = nullptr;
+    if (!f8.shaderFloat8 || !f8.shaderFloat8CooperativeMatrix) return f8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT}, 0;
+    ext.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+    return kFeatureFloat8;
+}class CudaVulkanGraph
 {
 public:
     static bool Supported(VkDevice device, PFN_vkGetDeviceProcAddr gdpa);

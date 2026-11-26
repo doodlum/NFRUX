@@ -87,6 +87,7 @@ struct Caps
     // Vulkan: 16 x 16 x 16 fp16 x fp16 -> fp32 cooperative matrices usable (with 16-bit storage and the memory model
     // enabled), and the subgroup size compute shaders get.
     bool        coopMatF16 = false;
+    bool        coopMatF8 = false;  // Vulkan: e4m3 16x16x32 -> fp32 cooperative matrices (VK_EXT_shader_float8 enabled)
     uint32_t    subgroupSize = 0;
     std::string Describe() const;
 };

@@ -250,6 +250,12 @@ for n, k in [("3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("2", ["-DMLFG_CONV_
         p = os.path.join(out, nm + ".spv")
         run([GLSLANG, "-V", "--target-env", "vulkan1.2", "-S", "comp", *k, f"-DMLFG_SG={sg}", "-o", p, os.path.join("shaders", "mlfg", "mlfg_conv_coopmat.comp")])
         mat.append((nm, open(p, "rb").read()))
+for nb in (3, 4):  # FP8 cooperative matrices (VK_EXT_shader_float8): the stage-2 FasterNet 1x1 layers, 48 / 96 and 64 / 128 outputs
+    for sg in (16, 32, 64):
+        nm = f"kMlfgMat8n{nb}_{sg}"
+        p = os.path.join(out, nm + ".spv")
+        run([GLSLANG, "-V", "--target-env", "vulkan1.3", "-S", "comp", f"-DMLFG_NB={nb}", f"-DMLFG_SG={sg}", "-o", p, os.path.join("shaders", "mlfg", "mlfg_conv_fp8.comp")])
+        mat.append((nm, open(p, "rb").read()))
 fns = []
 for c, pp in ((48, 16), (64, 32)):
     for sg in (16, 32, 64):

@@ -160,7 +160,7 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
+    return m_tier == Tier::CoopMat ? (m_mat8[0] ? "cooperative matrices fp16, FP8 for stage 2's 1x1 layers (Vulkan)" : "cooperative matrices fp16 (Vulkan)") : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
 }
 
 bool Network::SelectTier(std::string* error)
@@ -361,6 +361,31 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                     }
             for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
         }
+        // FP8 cooperative matrices (Caps.coopMatF8): the fp8 1x1 layers' weights again as e4m3 bytes [ciPad32][coPad64]
+        // (m_off8 in 16-byte units). Slower than fp16 on the RTX 4070 (these layers are bound by the fp16 tensors' traffic and
+        // the epilogue, not the matrix rate; the e4m3 staging adds work): off unless NFRUX_MLFG_FP8MAT=1.
+        std::fill(m_off8.begin(), m_off8.end(), ~0u);
+        if (m_dev.caps().coopMatF8 && EnvFlag("NFRUX_MLFG_FP8MAT", false))
+        {
+            for (uint32_t l = 0; l < kLayers; ++l)
+            {
+                const LayerWeights& L = m_weights.layers[l];
+                if (L.kind != 0 || L.k != 1 || !L.fp8) continue;
+                const uint32_t ciP = (L.cin + 31) & ~31u, coP = (L.cout + 63) & ~63u;
+                m_off8[l] = uint32_t(m_blob8.size() / 16);
+                m_blob8.resize(m_blob8.size() + size_t(ciP) * coP, 0);
+                for (uint32_t o = 0; o < L.cout; ++o)
+                    for (uint32_t i = 0; i < L.cin; ++i) m_blob8[size_t(m_off8[l]) * 16 + size_t(i) * coP + o] = m_weights.data[L.weights + size_t(o) * L.cin + i];
+            }
+            const uint32_t sg = m_dev.caps().subgroupSize;
+            m_gpuW8 = m_blob8.empty() ? nullptr : m_dev.CreateBuffer(m_blob8.size());
+            if (m_gpuW8)
+            {
+                m_mat8[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat8n3_16 : sg == 32 ? shaders::kMlfgMat8n3_32 : shaders::kMlfgMat8n3_64);
+                m_mat8[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat8n4_16 : sg == 32 ? shaders::kMlfgMat8n4_32 : shaders::kMlfgMat8n4_64);
+            }
+            if (!m_mat8[0] || !m_mat8[1]) m_mat8[0].reset(), m_mat8[1].reset(), Log("MLFG: the FP8 cooperative-matrix passes failed; fp16 for every layer");
+        }
         m_blob.resize(h.size() * 2), memcpy(m_blob.data(), h.data(), m_blob.size());
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
         m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
@@ -515,6 +540,14 @@ bool Network::Run(const Conv& c)
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
         const bool narrow = L.cout <= 16 && (L.kind == 1 || L.k == 3);  // one 16-channel tile a group
         if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
+        if (m_mat8[0] && m_off8[c.layer] != ~0u && vec8)  // FP8 cooperative matrices: e4m3 inputs and weights, fp32 sums
+        {
+            k.add[2] = int32_t(m_off8[c.layer]), k.x[1] = int32_t((L.cin + 31) & ~31u), k.x[2] = k.x[3] = 0;
+            const Bind b8[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuW8),
+                               Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
+            const uint32_t nb = L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : 4;
+            return m_mat8[nb == 4]->Dispatch(b8, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 16 * nb - 1) / (16 * nb));
+        }
         const bool h16 = c.layer < m_matAcc16.size() && m_matAcc16[c.layer];  // fp16 sums a chunk (shipped build)
         if (narrow) return (h16 ? m_matH[3] : m_matN1[0])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
         const uint32_t z = (L.cout + 63) / 64;
