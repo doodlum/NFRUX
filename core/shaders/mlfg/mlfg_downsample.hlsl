@@ -40,7 +40,7 @@ RWByteAddressBuffer u_dst : register(u2);
     const uint w = uint(c_src.x);
     const uint a = TexelBase(int2(x0, y0), w, 32u), b = TexelBase(int2(x1, y0), w, 32u);
     const uint c = TexelBase(int2(x0, y1), w, 32u), d = TexelBase(int2(x1, y1), w, 32u);
-    [loop] for (uint k = 0u; k < 18u; k += 2u)
+    [unroll] for (uint k = 0u; k < 18u; k += 2u)
     {
         const float2 ta = LoadHalf2(t_src, a + k), tb = LoadHalf2(t_src, b + k);
         const float2 tc = LoadHalf2(t_src, c + k), td = LoadHalf2(t_src, d + k);

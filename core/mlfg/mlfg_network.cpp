@@ -228,6 +228,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     auto fail = [&](const char* m) { if (error) *error = m; return false; };
     if (l0w % 32 || l0h % 32 || s2w % 4 || s2h % 4) return fail("network sizes");
     if (!SelectTier(error)) return false;
+    m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
     m_offset.resize(kLayers), m_biasOffset.resize(kLayers);
     if (m_tier == Tier::Cuda)
     {
@@ -329,22 +330,6 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j) made = made && (m_conv[i][j] = m_dev.CreatePass(*sh[i][j]));
     if (!made) return fail("network passes or weights buffer");
-    if (EnvFlag("NFRUX_TEST_TIMES", false))  // profiling: a pass of its own per layer, so the times say which
-    {
-        static std::vector<std::string> names(2 * kLayers);
-        static std::vector<Shader>      copies(2 * kLayers);
-        m_layerPasses.resize(kLayers), m_layerPassesBig.resize(kLayers);
-        for (uint32_t l = 0; l < kLayers; ++l)
-            for (int j = 0; j < 2; ++j)
-            {
-                const LayerWeights& L = m_weights.layers[l];
-                Shader& c = copies[2 * l + j];
-                c = *sh[L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2][j];
-                names[2 * l + j] = "layer " + std::to_string(l) + " " + c.name;
-                c.name = names[2 * l + j].c_str();
-                (j ? m_layerPasses : m_layerPassesBig)[l] = m_dev.CreatePass(c);
-            }
-    }
     }
     bool ok = true;
     auto tensor = [&](Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) {
@@ -374,6 +359,9 @@ bool Network::Prepare()
 bool Network::Run(const Conv& c)
 {
     const LayerWeights& L = m_weights.layers[c.layer];
+    char label[48] = "";
+    if (m_dev.Timing()) snprintf(label, sizeof(label), "L%03u %s%ux%u %u->%u", c.layer, L.kind ? "T" : "k", L.k, L.stride, L.cin, L.cout);
+    if (label[0] && m_tier != Tier::Cuda) m_dev.Label(label);  // CUDA launches mark themselves
     const uint32_t writeEnd = c.writeEnd ? c.writeEnd : (L.cout + 1) & ~1u;
     if (!c.src || !c.out || (writeEnd & 1) || (c.out.ch & 1) || c.out.ch + writeEnd > c.out.pitch) return false;
     const View& s1 = c.src1 ? c.src1 : c.src;
@@ -391,7 +379,9 @@ bool Network::Run(const Conv& c)
                         c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t((L.cin + 7) / 8), int32_t(ntp)};
         const int      shape = nb == 1 ? (L.kind == 1 ? 5 : 4) : L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
         const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, L.kind == 1 ? c.src.h : c.out.h, ntp / nb};
-        return m_cuda->Launch(list, shape, grid, p);
+        const bool ok = m_cuda->Launch(list, shape, grid, p);
+        if (label[0]) m_dev.Mark(label);
+        return ok;
     }
     if (m_tier == Tier::CoopMat)
     {
@@ -423,7 +413,6 @@ bool Network::Run(const Conv& c)
     const uint32_t zs = (std::max(L.cout, writeEnd) + 7) / 8, th = shape == 1 ? 8 : 16;
     const bool     small = uint64_t((c.out.w + 15) / 16) * ((c.out.h + th - 1) / th) * zs < 768;
     Pass*          p = m_conv[shape][small ? 1 : 0].get();
-    if (!m_layerPasses.empty() && m_layerPasses[c.layer]) p = small ? m_layerPasses[c.layer].get() : m_layerPassesBig[c.layer].get();
     const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                       Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf)};
     return small ? p->Dispatch(b, 6, (c.out.w + 3) / 4, (c.out.h + 3) / 4, zs) : p->Dispatch(b, 6, (c.out.w + 15) / 16, (c.out.h + th - 1) / th, zs);
@@ -483,6 +472,23 @@ bool Network::FlowBlock(uint32_t block, const View& in, const View& out13)
 bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, const View& y, const View& pc, const View& h, const View* skip, const View* upOut)
 {
     Conv c;
+    if (m_tier == Tier::Cuda && m_fused && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
+    {
+        // One kernel for pconv, expand and project: the same products, order and roundings as the three layers.
+        const Buffer* bufs[] = {x.buf, y.buf, m_gpuWeights.get(), m_gpuBias.get()};
+        void* list = m_dev.NativeAccess(bufs, 4);
+        if (!list) return false;
+        const uint64_t wa = m_dev.NativeAddress(*m_gpuWeights), ba = m_dev.NativeAddress(*m_gpuBias);
+        const FnParams p = {m_dev.NativeAddress(*x.buf), m_dev.NativeAddress(*y.buf), wa + uint64_t(m_offset[first]) * 4, wa + uint64_t(m_offset[first + 1]) * 4,
+                            wa + uint64_t(m_offset[first + 2]) * 4, ba + uint64_t(m_biasOffset[first]) * 4, ba + uint64_t(m_biasOffset[first + 1]) * 4,
+                            ba + uint64_t(m_biasOffset[first + 2]) * 4, int32_t(x.w), int32_t(x.h)};
+        const uint32_t grid[3] = {(x.w + 15) / 16, x.h, 1};
+        if (!m_cuda->LaunchFn(list, C, grid, p)) return false;
+        if (m_dev.Timing()) m_dev.Mark(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
+        if (!skip) return true;
+        c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
+        return Run(c);
+    }
     c.layer = first, c.src = x, c.out = pc, c.fp8 = true;
     if (!Run(c)) return false;
     c = {}, c.layer = first + 1, c.src = pc, c.src1 = x.At(P), c.split = P, c.out = h, c.act = Relu, c.fp8 = true;

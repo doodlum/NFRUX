@@ -98,7 +98,7 @@ private:
     std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4], m_matN1[2];
     std::unique_ptr<CudaKernels> m_cuda;
-    std::vector<std::unique_ptr<Pass>> m_layerPasses, m_layerPassesBig;  // NFRUX_TEST_TIMES
+    bool                    m_fused = true;  // fused FasterNet blocks (NFRUX_MLFG_UNFUSED=1: the layers one by one, tests)
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch
     Tensor                  m_t32, m_x48, m_y48, m_skip, m_pc16, m_h96, m_x64, m_y64, m_pc32, m_h128, m_u32;  // stage 2

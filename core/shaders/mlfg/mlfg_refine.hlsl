@@ -55,7 +55,7 @@ void Warp(int2 g, float2 f, uint colour, uint feat, out float o[9])
     const uint   w = uint(c_net.x);
     const uint   a = TexelBase(int2(x0, y0), w, 32u), b = TexelBase(int2(x1, y0), w, 32u);
     const uint   c = TexelBase(int2(x0, y1), w, 32u), d = TexelBase(int2(x1, y1), w, 32u);
-    [loop] for (uint k = 0u; k < 9u; ++k)
+    [unroll] for (uint k = 0u; k < 9u; ++k)
     {
         const uint ch = k < 3u ? colour + k : feat + (k - 3u);
         o[k] = Bilerp16(LoadHalf(t_net, a + ch), LoadHalf(t_net, b + ch), LoadHalf(t_net, c + ch), LoadHalf(t_net, d + ch), fr.x, fr.y);
@@ -70,7 +70,7 @@ void Stack(int2 g, out float st[32], out float4 flow)
     if (mode == 2)
     {
         const uint hb = TexelBase(g, uint(c_head.x), 16u);
-        [loop] for (uint k = 0u; k < 13u; ++k)
+        [unroll] for (uint k = 0u; k < 13u; ++k)
             hd[k] = LoadHalf(t_head, hb + k);
     }
     else
@@ -82,7 +82,7 @@ void Stack(int2 g, out float st[32], out float4 flow)
         const uint w = uint(c_head.x);
         const uint a = TexelBase(int2(x0, y0), w, 16u), b = TexelBase(int2(x1, y0), w, 16u);
         const uint c = TexelBase(int2(x0, y1), w, 16u), d = TexelBase(int2(x1, y1), w, 16u);
-        [loop] for (uint k = 0u; k < 13u; ++k)
+        [unroll] for (uint k = 0u; k < 13u; ++k)
             hd[k] = Bilerp16(LoadHalf(t_head, a + k), LoadHalf(t_head, b + k), LoadHalf(t_head, c + k), LoadHalf(t_head, d + k), fx, fy);
     }
     const float4 h4 = float4(hd[0], hd[1], hd[2], hd[3]);
@@ -155,15 +155,15 @@ void StoreFlow(int2 g, float4 f)
         float4     flow;
         Stack(g, t, flow);
         StoreFlow(g, flow);
-        [loop] for (uint k = 0u; k < 32u; ++k)
+        [unroll] for (uint k = 0u; k < 32u; ++k)
             s[k] = q == 0 ? t[k] : F16Round(s[k] + t[k]);
     }
     if (down)
     {
-        [loop] for (uint k = 0u; k < 32u; ++k)
+        [unroll] for (uint k = 0u; k < 32u; ++k)
             s[k] = F16Round(k >= 28u ? (s[k] * 0.25) * 0.5 : s[k] * 0.25);  // AMD's / 4 and / 2: exact either way
         s[18] = F16Round(c_params.z);  // AMD overwrites the averaged constant with 0.5: the timestep t
     }
-    [loop] for (uint k = 0u; k < 32u; k += 2u)
+    [unroll] for (uint k = 0u; k < 32u; k += 2u)
         StoreHalf2(u_stack, ob + k, s[k], s[k + 1u]);
 }

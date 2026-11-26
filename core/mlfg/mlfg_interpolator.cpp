@@ -27,6 +27,8 @@ namespace
 using Tex     = std::unique_ptr<Texture>;
 using PassPtr = std::unique_ptr<Pass>;
 uint32_t G(uint32_t n) { return (n + 7) / 8; }
+// A float's bits in an int constant (the passes' uniform quotients, correctly rounded here: IEEE division).
+int32_t Bits(float f) { int32_t i; memcpy(&i, &f, 4); return i; }
 
 // Column-major 4x4 (m[col * 4 + row]), as the NFRU interpolator's; inverse in double.
 bool Inverse(const float m[16], float out[16])
@@ -260,7 +262,8 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
         if (!Splat(*fwd, d0, t, -1.0f, *key0, *word0) || !Splat(mv1, d1, 1.0f - t, 1.0f, *key1, *word1)) return false;
         {
             mlfg::Stage2InputConstants k = {{int32_t(sz.s2w), int32_t(sz.s2h), int32_t(sz.s2w), int32_t(sz.s2h)}, {int32_t(sz.W), int32_t(sz.H), int32_t(sz.livew), int32_t(sz.liveh)},
-                                            {int32_t(sz.prew), int32_t(sz.preh), 0, 0}, {0, 0, 1, 1}, {0, 0, 0, 0}};
+                                            {int32_t(sz.prew), int32_t(sz.preh), 0, Bits(0.5f * (float(sz.prew) / float(sz.s2w)))}, {0, 0, 1, 1},
+                                            {0, 0, 1.0f / float(sz.s2w), 1.0f / float(sz.s2h)}};
             const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Tex(1, prev), Bind::Tex(2, color), Bind::Tex(3, *img0), Bind::Tex(4, *img1), Bind::Tex(5, *key0),
                               Bind::Tex(6, *word0), Bind::Tex(7, *key1), Bind::Tex(8, *word1), Bind::Buf(9, *s2in.buf)};
             if (!s2input->Dispatch(b, 10, G(sz.s2w), G(sz.s2h))) return false;
@@ -274,7 +277,7 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
         const Texture& out = finishing ? *gen : *outs[i];
         {
             mlfg::CompositeConstants k = {{int32_t(sz.W), int32_t(sz.H), int32_t(sz.livew), int32_t(sz.liveh)}, {int32_t(sz.prew), int32_t(sz.preh), int32_t(sz.s2w), 0},
-                                          {int32_t(sz.s2w), int32_t(sz.s2h), 0, 0}, {0, 0, 0, 0}, {0, 0, 1, 1}, {0, 0, t, 0}, {0, 0, 0, 0}};
+                                          {int32_t(sz.s2w), int32_t(sz.s2h), 0, 0}, {0, 0, 0, Bits(0.5f * (float(sz.prew) / float(sz.W)))}, {0, 0, 1, 1}, {0, 0, t, 1.0f / float(sz.W)}, {0, 0, 0, 1.0f / float(sz.H)}};
             const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *weights.buf), Bind::Tex(2, prev), Bind::Tex(3, color), Bind::Tex(4, *img0), Bind::Tex(5, *img1),
                               Bind::Tex(6, *key0), Bind::Tex(7, *word0), Bind::Tex(8, *key1), Bind::Tex(9, *word1), Bind::Tex(10, color), Bind::Tex(11, out)};
             if (!composite->Dispatch(b, 12, G(sz.W), G(sz.H))) return false;

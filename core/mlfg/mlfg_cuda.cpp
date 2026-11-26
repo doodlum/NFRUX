@@ -145,6 +145,101 @@ std::string Kernel(int shape, bool narrow)
     w("ret;");
     return w.s + "}\n";
 }
+// fp32 %f<v> -> its fp8 e4m3 value (torch's rounding; scratch f186-f190, r67-r71, r74, p26-p27).
+void Fp8(Ptx& w, int v)
+{
+    w("mov.b32 %%r67, %%f%d; and.b32 %%r68, %%r67, 0x7FFFFFFF; shr.u32 %%r69, %%r68, 23; max.u32 %%r69, %%r69, 121;", v);
+    w("mov.u32 %%r74, 257; sub.u32 %%r70, %%r74, %%r69; shl.b32 %%r70, %%r70, 23; mov.b32 %%f187, %%r70; sub.u32 %%r71, %%r69, 3; shl.b32 %%r71, %%r71, 23; mov.b32 %%f188, %%r71;");
+    w("mul.rn.f32 %%f189, %%f%d, %%f187; cvt.rni.f32.f32 %%f189, %%f189; mul.rn.f32 %%f189, %%f189, %%f188;", v);
+    w("abs.f32 %%f190, %%f189; setp.gt.f32 %%p26, %%f190, 0f43E00000; setp.ge.u32 %%p27, %%r68, 0x7F800000; or.pred %%p26, %%p26, %%p27;");
+    w("selp.f32 %%f%d, 0f7FC00000, %%f189, %%p26;", v);
+}
+
+// A whole FasterNet block of stage 2 in one warp: 16 pixels of a row, y = q8(project(q8(relu(expand(cat(q8(pconv(x[:P])),
+// x[P:]))))) + x). An mma's accumulator fragment (rows g, g + 8; columns 2q, 2q + 1 of an n tile) is exactly the A
+// fragment of the next product's k chunk, so each step's rounded result stays in registers. The same products in the
+// same order as the three separate layers: the same bits. ntp*: the layers' padded n tiles (the weights' layout).
+std::string FnKernel(int C, int P, int ntpP, int ntpE, int ntpJ)
+{
+    const int KP = P / 8, KE = C / 8, NE = 2 * C / 8, NJ = C / 8;
+    Ptx w;
+    w.s = ".visible .entry fn" + std::to_string(C) + "(.param .align 8 .b8 P[72])\n{\n";
+    w(".reg .b32 %%r<200>; .reg .b64 %%rd<80>; .reg .f32 %%f<200>; .reg .pred %%p<60>; .reg .b16 %%h<8>;");
+    for (int i = 0; i < 8; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // x y wp we wj bp be bj
+    w("ld.param.u32 %%r1, [P+64]; ld.param.u32 %%r2, [P+68];");                      // W H
+    w("mov.u32 %%r21, %%tid.x; and.b32 %%r21, %%r21, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3;");
+    w("mov.u32 %%r24, %%ctaid.x; shl.b32 %%r24, %%r24, 4; mov.u32 %%r25, %%ctaid.y; add.u32 %%r27, %%r24, %%r22; add.u32 %%r28, %%r27, 8;");
+    w("mul.wide.u32 %%rd9, %%r21, 4; mul.wide.u32 %%rd20, %%r23, 4; mul.wide.u32 %%rd21, %%r23, 8;");  // lane*4, q*4 (channel pair bytes), q*8
+    for (int t = 0; t < 9; ++t)  // tap t's pixel of rows a / b: predicate p(10 + 2t + r), channel-0 address rd(30 + 2t + r)
+    {
+        w("add.s32 %%r30, %%r25, %d; setp.ge.s32 %%p5, %%r30, 0; setp.lt.s32 %%p6, %%r30, %%r2; and.pred %%p5, %%p5, %%p6;", t / 3 - 1);
+        for (int r = 0; r < 2; ++r)
+        {
+            const int pr = 10 + t * 2 + r;
+            w("add.s32 %%r31, %%r%d, %d; setp.ge.s32 %%p6, %%r31, 0; setp.lt.s32 %%p7, %%r31, %%r1; and.pred %%p6, %%p6, %%p7; and.pred %%p%d, %%p5, %%p6;", r ? 28 : 27, t % 3 - 1, pr);
+            w("mad.lo.s32 %%r32, %%r30, %%r1, %%r31; selp.b32 %%r32, %%r32, 0, %%p%d; mul.lo.s32 %%r32, %%r32, %d; mul.wide.s32 %%rd10, %%r32, 2; add.s64 %%rd%d, %%rd1, %%rd10;", pr, C,
+              30 + t * 2 + r);
+            w("add.s64 %%rd%d, %%rd%d, %%rd20;", 30 + t * 2 + r, 30 + t * 2 + r);  // + this lane's channel pair
+        }
+    }
+    // Loads two channels (word-aligned) of row r at tap t into %r<dst>, 0 outside.
+    auto loadA = [&](int t, int r, int chunk, int dst) {
+        w("mov.u32 %%r%d, 0; @%%p%d ld.global.u32 %%r%d, [%%rd%d+%d];", dst, 10 + t * 2 + r, dst, 30 + t * 2 + r, chunk * 16);
+    };
+    auto mma = [&](int f, int a0, int a1) {
+        w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r52}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, a0, a1, f, f + 1, f + 2, f + 3);
+    };
+    auto bload = [&](int wreg, int kc, int t, int taps, int ntp, int nt) {
+        w("add.s64 %%rd11, %%rd%d, %%rd9; ld.global.u32 %%r52, [%%rd11+%d];", wreg, (((kc * taps + t) * ntp + nt) * 32) * 4);
+    };
+    // Epilogue of n tile n (accumulators f..f+3) into packed fp16 words r<dst> (row a), r<dst+1> (row b).
+    auto finish = [&](int f, int breg, int n, bool relu, bool residual, int dst) {
+        w("add.s64 %%rd12, %%rd%d, %%rd21; ld.global.f32 %%f180, [%%rd12+%d]; ld.global.f32 %%f181, [%%rd12+%d];", breg, n * 32, n * 32 + 4);
+        for (int r = 0; r < 2; ++r)
+        {
+            w("add.rn.f32 %%f182, %%f%d, %%f180; add.rn.f32 %%f183, %%f%d, %%f181;", f + 2 * r, f + 2 * r + 1);
+            if (residual)
+            {
+                loadA(4, r, n, 58);
+                w("mov.b32 {%%h3, %%h4}, %%r58; cvt.f32.f16 %%f184, %%h3; cvt.f32.f16 %%f185, %%h4; add.rn.f32 %%f182, %%f182, %%f184; add.rn.f32 %%f183, %%f183, %%f185;");
+            }
+            if (relu) w("max.f32 %%f182, %%f182, 0f00000000; max.f32 %%f183, %%f183, 0f00000000;");
+            Fp8(w, 182), Fp8(w, 183);
+            w("cvt.rn.f16.f32 %%h5, %%f182; cvt.rn.f16.f32 %%h6, %%f183; mov.b32 %%r%d, {%%h5, %%h6};", dst + r);
+        }
+    };
+    // pconv 3x3 P -> P on x[:P]: accumulators f0 .. f(4 KP - 1); results -> pA r100 + 2j (+1).
+    for (int i = 0; i < KP * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int kc = 0; kc < KP; ++kc)
+        for (int t = 0; t < 9; ++t)
+        {
+            loadA(t, 0, kc, 50), loadA(t, 1, kc, 51);
+            for (int n = 0; n < KP; ++n) bload(3, kc, t, 9, ntpP, n), mma(n * 4, 50, 51);
+        }
+    for (int n = 0; n < KP; ++n) finish(n * 4, 6, n, false, false, 100 + 2 * n);
+    // expand 1x1 C -> 2C on cat(pA, x[P:]), relu: accumulators f0 .. f(4 NE - 1); results -> hA r120 + 2j (+1).
+    for (int i = 0; i < NE * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int kc = 0; kc < KE; ++kc)
+    {
+        int a0 = 100 + 2 * kc, a1 = a0 + 1;
+        if (kc >= KP) loadA(4, 0, kc, 50), loadA(4, 1, kc, 51), a0 = 50, a1 = 51;
+        for (int n = 0; n < NE; ++n) bload(4, kc, 0, 1, ntpE, n), mma(n * 4, a0, a1);
+    }
+    for (int n = 0; n < NE; ++n) finish(n * 4, 7, n, true, false, 120 + 2 * n);
+    // project 1x1 2C -> C, + x: accumulators f0 .. f(4 NJ - 1); stored.
+    for (int i = 0; i < NJ * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int kc = 0; kc < NE; ++kc)
+        for (int n = 0; n < NJ; ++n) bload(5, kc, 0, 1, ntpJ, n), mma(n * 4, 120 + 2 * kc, 121 + 2 * kc);
+    // Output addresses: y at the centre pixel of rows a / b (rd 30 + 8, 31 + 8 relative to x), stored where in range.
+    w("sub.s64 %%rd13, %%rd2, %%rd1; add.s64 %%rd14, %%rd38, %%rd13; add.s64 %%rd15, %%rd39, %%rd13;");
+    for (int n = 0; n < NJ; ++n)
+    {
+        finish(n * 4, 8, n, false, true, 160 + 2 * n);
+        w("@%%p18 st.global.u32 [%%rd14+%d], %%r%d; @%%p19 st.global.u32 [%%rd15+%d], %%r%d;", n * 16, 160 + 2 * n, n * 16, 161 + 2 * n);
+    }
+    w("ret;");
+    return w.s + "}\n";
+}
 }  // namespace
 
 std::string CudaPtx()
@@ -152,6 +247,7 @@ std::string CudaPtx()
     std::string p = ".version 7.0\n.target sm_75\n.address_size 64\n";
     for (int s = 0; s < 4; ++s) p += Kernel(s, false);
     p += Kernel(0, true), p += Kernel(3, true);
+    p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 8, 16, 8);
     return p;
 }
 
@@ -166,12 +262,17 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
     std::unique_ptr<CudaKernels> k(new CudaKernels());
     k->m_device = d3d;
     if (!(k->m_module = cuda::CreateModule(d3d, cubin))) return fail("CreateCuModule");
-    static const char* names[6] = {"conv3", "conv2", "conv1", "convT", "conv3n", "convTn"};
-    for (int i = 0; i < 6; ++i)
+    static const char* names[8] = {"conv3", "conv2", "conv1", "convT", "conv3n", "convTn", "fn48", "fn64"};
+    for (int i = 0; i < 8; ++i)
         if (!(k->m_fn[i] = cuda::CreateFunction(d3d, k->m_module, names[i]))) return fail("CreateCuFunction");
     return k;
 }
-CudaKernels::~CudaKernels() { cuda::Destroy(m_device, m_module, {m_fn[0], m_fn[1], m_fn[2], m_fn[3], m_fn[4], m_fn[5]}); }
+CudaKernels::~CudaKernels() { cuda::Destroy(m_device, m_module, std::vector<void*>(m_fn, m_fn + 8)); }
+
+bool CudaKernels::LaunchFn(void* list, uint32_t C, const uint32_t grid[3], const FnParams& p) const
+{
+    return cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), m_fn[C == 48 ? 6 : 7], grid, 32, &p, sizeof(p));
+}
 
 bool CudaKernels::Launch(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const
 {

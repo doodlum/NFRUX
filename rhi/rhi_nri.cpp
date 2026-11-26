@@ -1007,6 +1007,24 @@ public:
     uint32_t        markValue[kSlots] = {};
     std::map<std::string, std::vector<float>> times;
     uint32_t        timedFrames = 0;
+    std::string label;  // the next dispatch's name in the times (profiling)
+    void Label(const char* l) override { if (timed) label = l; }
+    bool Timing() const override { return timed; }
+    // A wrapped D3D12 device has no queue of NRI's to ask: a compute queue of its own, once.
+    double TimestampHz()
+    {
+        static double hz = 0;
+        if (hz == 0) hz = double(n.GetDeviceDesc(*dev).other.timestampFrequencyHz);
+        if (hz == 0 && d3d)
+        {
+            ID3D12CommandQueue* q = nullptr;
+            D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COMPUTE};
+            uint64_t f = 0;
+            if (SUCCEEDED(d3d->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&q)))) q->GetTimestampFrequency(&f), q->Release();
+            hz = double(f);
+        }
+        return hz;
+    }
     void Mark(const char* label) override
     {
         if (!timed || markCount >= kMarks) return;
@@ -1023,7 +1041,7 @@ public:
                 if (auto* v = static_cast<const uint64_t*>(n.MapBuffer(*markBack, 0, nri::WHOLE_SIZE)))
                 {
                     const uint64_t* q = v + size_t(slot) * kMarks;
-                    const double hz = double(n.GetDeviceDesc(*dev).other.timestampFrequencyHz), ms = hz > 0 ? 1000.0 / hz : 0;  // (a wrapped D3D12 device has no queue to ask: 0)
+                    const double hz = TimestampHz(), ms = hz > 0 ? 1000.0 / hz : 0;
                     if (markNames[slot].size() > 8 && ++timedFrames > 60)
                         for (size_t i = 1; i < markNames[slot].size(); ++i) times[markNames[slot][i]].push_back(float(double(q[i] - q[i - 1]) * ms));
                     n.UnmapBuffer(*markBack);
@@ -1099,7 +1117,7 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
     d.n.CmdSetDescriptorSet(*d.cmd, sd);
     if (d.timed && !d.markCount) d.Mark("begin");
     d.n.CmdDispatch(*d.cmd, {gx, gy, gz});
-    if (d.timed) d.Mark(name.c_str());
+    if (d.timed) d.Mark(d.label.empty() ? name.c_str() : d.label.c_str()), d.label.clear();
     return true;
 }
 }  // namespace

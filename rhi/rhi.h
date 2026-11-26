@@ -143,6 +143,8 @@ public:
     virtual void ReadBack(const Texture& t, std::shared_ptr<std::vector<uint8_t>> out) = 0;
     virtual void ReadBack(const Buffer& b, std::shared_ptr<std::vector<uint8_t>> out) = 0;  // all of it, the same way
     virtual void Mark(const char* label) = 0;  // profiling
+    virtual void Label(const char*) {}         // profiling: the next pass's name in the times
+    virtual bool Timing() const { return false; }
     // GPU time (microseconds) per label of the last profiled frame, when profiling is on.
     virtual std::vector<std::pair<std::string, float>> Profile() { return {}; }
     virtual bool WaitIdle() = 0;  // before destroying what the GPU may still use; false: still busy after 2 s

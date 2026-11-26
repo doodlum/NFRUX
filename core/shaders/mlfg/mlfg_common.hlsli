@@ -69,12 +69,29 @@ float F16ToF32(uint h)
     return asfloat(s | ((e + 112u) << 23) | (m << 13));
 }
 
-float  F16Round(float x) { return F16ToF32(F32ToF16(x)); }
+// The same results faster: where the result is an fp16 normal ([2^-14, 65520) in magnitude, so no overflow and no
+// subnormal), round to nearest even on 10 mantissa bits in the fp32 encoding itself (a carry moves into the exponent, as
+// it should); elsewhere the full conversion.
+float F16Round(float x)
+{
+    const uint u = asuint(x), a = u & 0x7FFFFFFFu;
+    if (a >= 0x38800000u && a < 0x477FF000u)
+        return asfloat((u + 0xFFFu + ((u >> 13) & 1u)) & 0xFFFFE000u);
+    return F16ToF32(F32ToF16(x));
+}
 float2 F16Round(float2 x) { return float2(F16Round(x.x), F16Round(x.y)); }
 float3 F16Round(float3 x) { return float3(F16Round(x.x), F16Round(x.y), F16Round(x.z)); }
 float4 F16Round(float4 x) { return float4(F16Round(x.x), F16Round(x.y), F16Round(x.z), F16Round(x.w)); }
 
-uint   PackF16x2(float lo, float hi) { return F32ToF16(lo) | (F32ToF16(hi) << 16); }
+// fp32 -> fp16 bits, F32ToF16's results, with F16Round's fast path for fp16 normals.
+uint F32ToF16Fast(float x)
+{
+    const uint u = asuint(x), a = u & 0x7FFFFFFFu;
+    if (a >= 0x38800000u && a < 0x477FF000u)
+        return ((u >> 16) & 0x8000u) | ((((a + 0xFFFu + ((a >> 13) & 1u)) & 0x7FFFE000u) - 0x38000000u) >> 13);
+    return F32ToF16(x);
+}
+uint   PackF16x2(float lo, float hi) { return F32ToF16Fast(lo) | (F32ToF16Fast(hi) << 16); }
 float2 UnpackF16x2(uint w) { return float2(F16ToF32(w & 0xFFFFu), F16ToF32(w >> 16)); }
 
 // ------------------------------------------------------------------------------------------------ exact division
