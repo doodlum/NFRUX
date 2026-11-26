@@ -20,7 +20,7 @@ struct CudaPlan
     {
         uint64_t weights = 0, params = 0;
         int32_t  src[2] = {}, dst = 0;  // internal tensor; -1 the input; -(2 + i) output i
-        uint32_t grid[2] = {};
+        uint32_t grid[3] = {1, 1, 1};
         bool     external = false;
     };
     std::vector<uint8_t>  cubin, constants;

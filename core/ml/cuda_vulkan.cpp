@@ -123,7 +123,7 @@ void CudaVulkanGraph::Record(VkCommandBuffer cmd, CudaVulkanGraph* const* graphs
             auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t].address : t == -1 ? inputs[i] : outputs[i][-2 - t]; };
             const uint64_t a[5] = {va(l.src[0]), va(l.src[1]), g.m_constants.address + l.weights, g.m_constants.address + l.params, va(l.dst)};
             const void*    p[6] = {&a[0], &a[1], &a[2], &a[3], &a[4], &pitch};
-            VkCuLaunchInfoNVX k = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX, nullptr, g.m_functions[li], l.grid[0], l.grid[1], 1, 128, 1, 1, 0, 6, p, 0, nullptr};
+            VkCuLaunchInfoNVX k = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX, nullptr, g.m_functions[li], l.grid[0], l.grid[1], l.grid[2], 128, 1, 1, 0, 6, p, 0, nullptr};
             f.launch(cmd, &k);
         }
         if (l.dst >= 0) dirty[l.dst] = true;

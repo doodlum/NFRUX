@@ -183,7 +183,7 @@ void NearestPtx(Writer& w, const char* dst, const char* v, int n, int d, int off
 }
 }  // namespace
 
-static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const ffx_ml::LoweredGraph& g, bool external)
+static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const ffx_ml::LoweredGraph& g, bool external, int cols, int ns)
 {
     const auto& c  = *fc.conv;
     const auto& r  = *fc.rescale;
@@ -196,28 +196,29 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
     char   h[256];
     snprintf(h, sizeof(h), ".visible .entry layer%u(.param .u64 p0, .param .u64 p1, .param .u64 p2, .param .u64 p3, .param .u64 p4, .param .u32 p5)\n{\n", index);
     std::string head = h;
-    w(".reg .u64 %%a<64>; .reg .u32 %%r<64>; .reg .s32 %%t<8>; .reg .s32 %%x<32>; .reg .s32 %%acc<32>; .reg .u32 %%f<8>; .reg .pred %%p<32>; .reg .pred %%pt; .reg .s64 %%l<16>; .reg .s32 %%q<32>;");
+    w(".reg .u64 %%a<64>; .reg .u32 %%r<64>; .reg .s32 %%t<8>; .reg .s32 %%x<32>; .reg .s32 %%acc<64>; .reg .u32 %%f<8>; .reg .pred %%p<32>; .reg .pred %%pi<32>; .reg .pred %%pv<4>; .reg .pred %%po<4>; .reg .u64 %%ah<4>; .reg .u64 %%aj<4>; .reg .u64 %%ak<4>; .reg .u64 %%ao<4>; .reg .u32 %%fi<4>; .reg .s32 %%xo<4>; .reg .pred %%pt; .reg .s64 %%l<16>; .reg .s32 %%q<32>;");
     w("ld.param.u64 %%a1, [p0]; ld.param.u64 %%a2, [p1]; ld.param.u64 %%a3, [p2]; ld.param.u64 %%a4, [p3]; ld.param.u64 %%a5, [p4]; ld.param.u32 %%r50, [p5];");
-    w("mov.u32 %%r1, %%tid.x; mov.u32 %%r2, %%ctaid.x; mov.u32 %%r3, %%ctaid.y;");
-    w("shr.u32 %%r4, %%r1, 5; mad.lo.u32 %%r5, %%r2, 4, %%r4; shl.b32 %%r5, %%r5, 4;");         // first output column of this warp
+    w("mov.u32 %%r1, %%tid.x; mov.u32 %%r2, %%ctaid.x; mov.u32 %%r3, %%ctaid.y; mov.u32 %%r40, %%ctaid.z;");
+    w("shr.u32 %%r4, %%r1, 5; mad.lo.u32 %%r5, %%r2, 4, %%r4; mul.lo.u32 %%r5, %%r5, %d;", cols * 8);         // first output column of this warp
     w("setp.ge.u32 %%p1, %%r5, %d; setp.ge.u32 %%p2, %%r3, %d; or.pred %%p1, %%p1, %%p2;", fc.outW, fc.outH);
     w("@%%p1 ret;");
     w("and.b32 %%r6, %%r1, 31; shr.u32 %%r7, %%r6, 2; and.b32 %%r8, %%r6, 3;");                   // fragment row and column
-    w("add.s32 %%x1, %%r5, %%r7; add.s32 %%x2, %%x1, 8;");                                        // this lane's two output columns
+    for (int j = 0; j < cols; ++j) w("add.s32 %%xo%d, %%r5, %%r7; add.s32 %%xo%d, %%xo%d, %d;", j, j, j, j * 8);  // this lane's output columns
     w("mov.u32 %%f6, 0x%08x;", uint32_t(c.inputZp & 0xff) * 0x01010101u);
-    for (int i = 0; i < nt * 4; ++i) w("mov.s32 %%acc%d, 0;", i);
+    for (int i = 0; i < ns * cols * 2; ++i) w("mov.s32 %%acc%d, 0;", i);
     w("cvt.u64.u32 %%a8, %%r8; shl.b64 %%a8, %%a8, 2;");                                          // fragment column in bytes
     w("cvt.u64.u32 %%a9, %%r7; shl.b64 %%a9, %%a9, 4; add.u64 %%a9, %%a9, %%a8; add.u64 %%a9, %%a3, %%a9;");  // weights: n (row) * 16 + column bytes
+    w("mul.wide.u32 %%a40, %%r40, %u; add.u64 %%a9, %%a9, %%a40;", uint32_t(ns * k * k * chunks * 128));  // this warp's channel tiles
     if (icw % 4) w("setp.ge.u32 %%p9, %%r8, %d; min.u32 %%r9, %%r8, %d; cvt.u64.u32 %%a10, %%r9; shl.b64 %%a10, %%a10, 2;", icw % 4, icw % 4 - 1);
     // Input columns: both output columns, for every kx (the taps of a row share them).
     for (int kx = 0; kx < k; ++kx)
-        for (int j = 0; j < 2; ++j)
+        for (int j = 0; j < cols; ++j)
         {
-            w("mad.lo.s32 %%x3, %%x%d, %d, %d;", 1 + j, stride, kx - c.pad[2]);
-            w("setp.ge.s32 %%p3, %%x3, 0; setp.lt.s32 %%p4, %%x3, %d; and.pred %%p%d, %%p3, %%p4;", fc.inW, 10 + kx * 2 + j);
+            w("mad.lo.s32 %%x3, %%xo%d, %d, %d;", j, stride, kx - c.pad[2]);
+            w("setp.ge.s32 %%p3, %%x3, 0; setp.lt.s32 %%p4, %%x3, %d; and.pred %%pi%d, %%p3, %%p4;", fc.inW, kx * cols + j);
             w("max.s32 %%x3, %%x3, 0; min.s32 %%x3, %%x3, %d;", fc.inW - 1);
             if (s0.resize) { NearestPtx(w, "%x4", "%x3", s0.scale[2], s0.scale[3], s0.offset[1], t0.w); w("mov.s32 %%x3, %%x4;"); }
-            w("mov.s32 %%q%d, %%x3;", kx * 2 + j);
+            w("mov.s32 %%q%d, %%x3;", kx * cols + j);
         }
     for (int ky = 0; ky < k; ++ky)
     {
@@ -228,32 +229,32 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
         w("mul.lo.s32 %%x6, %%x5, %d;", t0.w);
         for (int kx = 0; kx < k; ++kx)
         {
-            for (int j = 0; j < 2; ++j)
+            for (int j = 0; j < cols; ++j)
             {
-                w("add.s32 %%x7, %%x6, %%q%d;", kx * 2 + j);
-                w("cvt.u64.s32 %%a%d, %%x7; mul.lo.u64 %%a%d, %%a%d, %d; add.u64 %%a%d, %%a1, %%a%d;", 12 + j, 14 + j, 12 + j, ic0 * 4, 14 + j, 14 + j);
-                if (ic1) w("mul.lo.u64 %%a%d, %%a%d, %d; add.u64 %%a%d, %%a2, %%a%d;", 16 + j, 12 + j, ic1 * 4, 16 + j, 16 + j);
-                w("and.pred %%p%d, %%p5, %%p%d;", 6 + j, 10 + kx * 2 + j);
+                w("add.s32 %%x7, %%x6, %%q%d;", kx * cols + j);
+                w("cvt.u64.s32 %%ah%d, %%x7; mul.lo.u64 %%aj%d, %%ah%d, %d; add.u64 %%aj%d, %%a1, %%aj%d;", j, j, j, ic0 * 4, j, j);
+                if (ic1) w("mul.lo.u64 %%ak%d, %%ah%d, %d; add.u64 %%ak%d, %%a2, %%ak%d;", j, j, ic1 * 4, j, j);
+                w("and.pred %%pv%d, %%p5, %%pi%d;", j, kx * cols + j);
             }
             for (int ch = 0; ch < chunks; ++ch)
             {
                 const bool one = ch * 4 < ic0;
                 const int  base = (one ? ch * 4 : ch * 4 - ic0) * 4;
                 const bool part = icw % 4 && ch == chunks - 1;  // the last chunk is not four whole words
-                for (int j = 0; j < 2; ++j)
+                for (int j = 0; j < cols; ++j)
                 {
-                    w("add.u64 %%a20, %%a%d, %%a%d; ld.global.u32 %%f%d, [%%a20 + %d];", (one ? 14 : 16) + j, part ? 10 : 8, j, base);
-                    w("selp.b32 %%f%d, %%f%d, %%f6, %%p%d;", j, j, 6 + j);
-                    if (part) w("selp.b32 %%f%d, 0, %%f%d, %%p9;", j, j);
+                    w("add.u64 %%a20, %%%s%d, %%a%d; ld.global.u32 %%fi%d, [%%a20 + %d];", one ? "aj" : "ak", j, part ? 10 : 8, j, base);
+                    w("selp.b32 %%fi%d, %%fi%d, %%f6, %%pv%d;", j, j, j);
+                    if (part) w("selp.b32 %%fi%d, 0, %%fi%d, %%p9;", j, j);
                 }
-                for (int n = 0; n < nt; ++n)
+                for (int n = 0; n < ns; ++n)
                 {
                     const uint32_t off = uint32_t(((n * k * k + ky * k + kx) * chunks + ch) * 128);
                     w("ld.global.u32 %%f2, [%%a9 + %u];", off);
                     // Two 8 x 8 x 16 products (tensor cores from sm_75, RTX 20): as fast here as sm_80's 16 x 8 x 16.
-                    for (int half = 0; half < 2; ++half)
-                        w("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d}, {%%f%d}, {%%f2}, {%%acc%d, %%acc%d};", n * 4 + half * 2, n * 4 + half * 2 + 1, half,
-                          n * 4 + half * 2, n * 4 + half * 2 + 1);
+                    for (int j = 0; j < cols; ++j)
+                        w("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d}, {%%fi%d}, {%%f2}, {%%acc%d, %%acc%d};", (n * cols + j) * 2, (n * cols + j) * 2 + 1, j,
+                          (n * cols + j) * 2, (n * cols + j) * 2 + 1);
                 }
             }
         }
@@ -261,13 +262,13 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
     // Each lane: channels 8 n + 2 col and + 1, of both columns.
     if (external) w("cvt.u64.u32 %%a30, %%r3; cvt.u64.u32 %%a31, %%r50; mul.lo.u64 %%a30, %%a30, %%a31; add.u64 %%a30, %%a5, %%a30;");
     else w("cvt.u64.u32 %%a30, %%r3; mul.lo.u64 %%a30, %%a30, %d; add.u64 %%a30, %%a5, %%a30;", fc.outW * outStride);
-    for (int j = 0; j < 2; ++j)
+    for (int j = 0; j < cols; ++j)
     {
-        w("setp.lt.s32 %%p%d, %%x%d, %d;", 26 + j, 1 + j, fc.outW);
-        w("cvt.u64.s32 %%a%d, %%x%d; mul.lo.u64 %%a%d, %%a%d, %d; add.u64 %%a%d, %%a30, %%a%d;", 32 + j, 1 + j, 32 + j, 32 + j, outStride, 32 + j, 32 + j);
+        w("setp.lt.s32 %%po%d, %%xo%d, %d;", j, j, fc.outW);
+        w("cvt.u64.s32 %%ao%d, %%xo%d; mul.lo.u64 %%ao%d, %%ao%d, %d; add.u64 %%ao%d, %%a30, %%ao%d;", j, j, j, j, outStride, j, j);
     }
-    w("shl.b32 %%r10, %%r8, 1; cvt.u64.u32 %%a34, %%r10;");
-    for (int n = 0; n < nt; ++n)
+    w("shl.b32 %%r10, %%r8, 1; mad.lo.u32 %%r10, %%r40, %d, %%r10; cvt.u64.u32 %%a34, %%r10;", ns * 8);
+    for (int n = 0; n < ns; ++n)
         for (int e = 0; e < 2; ++e)
         {
             const int ch = n * 8 + e;
@@ -277,12 +278,12 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
             if (r.perChannel) w("ld.global.s32 %%x11, [%%a36 + %d]; ld.global.u32 %%r13, [%%a36 + %d];", ocPad * 4, ocPad * 8);
             else w("ld.global.s32 %%x11, [%%a4 + %d]; ld.global.u32 %%r13, [%%a4 + %d];", ocPad * 4, ocPad * 8);
             w("sub.u32 %%r14, %%r13, 1; mov.s64 %%l1, 1; shl.b64 %%l1, %%l1, %%r14;");
-            for (int j = 0; j < 2; ++j)
+            for (int j = 0; j < cols; ++j)
             {
-                w("add.s32 %%x12, %%acc%d, %%x10; mul.wide.s32 %%l2, %%x12, %%x11; add.s64 %%l2, %%l2, %%l1; shr.s64 %%l2, %%l2, %%r13; cvt.s32.s64 %%x13, %%l2;", n * 4 + j * 2 + e);
+                w("add.s32 %%x12, %%acc%d, %%x10; mul.wide.s32 %%l2, %%x12, %%x11; add.s64 %%l2, %%l2, %%l1; shr.s64 %%l2, %%l2, %%r13; cvt.s32.s64 %%x13, %%l2;", (n * cols + j) * 2 + e);
                 w("add.s32 %%x13, %%x13, %d; max.s32 %%x13, %%x13, -128; min.s32 %%x13, %%x13, 127;", r.rescaleOutZp);
                 if (fc.table) w("add.s32 %%x13, %%x13, 128; cvt.u64.s32 %%a37, %%x13; add.u64 %%a37, %%a4, %%a37; ld.global.s8 %%x13, [%%a37 + %d];", ocPad * 12);
-                w("and.pred %%p21, %%p20, %%p%d; add.u64 %%a38, %%a%d, %%a35;", 26 + j, 32 + j);
+                w("and.pred %%p21, %%p20, %%po%d; add.u64 %%a38, %%ao%d, %%a35;", j, j);
                 w("@%%p21 st.global.u8 [%%a38], %%x13;");
             }
         }
@@ -314,7 +315,8 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
     // Without tensor cores (GTX) dot4 uses the same hardware as CUDA would.
     if (!ComputeCapability(luid, error)) return false;
     std::string           ptx = ".version 7.1\n.target sm_75\n.address_size 64\n";
-    std::vector<uint8_t>& constants = out.constants;    for (size_t li = 0; li < g.convs.size(); ++li)
+    std::vector<uint8_t>& constants = out.constants;
+    for (size_t li = 0; li < g.convs.size(); ++li)
     {
         const auto& fc = g.convs[li];
         const auto& c  = *fc.conv;
@@ -330,7 +332,11 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
         if (!ok) return fail("unsupported layer " + std::to_string(li));
         CudaPlan::Layer l;
         l.dst = slot[fc.output], l.external = l.dst < -1;
-        ptx += LayerPtx(uint32_t(li), fc, g, l.external);
+        // A layer of fewer than 20k pixels (the low-resolution end of the U-Net) is too small to fill the GPU with 2 columns x 8
+        // channel tiles per warp: 1 x 1 there gives 8x the warps. Measured 5-8% faster overall on an RTX 40, exact either way.
+        const bool narrow = fc.outW * fc.outH < 20000;
+        const int  lc = narrow ? 1 : 2, ln = std::min(narrow ? 1 : 8, (fc.outC + 7) / 8);
+        ptx += LayerPtx(uint32_t(li), fc, g, l.external, lc, ln);
         const int chunks = (ic0 + ic1 + 3) / 4, nt = (fc.outC + 7) / 8, taps = c.kernelH * c.kernelW, ic = fc.inC, pad = (fc.outC + 3) & ~3;
         auto align = [&] { constants.resize((constants.size() + 255) & ~size_t(255)); };
         align();
@@ -354,7 +360,7 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
         if (fc.table) memcpy(&p[3 * pad], fc.table->table.data(), 256);
         constants.insert(constants.end(), reinterpret_cast<uint8_t*>(p.data()), reinterpret_cast<uint8_t*>(p.data() + p.size()));
         l.src[0] = slot[s0.tensor], l.src[1] = two ? slot[fc.sources[1].tensor] : l.src[0];
-        l.grid[0] = uint32_t(fc.outW + 63) / 64, l.grid[1] = uint32_t(fc.outH);
+        l.grid[0] = uint32_t(fc.outW + lc * 32 - 1) / (lc * 32), l.grid[1] = uint32_t(fc.outH), l.grid[2] = uint32_t(((fc.outC + 7) / 8 + ln - 1) / ln);
         out.layers.push_back(l);
     }
     out.cubin = Cubin(ptx, luid, error);
@@ -453,7 +459,7 @@ void CudaGraph::Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs
             const uint64_t base = g.m_constants->GetGPUVirtualAddress();
             auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? inputs[i] : outputs[i][-2 - t]->GetGPUVirtualAddress(); };
             params[i] = {va(l.src[0]), va(l.src[1]), base + l.weights, base + l.params, va(l.dst), outputPitch};
-            launches[i] = {l.fn, {l.grid[0], l.grid[1], 1}, {128, 1, 1}, 0, &params[i], 44};
+            launches[i] = {l.fn, {l.grid[0], l.grid[1], l.grid[2]}, {128, 1, 1}, 0, &params[i], 44};
         }
         // Not as one chain: the launches of a chain run one after another.
         for (uint32_t i = 0; i < count; ++i) Nv().launch(list, &launches[i], 1);
