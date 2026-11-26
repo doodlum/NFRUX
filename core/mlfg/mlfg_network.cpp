@@ -159,7 +159,7 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? (m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks (D3D12)" : "CUDA kernels, fp16 tensor cores (D3D12)") : "generic HLSL kernels (fp32, strict)";
+    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
 }
 
 bool Network::SelectTier(std::string* error)
@@ -177,13 +177,14 @@ bool Network::SelectTier(std::string* error)
         Log("nfrux.ini: AmdNetwork=%s is not generic, coopmat or cuda: the automatic choice", want);
         want = nullptr;
     }
-    // D3D12 on NVIDIA RTX: CUDA kernels on fp16 tensor cores (NVAPI launch), behind a crash marker as the int8 runtime's CUDA.
-    const bool cudaWanted = want ? !strcmp(want, "cuda") : (!caps.vulkan && caps.nvidia);
-    if (cudaWanted && !caps.vulkan)
+    // NVIDIA RTX: CUDA kernels on the tensor cores (D3D12: NVAPI launch; Vulkan: VK_NVX_binary_import), behind a crash marker
+    // as the int8 runtime's CUDA; else coopmat / generic.
+    const bool cudaWanted = want ? !strcmp(want, "cuda") : caps.nvidia;
+    if (cudaWanted && m_dev.CudaAvailable())
     {
         std::string why;
         char        b[64];
-        snprintf(b, sizeof(b), "d3d12_mlfg_cuda_%04x", caps.deviceId);
+        snprintf(b, sizeof(b), "%s_mlfg_cuda_%04x", caps.vulkan ? "vulkan" : "d3d12", caps.deviceId);
         if (env || MarkerBegin(b))
         {
             if ((m_cuda = CudaKernels::Create(m_dev, &why)))
@@ -201,8 +202,8 @@ bool Network::SelectTier(std::string* error)
     }
     else if (want && !strcmp(want, "cuda"))
     {
-        if (env) { if (error) *error = "NFRUX_MLFG=cuda: D3D12 only (Vulkan: coopmat)"; return false; }
-        Log("nfrux.ini: AmdNetwork=cuda is D3D12's: the automatic choice");
+        if (env) { if (error) *error = "NFRUX_MLFG=cuda: no CUDA launch on this device"; return false; }
+        Log("nfrux.ini: AmdNetwork=cuda: no CUDA launch on this device: the automatic choice");
         want = nullptr;
     }
     if (want && !mat)
@@ -297,11 +298,11 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                                 m_blob8[m_off8[l] + ((size_t(c) * nt + n) * 32 + lane) * 8 + i] = m_weights.data[L.weights + (size_t(o) * L.cin + ci) * taps + t];
                             }
             }
-            if (!(m_gpuW8 = m_dev.CreateBuffer(m_blob8.size()))) return fail("weights buffer");
+            if (!(m_gpuW8 = m_dev.CreateBuffer(m_blob8.size(), true))) return fail("weights buffer");
         }
         m_blob.resize(h.size() * 4), memcpy(m_blob.data(), h.data(), m_blob.size());
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
-        m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
+        m_gpuWeights = m_dev.CreateBuffer(m_blob.size(), true), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size(), true);
         if (!m_gpuWeights || !m_gpuBias) return fail("weights buffer");
     }
     else if (m_tier == Tier::CoopMat)
@@ -377,7 +378,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     bool ok = true;
     auto tensor = [&](Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) {
         t.w = w, t.h = h, t.pitch = pitch;
-        t.buf = m_dev.CreateBuffer(uint64_t(w) * h * pitch * 2);
+        t.buf = m_dev.CreateBuffer(uint64_t(w) * h * pitch * 2, m_tier == Tier::Cuda);
         ok = ok && t.buf;
     };
     // Stage-1 scratch, used at many sizes (views): the largest of each role.
@@ -415,8 +416,6 @@ bool Network::Run(const Conv& c)
         const uint32_t split = std::min(c.split, L.cin), nb = m_nb[c.layer], nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
         if (nt > ntp || (split < L.cin && split % 8)) return false;
         const Buffer* bufs[] = {c.src.buf, s1.buf, m_gpuWeights.get(), m_gpuBias.get(), c.add ? c.add.buf : c.src.buf, c.out.buf};
-        void* list = m_dev.NativeAccess(bufs, 6);
-        if (!list) return false;
         CudaParams p = {m_dev.NativeAddress(*bufs[0]), m_dev.NativeAddress(*bufs[1]), m_dev.NativeAddress(*bufs[2]) + uint64_t(m_offset[c.layer]) * 4,
                         m_dev.NativeAddress(*bufs[3]) + uint64_t(m_biasOffset[c.layer]) * 4, m_dev.NativeAddress(*bufs[4]), m_dev.NativeAddress(*bufs[5]),
                         int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch) - int32_t(split), int32_t(split), int32_t(L.cin),
@@ -428,7 +427,7 @@ bool Network::Run(const Conv& c)
         // Only where that still gives 256 warps or more (measured: the 30- and 60-pixel-wide stage-1 layers get slower).
         const bool m2 = nb == 8 && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
         const uint32_t gridM[3] = {(c.out.w + 31) / 32, grid[1], grid[2]};
-        const bool ok = m2 ? m_cuda->LaunchM(list, shape, gridM, p) : m_cuda->Launch(list, shape, nb, grid, p);
+        const bool ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }
@@ -528,14 +527,12 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
         // One kernel for pconv, expand and project: the same products, order and roundings as the three layers.
         const bool    f8 = m_gpuW8 != nullptr;
         const Buffer* bufs[] = {x.buf, y.buf, f8 ? m_gpuW8.get() : m_gpuWeights.get(), m_gpuBias.get()};
-        void* list = m_dev.NativeAccess(bufs, 4);
-        if (!list) return false;
         const uint64_t wa = m_dev.NativeAddress(*bufs[2]), ba = m_dev.NativeAddress(*m_gpuBias);
         auto wo = [&](uint32_t l) { return f8 ? wa + m_off8[l] : wa + uint64_t(m_offset[l]) * 4; };
         const FnParams p = {m_dev.NativeAddress(*x.buf), m_dev.NativeAddress(*y.buf), wo(first), wo(first + 1), wo(first + 2), ba + uint64_t(m_biasOffset[first]) * 4, ba + uint64_t(m_biasOffset[first + 1]) * 4,
                             ba + uint64_t(m_biasOffset[first + 2]) * 4, int32_t(x.w), int32_t(x.h)};
         const uint32_t grid[3] = {(x.w + 15) / 16, (x.h + kCudaWarps - 1) / kCudaWarps, 1};
-        if (!m_cuda->LaunchFn(list, C, f8, grid, p)) return false;
+        if (!m_cuda->LaunchFn(bufs, 4, C, f8, grid, p)) return false;
         if (m_dev.Timing()) m_dev.Mark(C == 48 ? (f8 ? "FasterNet 48 (fused, fp8)" : "FasterNet 48 (fused)") : (f8 ? "FasterNet 64 (fused, fp8)" : "FasterNet 64 (fused)"));
         if (!skip) return true;
         c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;

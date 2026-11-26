@@ -471,27 +471,27 @@ std::string CudaPtx(bool fp8)
 std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error)
 {
     auto fail = [&](const std::string& m) -> std::unique_ptr<CudaKernels> { if (error) *error = m; return nullptr; };
-    auto* d3d = static_cast<ID3D12Device*>(dev.NativeDevice());
-    if (!d3d || !cuda::Available()) return fail("no NVAPI CUDA launch");
-    const int cc = cuda::ComputeCapability(d3d->GetAdapterLuid(), error);
+    LUID luid;
+    if (!dev.CudaAvailable() || !dev.CudaLuid(reinterpret_cast<uint8_t*>(&luid))) return fail("no CUDA launch on this device");
+    const int cc = cuda::ComputeCapability(luid, error);
     if (!cc) return nullptr;
     // FP8 tensor cores from sm_89 (RTX 40): the module for that target with the e4m3 FasterNet kernels.
     const bool fp8 = cc >= 89 && !EnvFlag("NFRUX_MLFG_NO_FP8", false);
-    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8), d3d->GetAdapterLuid(), error);
+    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8), luid, error);
     if (cubin.empty()) return nullptr;
-    std::unique_ptr<CudaKernels> k(new CudaKernels());
-    k->m_device = d3d;
-    if (!(k->m_module = cuda::CreateModule(d3d, cubin))) return fail("CreateCuModule");
+    std::unique_ptr<CudaKernels> k(new CudaKernels(dev));
+    if (!(k->m_module = dev.CudaModule(cubin))) return fail("CUDA module");
+    auto fn = [&](void*& f, const std::string& name) { return (f = dev.CudaFunction(k->m_module, name.c_str())) != nullptr; };
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     for (int s = 0; s < 4; ++s)
         for (int i = 0; i < 6; ++i)
-            if ((s < 3 || kNbs[i] <= 4) && !(k->m_conv[s][i] = cuda::CreateFunction(d3d, k->m_module, (std::string(names[s]) + "_" + std::to_string(kNbs[i])).c_str()))) return fail("CreateCuFunction");
+            if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_conv[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]))) return fail("CUDA function");
     for (int s = 0; s < 3; ++s)
-        if (!(k->m_convM[s] = cuda::CreateFunction(d3d, k->m_module, (std::string(names[s]) + "_8m2").c_str()))) return fail("CreateCuFunction");
+        if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2")) return fail("CUDA function");
     for (int i = 0; i < 2; ++i)
-        if (!(k->m_fnk[i] = cuda::CreateFunction(d3d, k->m_module, i ? "fn64" : "fn48"))) return fail("CreateCuFunction");
+        if (!fn(k->m_fnk[i], i ? "fn64" : "fn48")) return fail("CUDA function");
     for (int i = 0; i < 2 && fp8; ++i)
-        if (!(k->m_fn8[i] = cuda::CreateFunction(d3d, k->m_module, i ? "fn64f8" : "fn48f8"))) return fail("CreateCuFunction");
+        if (!fn(k->m_fn8[i], i ? "fn64f8" : "fn48f8")) return fail("CUDA function");
     return k;
 }
 CudaKernels::~CudaKernels()
@@ -500,24 +500,23 @@ CudaKernels::~CudaKernels()
     f.insert(f.end(), m_fn8, m_fn8 + 2);
     f.insert(f.end(), m_convM, m_convM + 3);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
-    cuda::Destroy(m_device, m_module, f);
+    m_dev.CudaDestroy(m_module, f);
 }
 
-bool CudaKernels::LaunchFn(void* list, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const
+bool CudaKernels::LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const
 {
-    void* f = fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1];
-    return f && cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), f, grid, 32 * kCudaWarps, &p, sizeof(p));
+    return m_dev.CudaLaunch(fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::LaunchM(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const
+bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p) const
 {
-    return cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p));
+    return m_dev.CudaLaunch(m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::Launch(void* list, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
+bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
 {
     int i = 0;
     while (i < 5 && kNbs[i] != int(nb)) ++i;
-    return kNbs[i] == int(nb) && m_conv[shape][i] && cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p));
+    return kNbs[i] == int(nb) && m_dev.CudaLaunch(m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 }  // namespace nfrux::mlfg

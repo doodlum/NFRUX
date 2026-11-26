@@ -88,6 +88,9 @@ struct BufN : Buffer
     nri::Buffer*     buf = nullptr;
     nri::Descriptor *srv = nullptr, *uav = nullptr;
     mutable nri::AccessStage state = {nri::AccessBits::NONE, nri::StageBits::NONE};
+    VkBuffer         vkBuf = VK_NULL_HANDLE;  // Vulkan buffers for CUDA: NFRUX's own allocation, with a device address
+    VkDeviceMemory   vkMem = VK_NULL_HANDLE;
+    uint64_t         address = 0;
     ~BufN() override;
 };
 struct PassN : Pass
@@ -388,7 +391,7 @@ public:
         if (t) t->format = Format::Native;
         return t;
     }
-    std::unique_ptr<Buffer> CreateBuffer(uint64_t size) override { return MakeBuf(size); }
+    std::unique_ptr<Buffer> CreateBuffer(uint64_t size, bool cuda) override { return cuda && isVk && CudaAvailable() ? MakeAddressable(size) : MakeBuf(size); }
     bool Upload(const Buffer& dst, const void* data, uint64_t size) override
     {
         auto& b = static_cast<const BufN&>(dst);
@@ -402,24 +405,117 @@ public:
         uploads.push_back({up, slot, slotValue[slot]});  // freed once its recording has finished
         return true;
     }
-    void* NativeDevice() override { return isVk ? nullptr : d3d; }
-    void* NativeAccess(const Buffer* const* buffers, uint32_t count) override
+    // --- CUDA kernels on NFRUX's buffers (NVIDIA): D3D12 through NVAPI, Vulkan through VK_NVX_binary_import (buffers by
+    // device address: those made with cuda = true), as the int8 network's two paths.
+    struct VkCu
     {
-        if (isVk || !cmd) return nullptr;
+        PFN_vkCreateCuModuleNVX createModule = nullptr; PFN_vkCreateCuFunctionNVX createFunction = nullptr; PFN_vkDestroyCuModuleNVX destroyModule = nullptr;
+        PFN_vkDestroyCuFunctionNVX destroyFunction = nullptr; PFN_vkCmdCuLaunchKernelNVX launch = nullptr; PFN_vkCmdPipelineBarrier barrier = nullptr;
+        PFN_vkCreateBuffer createBuffer = nullptr; PFN_vkDestroyBuffer destroyBuffer = nullptr; PFN_vkGetBufferMemoryRequirements requirements = nullptr;
+        PFN_vkAllocateMemory allocate = nullptr; PFN_vkFreeMemory free = nullptr; PFN_vkBindBufferMemory bind = nullptr; PFN_vkGetBufferDeviceAddress address = nullptr;
+        VkPhysicalDeviceMemoryProperties memory = {};
+        bool ok = false;
+    } vkcu;
+    bool CudaAvailable() override
+    {
+        if (!c.nvidia) return false;
+        if (!isVk) return cuda::Available();
+        if (vkcu.ok) return true;
+        if (!(vk.mlFeatures & kFeatureCudaLaunch) || !CudaVulkanGraph::Supported(vk.device, vk.gdpa)) return false;
+        auto get = [&](auto& fn, const char* name) { fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(vk.gdpa(vk.device, name)); };
+        get(vkcu.createModule, "vkCreateCuModuleNVX"), get(vkcu.createFunction, "vkCreateCuFunctionNVX"), get(vkcu.destroyModule, "vkDestroyCuModuleNVX");
+        get(vkcu.destroyFunction, "vkDestroyCuFunctionNVX"), get(vkcu.launch, "vkCmdCuLaunchKernelNVX"), get(vkcu.barrier, "vkCmdPipelineBarrier");
+        get(vkcu.createBuffer, "vkCreateBuffer"), get(vkcu.destroyBuffer, "vkDestroyBuffer"), get(vkcu.requirements, "vkGetBufferMemoryRequirements");
+        get(vkcu.allocate, "vkAllocateMemory"), get(vkcu.free, "vkFreeMemory"), get(vkcu.bind, "vkBindBufferMemory"), get(vkcu.address, "vkGetBufferDeviceAddress");
+        if (!vkcu.address) get(vkcu.address, "vkGetBufferDeviceAddressKHR");
+        reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(vk.gipa(vk.instance, "vkGetPhysicalDeviceMemoryProperties"))(vk.physicalDevice, &vkcu.memory);
+        return vkcu.ok = vkcu.createModule && vkcu.createFunction && vkcu.launch && vkcu.barrier && vkcu.address && vkcu.allocate;
+    }
+    bool CudaLuid(uint8_t luid[8]) override
+    {
+        if (!isVk) { const LUID l = d3d->GetAdapterLuid(); memcpy(luid, &l, 8); return true; }
+        VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+        VkPhysicalDeviceProperties2  pp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(vk.gipa(vk.instance, "vkGetPhysicalDeviceProperties2"))(vk.physicalDevice, &pp);
+        memcpy(luid, id.deviceLUID, 8);
+        return id.deviceLUIDValid != VK_FALSE;
+    }
+    void* CudaModule(const std::vector<uint8_t>& cubin) override
+    {
+        if (!isVk) return cuda::CreateModule(d3d, cubin);
+        VkCuModuleNVX m = VK_NULL_HANDLE;
+        VkCuModuleCreateInfoNVX mi = {VK_STRUCTURE_TYPE_CU_MODULE_CREATE_INFO_NVX, nullptr, cubin.size(), cubin.data()};
+        return vkcu.ok && !vkcu.createModule(vk.device, &mi, nullptr, &m) ? reinterpret_cast<void*>(m) : nullptr;
+    }
+    void* CudaFunction(void* module, const char* name) override
+    {
+        if (!isVk) return cuda::CreateFunction(d3d, module, name);
+        VkCuFunctionNVX f = VK_NULL_HANDLE;
+        VkCuFunctionCreateInfoNVX fi = {VK_STRUCTURE_TYPE_CU_FUNCTION_CREATE_INFO_NVX, nullptr, reinterpret_cast<VkCuModuleNVX>(module), name};
+        return !vkcu.createFunction(vk.device, &fi, nullptr, &f) ? reinterpret_cast<void*>(f) : nullptr;
+    }
+    void CudaDestroy(void* module, const std::vector<void*>& functions) override
+    {
+        if (!isVk) return cuda::Destroy(d3d, module, functions);
+        for (void* f : functions) if (f) vkcu.destroyFunction(vk.device, reinterpret_cast<VkCuFunctionNVX>(f), nullptr);
+        if (module) vkcu.destroyModule(vk.device, reinterpret_cast<VkCuModuleNVX>(module), nullptr);
+    }
+    // The buffers to UNORDERED_ACCESS / storage (UAV barriers on D3D12; on Vulkan a full memory barrier before and after,
+    // as the int8 path: the launch is not a pipeline stage NRI tracks), then the kernel.
+    bool CudaLaunch(void* fn, const uint32_t grid[3], uint32_t block, const void* params, uint32_t size, const Buffer* const* buffers, uint32_t count) override
+    {
+        if (!cmd || !fn) return false;
         for (uint32_t i = 0; i < count; ++i)
         {
             bool seen = false;
             for (uint32_t j = 0; j < i; ++j) seen = seen || buffers[j] == buffers[i];
             if (!seen) To(static_cast<const BufN&>(*buffers[i]), nri::AccessBits::SHADER_RESOURCE_STORAGE, nri::StageBits::COMPUTE_SHADER);
         }
+        cudaDirty = false;  // the barrier below covers it
         Flush();
-        return nativeCmd;
+        if (!isVk) return cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), fn, grid, block, params, size);
+        auto* vc = static_cast<VkCommandBuffer>(nativeCmd);
+        VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+        vkcu.barrier(vc, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+        const void* p[1] = {params};
+        VkCuLaunchInfoNVX k = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX, nullptr, reinterpret_cast<VkCuFunctionNVX>(fn), grid[0], grid[1], grid[2], block, 1, 1, 0, 1, p, 0, nullptr};
+        vkcu.launch(vc, &k);
+        cudaDirty = true;  // the next pass, copy or launch waits for it (Flush)
+        (void)size;
+        return true;
     }
     uint64_t NativeAddress(const Buffer& b) override
     {
-        return isVk ? 0 : reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(static_cast<const BufN&>(b).buf))->GetGPUVirtualAddress();
+        auto& x = static_cast<const BufN&>(b);
+        return isVk ? x.address : reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(x.buf))->GetGPUVirtualAddress();
     }
-    struct Staged { nri::Buffer* buf; uint32_t slot, value; };
+    // Vulkan, for CUDA: a buffer with a device address (the int8 path's allocation), wrapped as NRI's.
+    std::unique_ptr<BufN> MakeAddressable(uint64_t size)
+    {
+        auto b = std::make_unique<BufN>();
+        b->dev = this, b->size = (size + 255) & ~255ull;
+        VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        ci.size = b->size, ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (vkcu.createBuffer(vk.device, &ci, nullptr, &b->vkBuf)) return nullptr;
+        VkMemoryRequirements r;
+        vkcu.requirements(vk.device, b->vkBuf, &r);
+        VkMemoryAllocateFlagsInfo fl = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &fl, r.size, UINT32_MAX};
+        for (uint32_t i = 0; i < vkcu.memory.memoryTypeCount && ai.memoryTypeIndex == UINT32_MAX; ++i)
+            if ((r.memoryTypeBits >> i & 1) && (vkcu.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) ai.memoryTypeIndex = i;
+        if (ai.memoryTypeIndex == UINT32_MAX || vkcu.allocate(vk.device, &ai, nullptr, &b->vkMem) || vkcu.bind(vk.device, b->vkBuf, b->vkMem, 0)) return nullptr;
+        VkBufferDeviceAddressInfo di = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, b->vkBuf};
+        b->address = vkcu.address(vk.device, &di);
+        nri::BufferVKDesc d = {};
+        d.vkBuffer = uint64_t(b->vkBuf), d.size = b->size, d.structureStride = 4;
+        if (!NRI_OK(nvk.CreateBufferVK(*dev, d, b->buf))) return nullptr;
+        nri::BufferViewDesc v = {};
+        v.buffer = b->buf, v.type = nri::BufferView::BYTE_ADDRESS_BUFFER, v.size = b->size;
+        if (!NRI_OK(n.CreateBufferView(v, b->srv))) return nullptr;
+        v.type = nri::BufferView::STORAGE_BYTE_ADDRESS_BUFFER;
+        return NRI_OK(n.CreateBufferView(v, b->uav)) ? std::move(b) : nullptr;
+    }    struct Staged { nri::Buffer* buf; uint32_t slot, value; };
     std::vector<Staged> uploads;
 
     std::unique_ptr<Pass> CreatePass(const Shader& s) override
@@ -796,8 +892,15 @@ public:
         bb.push_back(b);
         t.state = b.after;
     }
+    bool cudaDirty = false;  // Vulkan: a CUDA launch since the last full barrier
     void Flush()
     {
+        if (cudaDirty && isVk)
+        {
+            cudaDirty = false;
+            VkMemoryBarrier m = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+            vkcu.barrier(static_cast<VkCommandBuffer>(nativeCmd), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &m, 0, nullptr, 0, nullptr);
+        }
         if (tb.empty() && bb.empty()) return;
         nri::BarrierDesc b = {};
         static const bool full = EnvFlag("NFRUX_FULL_BARRIERS", false);  // diagnosis
@@ -1068,7 +1171,14 @@ public:
 };
 
 TexN::~TexN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyDescriptor(uav); if (tex) dev->n.DestroyTexture(tex); }
-BufN::~BufN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyDescriptor(uav); if (buf) dev->n.DestroyBuffer(buf); }
+BufN::~BufN()
+{
+    if (srv) dev->n.DestroyDescriptor(srv);
+    if (uav) dev->n.DestroyDescriptor(uav);
+    if (buf) dev->n.DestroyBuffer(buf);
+    if (vkBuf) dev->vkcu.destroyBuffer(dev->vk.device, vkBuf, nullptr);
+    if (vkMem) dev->vkcu.free(dev->vk.device, vkMem, nullptr);
+}
 PassN::~PassN() { if (pipeline) dev->n.DestroyPipeline(pipeline); if (layout) dev->n.DestroyPipelineLayout(layout); }
 
 bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy, uint32_t gz)

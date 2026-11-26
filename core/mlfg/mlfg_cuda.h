@@ -1,4 +1,4 @@
-// The FSR FG4 runtime's CUDA tier (D3D12, NVIDIA RTX): fp16 tensor-core kernels, see mlfg_cuda.cpp. SPDX-License-Identifier: MIT
+// The FSR FG4 runtime's CUDA tier (NVIDIA RTX, D3D12 and Vulkan): tensor-core kernels, see mlfg_cuda.cpp. SPDX-License-Identifier: MIT
 #pragma once
 #include "rhi.h"
 
@@ -32,17 +32,17 @@ class CudaKernels
 public:
     static std::unique_ptr<CudaKernels> Create(Device& dev, std::string* error);
     ~CudaKernels();
-    // shape 0 3x3/1, 1 2x2/2, 2 1x1, 3 transposed; nb n tiles (8 channels) a warp: 1, 2, 3, 4, 6, 8 (transposed up to 4); list: the D3D12 command list (Device::NativeAccess). 32 threads a group.
-    bool Launch(void* list, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const;
+    // shape 0 3x3/1, 1 2x2/2, 2 1x1, 3 transposed; nb n tiles (8 channels) a warp: 1, 2, 3, 4, 6, 8 (transposed up to 4); bufs: the buffers it touches (Device::CudaLaunch).
+    bool Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const;
     // shape 0-2, 8 n tiles, 32 pixels of a row a warp: grid (W / 32 rounded up, rows / kCudaWarps, n tiles / 8).
-    bool LaunchM(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const;
+    bool LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p) const;
     // A whole FasterNet block (no up), 16 pixels of a row a warp: grid (W / 16 rounded up, H, 1).
-    bool LaunchFn(void* list, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const;  // fp8: the e4m3 kernel (FP8 weights)
+    bool LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const;  // fp8: the e4m3 kernel (FP8 weights)
     bool Fp8() const { return m_fn8[0] != nullptr; }  // sm_89+: e4m3 tensor cores
 
 private:
-    CudaKernels() = default;
-    ID3D12Device* m_device = nullptr;
+    explicit CudaKernels(Device& d) : m_dev(d) {}
+    Device&       m_dev;
     void*         m_module = nullptr;
     void*         m_conv[4][6] = {};
     void*         m_fnk[2] = {};

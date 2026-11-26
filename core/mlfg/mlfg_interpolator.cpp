@@ -147,7 +147,7 @@ bool MlfgInterpolator::Create(std::string* error)
     for (auto& t : colorTm1) ok = ok && (t = dev.CreateTextureLike(set.colorLike, sz.W, sz.H));
     for (auto& t : outs) tex(t, set.outputFormat, sz.W, sz.H);
     auto tensor = [&](mlfg::Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) {
-        t.w = w, t.h = h, t.pitch = pitch, t.buf = dev.CreateBuffer(uint64_t(w) * h * pitch * 2);
+        t.w = w, t.h = h, t.pitch = pitch, t.buf = dev.CreateBuffer(uint64_t(w) * h * pitch * 2, true);  // the network's tensors: CUDA kernels may read them
         ok = ok && t.buf;
     };
     const uint32_t L = sz.l0w, Lh = sz.l0h;

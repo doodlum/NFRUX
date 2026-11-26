@@ -370,7 +370,7 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
 namespace cuda
 {
 bool                 Available() { return Nv().ok; }
-int                  ComputeCapability(LUID luid, std::string* error) { return Nv().ok ? nfrux::ComputeCapability(luid, error) : 0; }
+int                  ComputeCapability(LUID luid, std::string* error) { return Nv().cuda ? nfrux::ComputeCapability(luid, error) : 0; }
 std::vector<uint8_t> Cubin(const std::string& ptx, LUID luid, std::string* error) { return nfrux::Cubin(ptx, luid, error); }
 void* CreateModule(ID3D12Device* device, const std::vector<uint8_t>& cubin)
 {

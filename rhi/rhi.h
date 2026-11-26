@@ -116,18 +116,24 @@ public:
     virtual std::unique_ptr<Texture> CreateTexture(Format format, uint32_t width, uint32_t height, bool uintView = false) = 0;
     // A texture of an external image's own format (the colour history).
     virtual std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& image, uint32_t width, uint32_t height) = 0;
-    virtual std::unique_ptr<Buffer>  CreateBuffer(uint64_t size) = 0;
+    // cuda: CUDA kernels will use it too (Vulkan: allocated with a device address when CudaAvailable()).
+    virtual std::unique_ptr<Buffer>  CreateBuffer(uint64_t size, bool cuda = false) = 0;
     // Host data into a buffer, recorded into the current frame (between BeginFrame and EndFrame); the staging copy is freed later.
     virtual bool Upload(const Buffer& dst, const void* data, uint64_t size) = 0;
     virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader) = 0;
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;
 
     virtual bool DropRung() = 0;  // the next network is made one rung lower; false: there is none
-    // D3D12, for CUDA kernels on NFRUX's buffers (core/mlfg): the device; the buffers into UNORDERED_ACCESS (a UAV barrier
-    // where they already are) and the current command list; a buffer's GPU virtual address. Null / 0 on Vulkan.
-    virtual void*    NativeDevice() { return nullptr; }
-    virtual void*    NativeAccess(const Buffer* const* buffers, uint32_t count) { return nullptr; }
-    virtual uint64_t NativeAddress(const Buffer& buffer) { return 0; }
+    // CUDA kernels on NFRUX's buffers (core/mlfg; NVIDIA): D3D12 through NVAPI, Vulkan through VK_NVX_binary_import with
+    // buffer device addresses. The adapter's LUID (to link PTX for it), modules and functions from a cubin, and a launch
+    // into the current recording: the buffers it touches go to UNORDERED_ACCESS / storage first, with barriers.
+    virtual bool     CudaAvailable() { return false; }
+    virtual bool     CudaLuid(uint8_t luid[8]) { return false; }
+    virtual void*    CudaModule(const std::vector<uint8_t>& cubin) { return nullptr; }
+    virtual void*    CudaFunction(void* module, const char* name) { return nullptr; }
+    virtual void     CudaDestroy(void* module, const std::vector<void*>& functions) {}
+    virtual bool     CudaLaunch(void* function, const uint32_t grid[3], uint32_t block, const void* params, uint32_t size, const Buffer* const* buffers, uint32_t count) { return false; }
+    virtual uint64_t NativeAddress(const Buffer& buffer) { return 0; }  // its address for the kernels
     // A frame's recording into the host's command buffer / list; every wrapped image is back in its own state at EndFrame.
     virtual bool BeginFrame(void* commands) = 0;
     virtual void EndFrame() = 0;
