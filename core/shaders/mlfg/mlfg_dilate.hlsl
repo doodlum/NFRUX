@@ -23,7 +23,7 @@
 cbuffer Constants : register(b0)
 {
     int4   c_sizes;      // renderSize.xy, outSize.xy (AMD dispatchSize)
-    float4 c_mvScale;    // motionVectorScale.xy, 0, 0
+    float4 c_mvScale;    // motionVectorScale.xy, NFRUX: the jitter's change taken out of the vectors (uv; 0, 0 = AMD)
     float4 c_genRect;    // generationRectMinUV.xy, generationRectMaxUV.xy
     float4 c_colorRect;  // colorRectMinUV.xy, colorRectMaxUV.xy
 };
@@ -68,7 +68,7 @@ float4 Fetch(Texture2D<float4> t, int2 p, int2 size) { return Inside(p, size) ? 
         }
     }
     float2 m = Fetch(t_mv, best, rs).xy;
-    m = FDiv((m * c_mvScale.xy) * rect, float2(rs));
+    m = FDiv((m * c_mvScale.xy) * rect, float2(rs)) - c_mvScale.zw;  // NFRUX's jitter cancellation (DLSS-G MvecJittered), exact at 0
 #if MLFG_INVERTED_DEPTH
     const float outsideDepth = 0.0;
 #else

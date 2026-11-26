@@ -116,6 +116,7 @@ private:
     uint32_t  hc = 0;  // mv / depth [hc]: this frame's; [hc ^ 1] the last frame's
     uint64_t  frame = 0;
     float     vp0[16] = {}, vpm1[16] = {};  // frame 0's (the last rendered) and frame -1's view-projection
+    float     lastJitter[2] = {};
 };
 
 bool MlfgInterpolator::Create(std::string* error)
@@ -182,10 +183,14 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
     const Texture &color = *pc, &prev = *colorTm1[frame % 2], &backup = *colorTm1[(frame + 1) % 2];
     const bool     reset = in.reset || frame == 0;
     ++frame;
+    // Vectors that contain the sample positions' jitter (render pixels): its change taken out, as the NFRU interpolator does.
+    const bool  jittered = in.motionJittered && !reset;
+    const float cancel[2] = {jittered ? (in.jitter[0] - lastJitter[0]) / float(set.renderWidth) : 0.0f, jittered ? (in.jitter[1] - lastJitter[1]) / float(set.renderHeight) : 0.0f};
+    lastJitter[0] = in.jitter[0], lastJitter[1] = in.jitter[1];
     // pipe191 of this frame: the history of the next.
     {
         mlfg::DilateConstants k = {{int32_t(set.renderWidth), int32_t(set.renderHeight), int32_t(sz.prew), int32_t(sz.preh)},
-                                   {in.mvScale[0] * float(set.renderWidth) / float(sz.W), in.mvScale[1] * float(set.renderHeight) / float(sz.H), 0, 0}, {0, 0, 1, 1}, {0, 0, 1, 1}};
+                                   {in.mvScale[0] * float(set.renderWidth) / float(sz.W), in.mvScale[1] * float(set.renderHeight) / float(sz.H), cancel[0], cancel[1]}, {0, 0, 1, 1}, {0, 0, 1, 1}};
         const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Tex(1, *pm), Bind::Tex(2, *pd), Bind::Tex(3, *mv[hc]), Bind::Tex(4, *depth[hc])};
         if (!dilate->Dispatch(b, 5, G(sz.prew), G(sz.preh))) return false;
     }
