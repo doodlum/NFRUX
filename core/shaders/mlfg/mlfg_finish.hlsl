@@ -7,7 +7,7 @@
 //         t3 ui       the frame with its UI (uiKind 0: HUD-less difference test; 2/3 with alpha; 4/5 alpha only)
 //         t4 alpha    UI opacity: red (UI alpha image) or alpha (a UI layer: kinds 3 / 5)
 //         t5 nowarp   no-warp mask (red > 0.5)
-// Writes  u6 out      size, the output's format; alpha 1
+// Writes  u6 out      size, the output's format; alpha 0 (as kMlfgComposite: the same bytes with and without this pass)
 //   no-warp pixel: cur; then kind 2/3: frame - (1 - a) * (HUD-less - generated) (opaque UI where that colour cannot be
 //   right); kind 4/5: the frame where the opacity is above 0.4 in the pixel's 2x2 block; kind 0: the frame where a
 //   channel differs from the HUD-less by more than 0.07 in the block. c_size.w bit 0: a UI source is given, bit 1:
@@ -36,11 +36,11 @@ Texture2D<float4> t_nowarp : register(t5);
 float4 Quantise(float3 c)
 {
 #if defined(MLFG_OUT_RGBA8)
-    return float4((floor(clamp(c, 0.0, 1.0) * 255.0 + 0.5) + 0.25) * (1.0 / 255.0), 1.0);
+    return float4((floor(clamp(c, 0.0, 1.0) * 255.0 + 0.5) + 0.25) * (1.0 / 255.0), 0.0);
 #elif defined(MLFG_OUT_RGB10A2)
-    return float4((floor(clamp(c, 0.0, 1.0) * 1023.0 + 0.5) + 0.25) * (1.0 / 1023.0), 1.0);
+    return float4((floor(clamp(c, 0.0, 1.0) * 1023.0 + 0.5) + 0.25) * (1.0 / 1023.0), 0.0);
 #else
-    return float4(F16Round(c), 1.0);
+    return float4(F16Round(c), 0.0);
 #endif
 }
 
