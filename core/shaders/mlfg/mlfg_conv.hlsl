@@ -24,6 +24,7 @@ cbuffer Constants : register(b0)
     int4 c_out;  // out width, height, pitch, first channel
     int4 c_cfg;  // cout, act (0 none, 1 leaky 0.2, 2 relu), round (0 fp16, 1 fp8), write end (even; >= cout)
     int4 c_add;  // add pitch (0: none), add first channel, weight offset (floats), coPad
+    int4 c_x;    // 1: the sources' 8-channel groups are 16-byte aligned (staging by 16-byte loads), 0, 0, 0
 };
 ByteAddressBuffer   t_src0 : register(t1);
 ByteAddressBuffer   t_src1 : register(t2);
@@ -118,10 +119,31 @@ float LoadIn(int2 p, int c)
     [loop] for (int cb = 0; cb < cin; cb += CI * KS)
     {
         GroupMemoryBarrierWithGroupSync();
-        [loop] for (uint i = li; i < uint(TINW * TINH * CI * KS); i += 64u)
+        if (c_x.x != 0)
         {
-            const uint p = i / uint(CI * KS), c = i % uint(CI * KS);
-            s_x[p * uint(PS) + c] = LoadIn(origin + int2(p % uint(TINW), p / uint(TINW)), cb + int(c));
+            // 8 channels a load (the same values as LoadIn's: channels past cin and pixels outside are 0).
+            [loop] for (uint i = li; i < uint(TINW * TINH * KS); i += 64u)
+            {
+                const uint p = i / uint(KS), sl = i % uint(KS);
+                const int2 q = origin + int2(p % uint(TINW), p / uint(TINW));
+                const int  c = cb + int(sl) * CI;
+                uint4      w = uint4(0, 0, 0, 0);
+                if (Inside(q, c_in.xy) && c < c_in2.w)
+                {
+                    const uint base = uint(q.y) * uint(c_in.x) + uint(q.x);
+                    w = c < c_in.w ? t_src0.Load4((base * uint(c_in.z) + uint(c_in2.x + c)) << 1) : t_src1.Load4((base * uint(c_in2.y) + uint(c - c_in.w + c_in2.z)) << 1);
+                }
+                [unroll] for (uint k = 0u; k < 8u; ++k)
+                    s_x[p * uint(PS) + sl * uint(CI) + k] = c + int(k) < c_in2.w ? F16ToF32((w[k >> 1] >> ((k & 1u) * 16u)) & 0xFFFFu) : 0.0;
+            }
+        }
+        else
+        {
+            [loop] for (uint i = li; i < uint(TINW * TINH * CI * KS); i += 64u)
+            {
+                const uint p = i / uint(CI * KS), c = i % uint(CI * KS);
+                s_x[p * uint(PS) + c] = LoadIn(origin + int2(p % uint(TINW), p / uint(TINW)), cb + int(c));
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         const int c0 = cb + int(slice) * CI;

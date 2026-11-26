@@ -95,10 +95,11 @@ private:
     std::unique_ptr<Buffer> m_gpuWeights, m_gpuBias;
     std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames
     uint32_t                m_frames = 0;
-    std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
+    std::unique_ptr<Pass>   m_conv[4][2], m_genFn[2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4], m_matN1[2], m_fn[2];  // coopmat: layers; narrow; fused FasterNet 48 / 64
     std::unique_ptr<CudaKernels> m_cuda;
     bool                    m_fused = true;
+    bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
     bool                    m_m2 = true;  // CUDA: 32 pixels a warp (NFRUX_MLFG_NO_M2=1: 16, tests)  // fused FasterNet blocks (NFRUX_MLFG_UNFUSED=1: the layers one by one, tests)
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch

@@ -189,7 +189,10 @@ def main():
         for tier in tiers:
             if len(apis) > 1 and all((tier, a) in got for a in apis):
                 same = all(np.array_equal(got[(tier, apis[0])][k], got[(tier, a)][k]) for a in apis[1:] for k in range(n - 1))
-                report(f'{n}x {tier}: {" vs ".join(apis)}', 'bytes identical' if same else 'BYTES DIFFER', same or tier != 'generic')
+                # Identical bytes are the strict build's promise; the shipped build lets compilers fuse the generic convolutions.
+                strict = 'strict' in A.exe.lower()
+                report(f'{n}x {tier}: {" vs ".join(apis)}', ('bytes identical' if same else 'BYTES DIFFER') + ('' if strict else ' (shipped build: informative)'),
+                       same or tier != 'generic' or not strict)
         if 'generic' in tiers:
             for tier in tiers:
                 if tier == 'generic': continue

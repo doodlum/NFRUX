@@ -88,6 +88,9 @@ for n, k in [("kMlfgConv3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("kMlfgConv
     big = ["-DMLFG_TW=16", "-DMLFG_TH=8" if n == "kMlfgConv2" else "-DMLFG_TH=16", "-DMLFG_KS=1"]
     passes += [(n, mg_ + "conv.hlsl", k + big, "NFRUX_UNUSED", 60),
                (n + "s", mg_ + "conv.hlsl", k + ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"], "NFRUX_UNUSED", 60)]
+# Fused FasterNet blocks of the generic tier.
+passes += [("kMlfgConvFn48", mg_ + "conv_fn.hlsl", ["-DMLFG_C=48", "-DMLFG_P=16"], "NFRUX_UNUSED", 60),
+           ("kMlfgConvFn64", mg_ + "conv_fn.hlsl", ["-DMLFG_C=64", "-DMLFG_P=32"], "NFRUX_UNUSED", 60)]
 
 
 def run(cmd):
@@ -99,6 +102,12 @@ def run(cmd):
 RELAXED = len(sys.argv) < 4 or sys.argv[3] not in ("1", "ON")
 ALWAYS = ("kFiDownsample",  # strict in every build: they round to a texel, often from an exact half, so a fused product picks another one
           "kMlfg")  # FSR FG4 passes: fp16 rounding points and integer-exact division / conversions must see unfused fp32 results
+# The generic tier's convolutions (kMlfgConv*) are the exception: their sums only (no rounding point of AMD's inside a
+# product chain), so the shipped build lets the compilers fuse them (multiply-add); the strict build keeps them strict.
+def Strict(name):
+    return name.startswith(ALWAYS) and not name.startswith("kMlfgConv")
+
+
 FLOAT_OPS = {127, 129, 131, 133, 136, 140, 141, 142, 143, 144, 145, 146, 147, 148}  # OpFNegate FAdd FSub FMul FDiv FRem and the vector/matrix products
 
 
@@ -119,7 +128,7 @@ def precise(path, name):
         if op in FLOAT_OPS:
             ops.append(w[i + 2])
         i += n
-    add = [] if RELAXED and not name.startswith(ALWAYS) else [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
+    add = [] if RELAXED and not Strict(name) else [x for r in ops if r not in has for x in ((3 << 16) | 71, r, 42)]
     w[first:first] = add
     import struct
     open(path, "wb").write(struct.pack(f"<{len(w)}I", *w))
@@ -148,7 +157,7 @@ def build(job):
             h = h.replace(".InterlockedMin(", ".InterlockedMin64(")
         open(b + ".hlsl", "w").write(h)
     run([XCROSS, b + ".spv", "--reflect", "--output", b + ".json"])
-    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED and not name.startswith(ALWAYS) else ["-Gis"]),
+    run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED and not Strict(name) else ["-Gis"]),
          *(["-enable-16bit-types"] if sm >= 62 else []), b + ".hlsl", "-Fo", b + ".dxil"])
     refl = json.load(open(b + ".json"))
     hl = open(b + ".hlsl").read()

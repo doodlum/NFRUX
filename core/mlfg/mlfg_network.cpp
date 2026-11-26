@@ -236,6 +236,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     if (!SelectTier(error)) return false;
     m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
     m_m2 = !EnvFlag("NFRUX_MLFG_NO_M2", false);
+    // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
+    // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
+    // untested elsewhere. Off unless NFRUX_MLFG_FUSED=1. CUDA's is on (NFRUX_MLFG_UNFUSED=1 turns every one off).
+    m_fusedMat = m_fused && EnvFlag("NFRUX_MLFG_FUSED", false);
     m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers);
     if (m_tier == Tier::Cuda)
     {
@@ -339,6 +343,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     bool made = m_gpuWeights != nullptr;
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j) made = made && (m_conv[i][j] = m_dev.CreatePass(*sh[i][j]));
+    made = made && (m_genFn[0] = m_dev.CreatePass(shaders::kMlfgConvFn48)) && (m_genFn[1] = m_dev.CreatePass(shaders::kMlfgConvFn64));
     if (!made) return fail("network passes or weights buffer");
     }
     bool ok = true;
@@ -415,12 +420,14 @@ bool Network::Run(const Conv& c)
         if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
         return (narrow ? m_matN1[0] : m_mat[shape])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, narrow ? 1 : (L.cout + 63) / 64);
     }
-    struct { int32_t in[4], in2[4], out[4], cfg[4], add[4]; } k = {
+    const uint32_t gsplit = std::min(c.split, L.cin);
+    const bool vec = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && (gsplit >= L.cin || (gsplit % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0));
+    struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
         {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
         {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
         {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
         {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
-        {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 7) & ~7u)}};
+        {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 7) & ~7u)}, {vec ? 1 : 0, 0, 0, 0}};
     // Shape, and tile: 16 x 16 (16 x 8 for 2x2/2) pixels a group, or 4 x 4 with the channels in 4 slices where the large
     // tile would give few groups (the low-resolution layers). Chosen from sizes only: the same on every API.
     const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
@@ -503,7 +510,19 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
         c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
         return Run(c);
     }
-    if (m_tier == Tier::CoopMat && m_fused && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
+    if (m_tier == Tier::Generic && m_fusedMat && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
+    {
+        auto pad = [&](uint32_t l) { return int32_t((m_weights.layers[l].cout + 7) & ~7u); };
+        const int32_t k[12] = {int32_t(x.w), int32_t(x.h), 0, 0, int32_t(m_offset[first]), int32_t(m_offset[first + 1]), int32_t(m_offset[first + 2]), 0,
+                               pad(first), pad(first + 1), pad(first + 2), 0};
+        const Bind b[] = {Bind::Data(0, k, sizeof(k)), Bind::Buf(1, *x.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(5, *y.buf)};
+        if (m_dev.Timing()) m_dev.Label(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
+        if (!m_genFn[C == 48 ? 0 : 1]->Dispatch(b, 4, (x.w + 7) / 8, (x.h + 7) / 8, 1)) return false;
+        if (!skip) return true;
+        c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
+        return Run(c);
+    }
+    if (m_tier == Tier::CoopMat && m_fusedMat && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
     {
         auto pad = [&](uint32_t l) { return int32_t((m_weights.layers[l].cout + 63) & ~63u); };
         const int32_t k[16] = {int32_t(x.w), int32_t(x.h), 0, 0, int32_t(m_offset[first]), int32_t(m_offset[first + 1]), int32_t(m_offset[first + 2]), 0,
