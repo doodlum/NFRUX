@@ -516,3 +516,15 @@ mlfg_net 58/58 on both samples (cuda with FP8 48.3-49.2 / 44.4-44.7 dB vs the fp
 (generic, strict build) 0 differing bytes, fused generic kernel included; ngx_harness Model=amd 77/78 per API (RGB10A2
 PQ quality), Model=nfru 158/158; build-ship and build-strict green. Details and what limits it: docs/FFX_MLFG.md
 "Speed work".
+
+## FSR FG4 port, speed round 2 (2026-11-26, commits b6728a0..ac7351e)
+
+parity --bench, RTX 4070 idle this time (both columns measured today: "before" is commit 26878cb rebuilt in a worktree),
+ms a rendered frame, 1080p 2x / 1080p 4x / 4K 2x / 4K 4x:
+cuda D3D12 3.97 / 6.28 / 8.41 / 16.5 -> 2.80 / 4.78 / 7.09 / 13.96; Vulkan on NVIDIA (coopmat before, cuda now)
+6.22 / 11.5 / 15.9 / 35.5 -> 3.04 / 5.05 / 7.41 / 14.3; coopmat (the AMD RDNA3+ / Intel path, forced on the RTX 4070)
+6.22 / 11.5 / 15.9 / 35.5 -> 4.12 / 7.99 / 11.5 / 25.4; generic unchanged (no speed work by request).
+Gates after the last change: mlfg_passes 68/68; mlfg_net 76/76 on each sample, every tier on both APIs (cuda
+47.8-48.8 / 44.1-45.0 dB vs the fp64-summed net, yardstick minus 3 = 46.8-47.2 / 41.5-42.4); parity --strict (generic,
+strict build) 0 differing bytes; ngx_harness Model=amd 77/78 per API (RGB10A2 PQ quality, as before), Model=nfru 158/158;
+build-ship and build-strict green. Details: docs/FFX_MLFG.md "Speed work, round 2".

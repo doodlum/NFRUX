@@ -192,7 +192,7 @@ params / gate textures on every path (paths that write images directly are an op
 | Vulkan FullBarriers | `NFRUX_FULL_BARRIERS` | flag |
 | General Model | `NFRUX_MODEL` | nfru (default), amd (FSR FG4, docs/FFX_MLFG.md) |
 | General AmdWeights | `NFRUX_AMD_WEIGHTS` | a `tools/mlfg_weights.py --bin` file |
-| D3D12 / Vulkan AmdNetwork | `NFRUX_MLFG` (tests: strict, no markers) | generic, cuda (D3D12) / generic, coopmat (Vulkan) |
+| D3D12 / Vulkan AmdNetwork | `NFRUX_MLFG` (tests: strict, no markers) | generic, cuda (D3D12) / generic, coopmat, cuda (Vulkan) |
 
 `Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
 
@@ -202,7 +202,7 @@ params / gate textures on every path (paths that write images directly are an op
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 | FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores, FP8 for stage 2's FasterNet blocks on RTX 40+ (NVAPI, crash marker) | - | generic (strict HLSL) |
-| FSR FG4 (Model=amd), Vulkan | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA) | - | generic (strict HLSL) |
+| FSR FG4 (Model=amd), Vulkan | NVIDIA RTX: the same CUDA kernels (VK_NVX_binary_import, crash marker; identical bytes to D3D12) | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA; FP8 1x1 layers opt-in) | generic (strict HLSL) |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of

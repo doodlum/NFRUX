@@ -85,12 +85,10 @@ end after a frame, as the int8 runtime's).
 |---|---|---|---|
 | generic | both | `mlfg_conv.hlsl` (kMlfgConv3/2/1/T + small-tile variants `s`): fp16 values in fp32 registers, fp32 sums per 8-channel chunk and tap, strict like every kMlfg pass; 64 threads make 16x16 (16x8) pixels x 8 channels, 4 / 2 pixels a thread; layers that would give under 768 groups use 4x4-pixel tiles with the input channels in 4 slices (fixed-order reduction) | the floor; NFRUX_MLFG=generic or AmdNetwork=generic |
 | coopmat | Vulkan | `mlfg_conv_coopmat.comp` (kMlfgMat*, per subgroup size 16 / 32 / 64): one subgroup a group, 16 pixels x 64 channels (16 for layers with at most 16 outputs), fp16 16x16x16 -> fp32, A from a shared fp16 patch (1x1: straight from the tensor), epilogue as generic | Vulkan with fp16 16x16x16 cooperative matrices, 16-bit storage, the memory model and a 16/32/64 subgroup (rhi `Caps.coopMatF16`, `subgroupSize`); crash marker off NVIDIA (cleared after 120 frames) |
-| cuda | D3D12 | `mlfg_cuda.cpp`: PTX written here (sm_75, `mma.sync.m16n8k8` f16 -> f32), linked by the driver, launched by NVAPI into the host's list as the int8 network's; a warp makes 16 pixels x 64 channels (8 for <= 16 outputs), weights in fragment order, epilogue with `cvt.rn.f16` and a scaled `cvt.rni` for e4m3 | D3D12 on NVIDIA; crash marker `d3d12_mlfg_cuda_<device>` |
+| cuda | both | `mlfg_cuda.cpp`: PTX written here (sm_75, `mma.sync.m16n8k8` f16 -> f32; sm_89: FP8 fused FasterNet), linked by the driver, launched by NVAPI (D3D12) or VK_NVX_binary_import (Vulkan) into the host's list as the int8 network's; a warp makes 16-64 pixels x 8-64 channels, weights in fragment order, epilogue with `cvt.rn.f16` and a scaled `cvt.rni` for e4m3; the same kernels give identical bytes on both APIs | NVIDIA RTX; crash marker `d3d12_mlfg_cuda_<device>` / `vulkan_mlfg_cuda_<device>`, coopmat (Vulkan) as the fallback |
 
 `NFRUX_MLFG` (tests) forces a tier strictly; nfrux.ini `[D3D12]` / `[Vulkan]` `AmdNetwork` forces it with fallback to
-the automatic choice (logged). The log says `FSR FG4 interpolator WxH ..., network: <tier>`. Not done: CUDA on Vulkan
-(VK_NVX_binary_import; on NVIDIA Vulkan the coopmat tier runs the same tensor cores), FP8 tensor cores for stage 2,
-fused FasterNet blocks.
+the automatic choice (logged). The log says `FSR FG4 interpolator WxH ..., network: <tier>`. (The speed sections below say what changed since: CUDA on Vulkan, FP8, fused blocks, fp16 accumulation.)
 
 ### Accuracy (tests/mlfg_net.py, mlfg_run.exe)
 
@@ -203,3 +201,91 @@ global memory per tap (no shared-memory staging / ldmatrix in the PTX kernels ye
 shared-memory staging for the CUDA 3x3 kernels, a deterministic two-pass split-K for blocks 1-2, CUDA on Vulkan
 (VK_NVX_binary_import: Vulkan on NVIDIA would get the cuda tier's 8.3 instead of coopmat's 15.9 ms), and fusing the
 softmax into the head's epilogue.
+
+### Speed work, round 2 (2026-11-26)
+
+Same RTX 4070, idle this time. `parity --bench` (16 frames a submission, median of 30, ms a rendered frame); "before" is
+round 1's last commit (26878cb) rebuilt in a worktree and measured on the same idle GPU, so the columns compare directly
+(round 1's own table above was taken under a training job and reads about 5-10% high).
+
+| Tier | 1080p 2x | 1080p 4x | 4K 2x | 4K 4x |
+|---|---|---|---|---|
+| cuda D3D12, before | 3.97 | 6.28 | 8.41 | 16.5 |
+| cuda D3D12, after | **2.80** | **4.78** | **7.09** | **13.96** |
+| Vulkan on NVIDIA, before (coopmat) | 6.22 | 11.5 | 15.9 | 35.5 |
+| Vulkan on NVIDIA, after (cuda) | **3.04** | **5.05** | **7.41** | **14.3** |
+| coopmat (AMD RDNA3+ / Intel path; forced here), before | 6.22 | 11.5 | 15.9 | 35.5 |
+| coopmat, after | **4.12** | **7.99** | **11.5** | **25.4** |
+| generic D3D12 / Vulkan (no speed work: the int8 QAT model will cover GPUs without tensor cores) | 21.2 / 15.4 | 42.7 / 30.9 | 67.6 / 45.7 | - |
+
+What changed, in the order done:
+1. **CUDA on Vulkan** (b6728a0): the rhi's CUDA calls (module, function, launch, buffers with device addresses) on both
+   APIs, Vulkan through VK_NVX_binary_import as the int8 network's `cuda_vulkan.cpp`; one full barrier before each launch
+   and one after the last before the next pass. Crash marker `vulkan_mlfg_cuda_<device>`, coopmat as the fallback. The
+   same kernels give identical bytes on both APIs (mlfg_net: cuda D3D12 == Vulkan bytes; ngx_harness 63 of 63 outputs).
+2. **Shared-memory staging, CUDA 3x3** (`conv3_8s2`): the block's rows staged once a chunk, every tap's A fragment a
+   shared load; same bits, but neutral on Ada (the per-tap global loads hit L1): built, off (`NFRUX_MLFG_STAGING=1`).
+   In coopmat the staging itself got cheaper: one 16-byte load a pixel's 8 channels instead of eight 2-byte ones.
+3. **Deterministic split-K** (CUDA, stage-1 3x3 layers that fill fewer than 256 warps): up to 4 splits of the channel
+   chunks write fp32 partial sums, a second kernel adds them in split order and runs the epilogue: the same bytes every
+   run and on both APIs. Stage 1 2.35 -> 2.05 ms at 4K (`NFRUX_MLFG_NO_SPLITK=1` turns it off).
+4. **Glue passes**: `F16Round` without a branch (fp16 subnormals by `(x + 0.75) - 0.75` marked `precise`; without
+   `precise` spirv-opt folds it away, which mlfg_passes caught): same bits everywhere, refine 0.65 -> 0.45 ms, composite
+   1.19 -> 1.01 ms. What is left in the composite (measured by taking parts out): the 5-weight fp16 bilinear upsample
+   ~0.5 ms, colour reads 0.1, splat coverage 0.08; a relaxed (non-strict) build of the composite was no faster, so it
+   stays exact in both builds. The coopmat epilogue got the same fast fp16 rounding.
+5. **Softmax fused into the head** (CUDA): the 3x3 32->5 layer's epilogue rounds the logits to fp16, gathers the five
+   from the quad's lanes by shuffles and computes kMlfgSoftmax5 exactly as the shader (FExp's Cody-Waite + polynomial
+   with separate IEEE multiplies / adds, sum in order, `div.rn`): bit-identical to the two passes; the pass is skipped.
+6. **FP8 on Vulkan** (VK_EXT_shader_float8): the loader and the test hosts enable the extension and
+   `shaderFloat8CooperativeMatrix` where the GPU has them (`kFeatureFloat8`), rhi `Caps.coopMatF8` (e4m3 16x16x32 -> fp32),
+   `mlfg_conv_fp8.comp` for stage 2's fp8 1x1 layers (inputs converted to e4m3 bytes in shared memory, exact; e4m3
+   weights; fp32 sums). Accurate (49.1-49.4 dB against the fp64-summed net) but slower on the RTX 4070 (48->96: 0.18
+   against 0.14 ms): these layers move fp16 tensors and are bound by that traffic and the epilogue, not the matrix
+   rate. Opt-in (`NFRUX_MLFG_FP8MAT=1`) for devices where it may win; the real gain would need stage 2's tensors stored
+   as e4m3 bytes (exact, they are e4m3 values), which is not done.
+7. **Coopmat tuning**: output tiles a group per layer: 2 for the 17-32-output 3x3 (stage-2 input layer 1.24 -> 0.44
+   ms), 3 for the 48 / 96-output 1x1 (no padded tiles; stage 2 4.97 -> 4.40 ms). More pixels a group (32 / 64, each B
+   matrix used 2-4 times) was slower (accumulator pressure); built in the shader as MLFG_MT, not used. The fused
+   FasterNet coopmat kernel re-checked with the new staging: still slower (14.5 against 12.2 ms), stays off.
+8. **CUDA tiling**: 4 n tiles (not 8 with 4 of zeros) for 17-32 outputs with a 32-pixel variant (stage-2 input layer
+   0.30 -> 0.24 ms); a 64-pixel kernel for one-n-tile 3x3 (head 0.25 -> 0.21 ms, with the softmax epilogue too).
+9. **fp16 accumulation** (shipped build only; `NFRUX_STRICT_MATH` builds compile none of it and keep their bytes):
+   see below.
+
+#### fp16 accumulation: which layers and why
+
+GeForce runs `mma.sync` with f16 accumulate at twice the f32 rate. Three forms were measured on every CUDA layer at 4K:
+fp32 (as before), fp16 over the whole reduction, and fp16 within each 8-channel chunk (all taps; the chunk sums added
+into fp32). Whole-reduction fp16 everywhere fails the yardstick (46.6-47.1 dB against 46.8-47.2 needed); chunked fp16
+everywhere passes narrowly but is slower overall (7.7 against 7.3 ms): the tensor cores are rarely the limit here,
+and on the 96-192-channel 3x3 layers the f16 kernels ran slower (more instructions a chunk, conversions). So the
+choice is per layer, kept only where it is faster:
+
+| Layers | Accumulator | Why |
+|---|---|---|
+| 1, 2, 5, 6 (encoders 3x3 32->32), 10 (2x2 96->192), 23 (2x2 64->128), 48 (3x3 24->24) | fp16 within each chunk, fp32 across chunks | 25-30% faster each (0.04 -> 0.03 ms, 0.032 -> 0.022, 0.025 -> 0.018); error not measurable on its own (within +-0.3 dB of fp32) |
+| 60 (stage-2 input, 3x3 24->32) | fp32 | 8% faster but -0.5 to -1.4 dB on the 4x outputs: its inputs carry the largest magnitudes |
+| every other plain layer (96-192-channel 3x3, transposed, the head, split-K) | fp32 | f16 slower or no faster |
+| fused FasterNet (fp16 and FP8 kernels) | fp32 | not tried for FP8 f16-accumulate: the fp16 result above (latency, not rate, bound) gives no reason to expect a gain |
+
+Gain -0.08 ms at 4K 2x; accuracy with the list against the fp64-summed net: 47.8 / 48.3 / 47.8 / 48.8 dB (sample 1,
+2x and 4x; fp32 47.9-49.2) and 45.0 / 44.6 / 45.0 / 44.1 dB (sample 2; fp32 44.5-45.2). `NFRUX_MLFG_NO_ACC16=1` turns it
+off, `NFRUX_MLFG_ACC16_LAYERS=a,b,..` replaces the list (tests). Coopmat: chunked float16_t-accumulator variants exist
+(3x3, 2x2, 3x3 with 1 / 2 tiles); on the RTX 4070 they are slower (stage 1 2.67 -> 2.78 ms) and cost ~1.9 dB, so no
+layer uses them by default; `NFRUX_MLFG_MAT_ACC16_LAYERS=*|a,b,..` selects them for measurement on other vendors.
+
+#### Where 4K 2x goes now (cuda D3D12, 7.1 ms; per-pass sum 6.3 ms)
+
+Stage-1 layers 1.97, composite 1.01, stage-2 network 0.82 (FasterNet FP8 0.45 + 64-ch 0.15 + rest), splats 0.43,
+refine 0.45, stage-2 input pass 0.32, its 3x3 layer 0.24, head + softmax 0.21, forward motion 0.24, dilation 0.13, the
+rest ~0.5. Vulkan on NVIDIA is 0.3 ms behind D3D12 (the full barriers around launches).
+
+How close to AMD: 2.2 ms quoted on an RX 9070 XT, whose dense FP8 rate is about 3.3x the RTX 4070's and memory
+bandwidth 1.3x; scaled, the same work here would be about 5.5-7 ms if the tensor cores were the limit. NFRUX is at
+7.1 (D3D12) / 7.4 (Vulkan), at or just above the upper end of that range. What limits it now is not the matrix rate
+(fp16 accumulation and FP8 on Vulkan both showed that): the stage-1 layers are latency-bound (30-60-pixel-wide maps),
+the glue is AMD's exact integer arithmetic (composite upsample, point-sample texel choice), and stage 2 moves fp16
+tensors. Not done, by expected payoff: stage-2 tensors as e4m3 bytes (halves its traffic; exact), a separable
+precomputed weight upsample for the composite, fusing the stage-2 input pass with its 3x3 layer, ldmatrix-based
+staging for the 16-pixel kernels.
