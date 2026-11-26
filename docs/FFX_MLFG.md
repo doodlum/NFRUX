@@ -106,6 +106,8 @@ fp64 sums is the yardstick, 50.2 dB at t = 0.5 (49.8 / 50.2 at t = 0.25 / 0.75),
 | cuda D3D12 | 50.0 / 49.6 dB, max 41-65 | 49.9-50.7 dB | 49.9-50.6 dB, max 80 |
 
 Every tier is as close to the fp64-summed network as torch's fp32 is (pass: within 3 dB of the yardstick); 58/58 checks.
+A second sample (`test_bal` tb_moon_000 p1=120): yardstick 44.5-45.4 dB; generic 45.4-45.5, coopmat 44.9-45.6, cuda 44.4-45.3 dB
+against mlfg_net, 58/58 (`--sample test_bal:1`).
 Tensors after the last frame (net_in, f54 .. f149, flowout, s2in, softmax weights) are reported per tier as well.
 
 ### Parity

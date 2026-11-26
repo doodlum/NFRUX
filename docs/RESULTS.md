@@ -496,3 +496,14 @@ A3 / A14, test_new, 4 pairs a clip, shipped D3D12 build (`tests/quality_referenc
 | Arm with prior | 38.05 / .0395 | 38.94 / .0320 | 40.56 / .0368 | 33.75 / .0589 | 36.76 / .0371 |
 
 A3 passes: NFRUX within 0.1 dB of torch on every multiplier's mean (limit 0.2; worst single frame -1.66 dB at 3x on a 57 dB pair). A14 (LPIPS, not above Arm as released) fails at 2x and 4x for v1, passes at 3x, 5x and 6x; PSNR says the same at 4x. The v15 retrain (LPIPS 0.5, no oracle loss) beat Arm at 2x-6x in its 4k-step probe and is the candidate to close it.
+
+## FSR FG4 port (Model=amd), 2026-11-26 (commits 31556e5..; shipped and strict builds)
+
+Details in docs/FFX_MLFG.md "The port". tests/mlfg_net.py (DLL code vs mlfg_net 'amd', two test-set samples, 2x and 4x):
+58/58 each; every tier within 3 dB of the fp64-summed network (yardstick 50.2 / 45.4 dB); generic D3D12 == Vulkan bytes.
+`parity --strict` (NFRUX_MODEL=amd, NFRUX_MLFG=generic): 0 differing bytes, 1080p RGBA8 2x-4x, 720p BGRA8 / RGB10A2 /
+RGBA16F inverted, 1366x767 render 683x384 6x. tests/mlfg_passes.py 68/68 after the FlowOut / Dilate / composite changes.
+ngx_harness with Model=amd: 77/78 a API (RGB10A2 PQ quality 38.2-38.3 dB < 40; NFRU 46.8), cross-API 2 outputs at
+56.3 / 57.1 dB (cuda vs coopmat); with NFRUX_MLFG=generic every output byte-identical between the APIs. Model=nfru:
+158/158 (unchanged). Cost (shared GPU, ~10% high): cuda 5.0 / 13.2 ms, coopmat 6.2 / 16.4 ms, generic 19-28 / 61-101 ms
+at 1080p / 4K 2x.
