@@ -244,6 +244,30 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
     m_m4 = !EnvFlag("NFRUX_MLFG_NO_M4", false);
     m_vec8 = !EnvFlag("NFRUX_MLFG_NO_VEC8", false);
+    // CUDA, shipped build: the layers whose sums run in fp16 within each 8-channel chunk (all taps; the chunks added in
+    // fp32), measured per layer at 4K (docs/FFX_MLFG.md): only where it is faster; short chunks keep the error small.
+    // NFRUX_MLFG_ACC16_LAYERS=a,b,... (tests) replaces the list; NFRUX_MLFG_NO_ACC16=1 none.
+    m_acc16.assign(kLayers, false), m_matAcc16.assign(kLayers, false);
+#ifndef NFRUX_STRICT_MATH
+    if (const char* e = getenv("NFRUX_MLFG_MAT_ACC16_LAYERS"))  // coopmat (tests): the layers with fp16 sums a chunk
+        for (const char* q = e; *q; ++q)
+            if ((q == e || q[-1] == ',') && *q >= '0' && *q <= '9' && uint32_t(atoi(q)) < kLayers) m_matAcc16[atoi(q)] = true;
+            else if (*q == '*') m_matAcc16.assign(kLayers, true);
+#endif
+#ifndef NFRUX_STRICT_MATH
+    if (!EnvFlag("NFRUX_MLFG_NO_ACC16", false))
+    {
+        std::string list = "1,2,5,6,10,23,48";  // not 60 (stage-2 input: -0.5 to -1.4 dB for 0.017 ms)
+        if (const char* e = getenv("NFRUX_MLFG_ACC16_LAYERS")) list = e;
+        for (size_t i = 0; i < list.size();)
+        {
+            const uint32_t l = uint32_t(atoi(list.c_str() + i));
+            if (l < kLayers && list[i] >= '0' && list[i] <= '9') m_acc16[l] = true;
+            const size_t c = list.find(',', i);
+            i = c == std::string::npos ? list.size() : c + 1;
+        }
+    }
+#endif
     if (const char* e = getenv("NFRUX_MLFG_MAT_MT")) m_matMt = std::min(std::max(atoi(e), 0), 4);  // tests: 1x1 16-output tiles a group (2-4; 0 by size)
     m_fusedSoftmax = !EnvFlag("NFRUX_MLFG_SOFTMAX_PASS", false);
     // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
@@ -351,6 +375,10 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         made = made && (m_fn[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgFn64_16 : sg == 32 ? shaders::kMlfgFn64_32 : shaders::kMlfgFn64_64));
         made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
         made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
+        made = made && (m_matH[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3h_16 : sg == 32 ? shaders::kMlfgMat3h_32 : shaders::kMlfgMat3h_64));
+        made = made && (m_matH[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat2h_16 : sg == 32 ? shaders::kMlfgMat2h_32 : shaders::kMlfgMat2h_64));
+        made = made && (m_matH[2] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2h_16 : sg == 32 ? shaders::kMlfgMat3n2h_32 : shaders::kMlfgMat3n2h_64));
+        made = made && (m_matH[3] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1h_16 : sg == 32 ? shaders::kMlfgMat3n1h_32 : shaders::kMlfgMat3n1h_64));
         made = made && (m_matN2 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2_16 : sg == 32 ? shaders::kMlfgMat3n2_32 : shaders::kMlfgMat3n2_64));
         made = made && (m_mat1m[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n2_16 : sg == 32 ? shaders::kMlfgMat1n2_32 : shaders::kMlfgMat1n2_64));
         made = made && (m_mat1m[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n3_16 : sg == 32 ? shaders::kMlfgMat1n3_32 : shaders::kMlfgMat1n3_64));
@@ -451,6 +479,7 @@ bool Network::Run(const Conv& c)
         if (m_partial && !m2 && nb == 8 && L.kind == 0 && L.k == 3 && warps < 256 && kc >= 4 && writeEnd <= ntp * 8)
             splits = std::min({4u, (256 + warps - 1) / warps, kc / 2});
         while (splits > 1 && uint64_t(splits) * pixels * ntp * 8 > kPartialFloats) --splits;
+        const bool h16 = c.layer < m_acc16.size() && m_acc16[c.layer];  // fp16 sums within each chunk (shipped build)
         bool ok;
         if (c.act == Softmax)  // the head with the softmax epilogue (Stage2's weights)
             ok = shape == 0 && nb == 1 && ntp == 1 && L.cout == 5 && m_cuda->LaunchSoftmax(bufs, 6, m4 ? gridM4 : grid, p, m4);
@@ -464,7 +493,7 @@ bool Network::Run(const Conv& c)
             ok = m_cuda->LaunchSplit(sb, 7, sg, sp, pixels);
         }
         else if (m4) ok = m_cuda->LaunchM4(bufs, 6, gridM4, p);
-        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged && nb == 8, nb == 4) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
+        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged && nb == 8, nb == 4, h16) : m_cuda->Launch(bufs, 6, shape, nb, grid, p, h16);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }
@@ -486,15 +515,16 @@ bool Network::Run(const Conv& c)
                           Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
         const bool narrow = L.cout <= 16 && (L.kind == 1 || L.k == 3);  // one 16-channel tile a group
         if (L.kind == 1) return (narrow ? m_matN1[1] : m_mat[3])->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, narrow ? 1 : (L.cout + 31) / 32);
-        if (narrow) return m_matN1[0]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
+        const bool h16 = c.layer < m_matAcc16.size() && m_matAcc16[c.layer];  // fp16 sums a chunk (shipped build)
+        if (narrow) return (h16 ? m_matH[3] : m_matN1[0])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);
         const uint32_t z = (L.cout + 63) / 64;
-        if (shape == 0 && L.cout <= 32) return m_matN2->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);  // 2 tiles of 16 outputs
+        if (shape == 0 && L.cout <= 32) return (h16 ? m_matH[2] : m_matN2)->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, 1);  // 2 tiles of 16 outputs
         if (shape == 2)  // 1x1: 48 or 32 outputs a group where 64 would compute padding (the stage-2 48 / 96-channel layers)
         {
             const uint32_t nb = m_matMt ? m_matMt : L.cout % 48 == 0 && L.cout % 64 != 0 ? 3 : L.cout % 32 == 0 && L.cout % 64 != 0 ? 2 : 4;
             if (nb < 4) return m_mat1m[nb == 3]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 16 * nb - 1) / (16 * nb));
         }
-        return m_mat[shape]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, z);
+        return (h16 && shape < 2 ? m_matH[shape] : m_mat[shape])->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, z);
     }
     const uint32_t gsplit = std::min(c.split, L.cin);
     const bool vec = c.src.pitch % 8 == 0 && c.src.ch % 8 == 0 && (gsplit >= L.cin || (gsplit % 8 == 0 && s1.pitch % 8 == 0 && s1.ch % 8 == 0));

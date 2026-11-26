@@ -241,7 +241,10 @@ for n, k in [("3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("2", ["-DMLFG_CONV_
              ("T", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"]),
              ("3n1", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_NB=1"]), ("Tn1", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1", "-DMLFG_NB=1"]),
              ("3n2", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_NB=2"]), ("1n3", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1", "-DMLFG_NB=3"]),
-             ("1n2", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1", "-DMLFG_NB=2"])]:
+             ("1n2", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1", "-DMLFG_NB=2"]),
+             # fp16 sums within each 16-channel chunk (the shipped build's choice per layer; not for the transposed / direct 1x1)
+             ("3h", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_ACC16=1"]), ("2h", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_ACC16=1"]),
+             ("3n2h", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_NB=2", "-DMLFG_ACC16=1"]), ("3n1h", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1", "-DMLFG_NB=1", "-DMLFG_ACC16=1"])]:
     for sg in (16, 32, 64):
         nm = f"kMlfgMat{n}_{sg}"
         p = os.path.join(out, nm + ".spv")

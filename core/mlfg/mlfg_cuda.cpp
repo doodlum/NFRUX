@@ -34,6 +34,29 @@ struct Ptx
 };
 
 void SoftmaxEpilogue(Ptx& w, int R, int xr);
+
+// Accumulation of the fp16 convolutions: 0 fp32 (mma f32 += f16 x f16), 1 fp16 within each 8-channel chunk (all its
+// taps) and the chunks added into fp32, 2 fp16 over the whole reduction. GeForce runs f16-accumulate mma at twice the
+// f32 rate. The fp16 accumulators of accumulator f (f, f + 1, f + 2, f + 3 in fp32) are r(200 + f / 2), r(201 + f / 2):
+// the same fragment layout, two halves a register (rows g / g + 8, columns 2q, 2q + 1).
+int g_acc = 0;
+void Mma(Ptx& w, int f, int a0, int a1, int b)
+{
+    if (g_acc)
+        w("mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16 {%%r%d, %%r%d}, {%%r%d, %%r%d}, {%%r%d}, {%%r%d, %%r%d};", 200 + f / 2, 201 + f / 2, a0, a1, b, 200 + f / 2, 201 + f / 2);
+    else
+        w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r%d}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, a0, a1, b, f, f + 1, f + 2, f + 3);
+}
+void AccZero(Ptx& w, int n)  // n fp32 accumulators' fp16 registers
+{
+    for (int i = 0; i < n / 2; ++i) w("mov.b32 %%r%d, 0;", 200 + i);
+}
+void AccFlush(Ptx& w, int n)  // fp32 += the fp16 sums
+{
+    for (int i = 0; i < n / 2; ++i)
+        w("mov.b32 {%%h1, %%h2}, %%r%d; cvt.f32.f16 %%f196, %%h1; cvt.f32.f16 %%f197, %%h2; add.rn.f32 %%f%d, %%f%d, %%f196; add.rn.f32 %%f%d, %%f%d, %%f197;", 200 + i, 2 * i, 2 * i, 2 * i + 1,
+          2 * i + 1);
+}
 // One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2; NB n tiles (8 channels each) a warp.
 std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
 {
@@ -43,7 +66,7 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     Ptx w;
     w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : softmax ? "x" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
-    w(".reg .b32 %%r<160>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
+    w(".reg .b32 %%r<300>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // s0 s1 w b add out
     // r1 inW r2 inH r3 p0 r4 ch0 r5 p1 r6 ch1m r7 split r8 cin r9 outW r10 outH r11 po r12 cho r13 cout r14 writeEnd r15 act
     // r16 fp8 r17 pa r18 cha r19 kc r20 ntp
@@ -84,7 +107,9 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
     }
     else
         w("mov.u32 %%r40, 0;");  // kc
+    if (g_acc == 2) AccZero(w, NA * NB * 4);
     w("LOOP:");
+    if (g_acc == 1) AccZero(w, NA * NB * 4);
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3; setp.lt.s32 %%p9, %%r41, %%r7;");  // chunk's first channel, from src0
     w("shl.b32 %%r42, %%r23, 1; add.s32 %%r42, %%r41, %%r42; add.s32 %%r43, %%r42, 1;");  // c, c + 1
@@ -109,13 +134,14 @@ std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
             {
                 const int f = (a * NB + j) * 4;
                 w("ld.global.u32 %%r52, [%%rd63+%d];", j * 128);
-                w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r50, %%r51}, {%%r52}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, f, f + 1, f + 2,
-                  f + 3);
+                Mma(w, f, 50, 51, 52);
             }
         }
     }
+    if (g_acc == 1) AccFlush(w, NA * NB * 4);
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
+    if (g_acc == 2) AccFlush(w, NA * NB * 4);
     if (split)  // the raw sums: part[split][pixel][ntp * 8] fp32
     {
         w("mul.lo.u32 %%r116, %%r9, %%r10; mul.lo.u32 %%r116, %%r116, %%r114; shl.b32 %%r117, %%r20, 3;");  // split * pixels, cpad
@@ -229,7 +255,7 @@ std::string KernelM(int shape, int NB, int MT, bool softmax = false)
     static const char* names[3] = {"conv3", "conv2", "conv1"};
     Ptx w;
     w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "m" + std::to_string(MT) + (softmax ? "x" : "") + "(.param .align 8 .b8 P[128])\n{\n";
-    w(".reg .b32 %%r<200>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
+    w(".reg .b32 %%r<300>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
     for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
     w("mov.u32 %%r21, %%tid.x; and.b32 %%r21, %%r21, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3;");
@@ -257,7 +283,9 @@ std::string KernelM(int shape, int NB, int MT, bool softmax = false)
     w("mul.wide.u32 %%rd8, %%r26, 128; add.s64 %%rd8, %%rd3, %%rd8; mul.wide.u32 %%rd7, %%r21, 4; add.s64 %%rd8, %%rd8, %%rd7;");
     w("mul.wide.u32 %%rd9, %%r20, 128; mul.lo.u64 %%rd60, %%rd9, %d;", taps);
     w("mov.u32 %%r40, 0;");
+    if (g_acc == 2) AccZero(w, MT * NB * 4);
     w("LOOP:");
+    if (g_acc == 1) AccZero(w, MT * NB * 4);
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3; setp.lt.s32 %%p9, %%r41, %%r7;");
     w("shl.b32 %%r42, %%r23, 1; add.s32 %%r42, %%r41, %%r42; add.s32 %%r43, %%r42, 1;");
@@ -282,13 +310,14 @@ std::string KernelM(int shape, int NB, int MT, bool softmax = false)
             for (int m = 0; m < MT; ++m)
             {
                 const int f = (m * NB + j) * 4;
-                w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r49}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, 50 + 2 * m,
-                  51 + 2 * m, f, f + 1, f + 2, f + 3);
+                Mma(w, f, 50 + 2 * m, 51 + 2 * m, 49);
             }
         }
     }
+    if (g_acc == 1) AccFlush(w, MT * NB * 4);
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
+    if (g_acc == 2) AccFlush(w, MT * NB * 4);
     if (softmax) SoftmaxEpilogue(w, R, 80);
     else Epilogue(w, NB, R);
     w("ret;");
@@ -304,7 +333,7 @@ std::string KernelS(int NB, int MT)
     const int R = 2 * MT, SW = MT * 16 + 2, SH = int(kCudaWarps) + 2;  // staged width / height
     Ptx w;
     w.s = std::string(".visible .entry conv3_") + std::to_string(NB) + "s" + std::to_string(MT) + "(.param .align 8 .b8 P[128])\n{\n";
-    w(".reg .b32 %%r<200>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
+    w(".reg .b32 %%r<300>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
     w(".shared .align 16 .b32 sx[%d];", SH * SW * 4);
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
     for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
@@ -320,7 +349,9 @@ std::string KernelS(int NB, int MT)
     w("mul.wide.u32 %%rd9, %%r20, 128; mul.lo.u64 %%rd60, %%rd9, 9;");
     w("sub.u32 %%r95, %%r91, 1; sub.u32 %%r96, %%r24, 1;");  // staged origin (y0 - 1, x0 - 1)
     w("mov.u32 %%r40, 0;");
+    if (g_acc == 2) AccZero(w, MT * NB * 4);
     w("LOOP:");
+    if (g_acc == 1) AccZero(w, MT * NB * 4);
     w("setp.ge.s32 %%p8, %%r40, %%r19; @%%p8 bra END;");
     w("shl.b32 %%r41, %%r40, 3;");
     w("bar.sync 0;");
@@ -349,13 +380,14 @@ std::string KernelS(int NB, int MT)
             for (int m = 0; m < MT; ++m)
             {
                 const int f = (m * NB + j) * 4;
-                w("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r%d, %%r%d}, {%%r49}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, 50 + 2 * m,
-                  51 + 2 * m, f, f + 1, f + 2, f + 3);
+                Mma(w, f, 50 + 2 * m, 51 + 2 * m, 49);
             }
         }
     }
+    if (g_acc == 1) AccFlush(w, MT * NB * 4);
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
+    if (g_acc == 2) AccFlush(w, MT * NB * 4);
     Epilogue(w, NB, R);
     w("ret;");
     return w.s + "}\n";
@@ -654,8 +686,9 @@ void SoftmaxEpilogue(Ptx& w, int R, int xr)  // R rows of 8 pixels, x in r(xr + 
 // kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
 int Fp8Channel(int kp) { return (kp >= 16 ? 16 : 0) + 8 * ((kp % 4) / 2) + 2 * ((kp % 16) / 4) + (kp % 2); }
 
-std::string CudaPtx(bool fp8)
+std::string CudaPtx(bool fp8, int acc)
 {
+    g_acc = 0;
     std::string p = fp8 ? ".version 8.4\n.target sm_89\n.address_size 64\n" : ".version 7.0\n.target sm_75\n.address_size 64\n";
     if (fp8) p += FnKernel8(48, 16), p += FnKernel8(64, 32);
     for (int s = 0; s < 4; ++s)
@@ -665,6 +698,16 @@ std::string CudaPtx(bool fp8)
     p += KernelS(8, 2);
     p += Kernel(0, 8, true), p += ReduceKernel(), p += Kernel(0, 1, false, true), p += KernelM(0, 1, 4), p += KernelM(0, 1, 4, true);
     p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 4, 16, 8);  // the layers' padded n tiles (CudaNb)
+    if (acc)  // the plain convolutions again with fp16 sums within each chunk: names + "h" (the layers Network picks)
+    {
+        g_acc = acc;
+        auto h = [](std::string k) { return k.replace(k.find("(.param"), 0, "h"); };
+        for (int s = 0; s < 4; ++s)
+            for (int nb : kNbs)
+                if (s < 3 || nb <= 4) p += h(Kernel(s, nb));
+        for (int s = 0; s < 3; ++s) p += h(KernelM(s, 8, 2)), p += h(KernelM(s, 4, 2));
+        g_acc = 0;
+    }
     return p;
 }
 
@@ -677,7 +720,12 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
     if (!cc) return nullptr;
     // FP8 tensor cores from sm_89 (RTX 40): the module for that target with the e4m3 FasterNet kernels.
     const bool fp8 = cc >= 89 && !EnvFlag("NFRUX_MLFG_NO_FP8", false);
-    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8), luid, error);
+#ifdef NFRUX_STRICT_MATH
+    const int acc = 0;  // the strict build: fp32 sums only
+#else
+    const int acc = EnvFlag("NFRUX_MLFG_NO_ACC16", false) ? 0 : 1;  // fp16-sum variants (chunked) for the layers that gain
+#endif
+    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8, acc), luid, error);
     if (cubin.empty()) return nullptr;
     std::unique_ptr<CudaKernels> k(new CudaKernels(dev));
     if (!(k->m_module = dev.CudaModule(cubin))) return fail("CUDA module");
@@ -688,6 +736,11 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
             if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_conv[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]))) return fail("CUDA function");
     for (int s = 0; s < 3; ++s)
         if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2") || !fn(k->m_convM4[s], std::string(names[s]) + "_4m2")) return fail("CUDA function");
+    for (int s = 0; s < 4 && acc; ++s)
+        for (int i = 0; i < 6; ++i)
+            if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_convH[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]) + "h")) return fail("CUDA function");
+    for (int s = 0; s < 3 && acc; ++s)
+        if (!fn(k->m_convMH[s], std::string(names[s]) + "_8m2h") || !fn(k->m_convM4H[s], std::string(names[s]) + "_4m2h")) return fail("CUDA function");
     if (!fn(k->m_convS, "conv3_8s2") || !fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek") || !fn(k->m_softmax, "conv3_1x") || !fn(k->m_conv1m4, "conv3_1m4") || !fn(k->m_softmaxM4, "conv3_1m4x")) return fail("CUDA function");
     for (int i = 0; i < 2; ++i)
         if (!fn(k->m_fnk[i], i ? "fn64" : "fn48")) return fail("CUDA function");
@@ -702,6 +755,8 @@ CudaKernels::~CudaKernels()
     f.insert(f.end(), m_convM, m_convM + 3), f.insert(f.end(), m_convM4, m_convM4 + 3);
     f.push_back(m_convS), f.push_back(m_splitK), f.push_back(m_reduce), f.push_back(m_softmax), f.push_back(m_conv1m4), f.push_back(m_softmaxM4);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
+    for (auto& s : m_convH) f.insert(f.end(), s, s + 6);
+    f.insert(f.end(), m_convMH, m_convMH + 3), f.insert(f.end(), m_convM4H, m_convM4H + 3);
     m_dev.CudaDestroy(m_module, f);
 }
 
@@ -710,16 +765,17 @@ bool CudaKernels::LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bo
     return m_dev.CudaLaunch(fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged, bool nb4) const
+bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged, bool nb4, bool h) const
 {
+    if (h && m_convMH[shape]) return m_dev.CudaLaunch(nb4 ? m_convM4H[shape] : m_convMH[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
     return m_dev.CudaLaunch(nb4 ? m_convM4[shape] : staged && shape == 0 ? m_convS : m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
+bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p, bool h) const
 {
     int i = 0;
     while (i < 5 && kNbs[i] != int(nb)) ++i;
-    return kNbs[i] == int(nb) && m_dev.CudaLaunch(m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+    return kNbs[i] == int(nb) && m_dev.CudaLaunch(h && m_convH[shape][i] ? m_convH[shape][i] : m_conv[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 }  // namespace nfrux::mlfg
 namespace nfrux::mlfg

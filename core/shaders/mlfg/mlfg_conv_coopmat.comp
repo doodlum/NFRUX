@@ -200,6 +200,15 @@ void main()
                 acc[t][b] = coopMatMulAdd(a, w, acc[t][b]);
             }
 #else
+#ifdef MLFG_ACC16  // fp16 sums within the 16-channel chunk (all taps), added into the fp32 accumulators after it
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc16[NT][NB];
+        [[unroll]] for (int m = 0; m < NT; ++m)
+            [[unroll]] for (int b = 0; b < NB; ++b)
+                acc16[m][b] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+#define MLFG_ACC acc16
+#else
+#define MLFG_ACC acc
+#endif
         [[unroll]] for (int t = 0; t < MLFG_CONV_K * MLFG_CONV_K; ++t)
         {
             const int ky = t / MLFG_CONV_K, kx = t % MLFG_CONV_K;
@@ -211,9 +220,14 @@ void main()
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
                 coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (int m = 0; m < NT; ++m)
-                    acc[m][b] = coopMatMulAdd(a[m], w, acc[m][b]);
+                    MLFG_ACC[m][b] = coopMatMulAdd(a[m], w, MLFG_ACC[m][b]);
             }
         }
+#ifdef MLFG_ACC16
+        [[unroll]] for (int m = 0; m < NT; ++m)
+            [[unroll]] for (int b = 0; b < NB; ++b)
+                acc[m][b] = acc[m][b] + coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc16[m][b]);
+#endif
 #endif
     }
     // Epilogue: bias, add, activation, rounding; two channels a word.

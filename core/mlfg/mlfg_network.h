@@ -108,7 +108,9 @@ private:
     bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
     bool                    m_m2 = true;
     bool                    m_m4 = true;
-    bool                    m_vec8 = true;  // coopmat: 16-byte staging loads (NFRUX_MLFG_NO_VEC8=1: off)  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
+    bool                    m_vec8 = true;
+    std::vector<bool>       m_acc16, m_matAcc16;  // coopmat: the same idea (3x3 / 2x2 / 3x3 2 tiles / 3x3 1 tile: m_matH)
+    std::unique_ptr<Pass>   m_matH[4];  // CUDA: layers with fp16 sums a chunk (shipped build)  // coopmat: 16-byte staging loads (NFRUX_MLFG_NO_VEC8=1: off)  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
     bool                    m_staged = false;  // CUDA 3x3: shared-memory staging (NFRUX_MLFG_STAGING=1; measured neutral)
     bool                    m_fusedSoftmax = true;  // CUDA: softmax in the head (NFRUX_MLFG_SOFTMAX_PASS=1: the pass)
     bool                    m_splitK = true;   // CUDA: split-K for the low-resolution 3x3 layers (NFRUX_MLFG_NO_SPLITK=1: off)
