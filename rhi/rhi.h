@@ -84,10 +84,13 @@ struct Caps
     bool        native16Bit = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
     uint32_t    shaderModel = 0;  // D3D12: 60, 62, 64, 66, ...
     bool        vulkan = false, nvidia = false;
-    // Vulkan: 16 x 16 x 16 fp16 x fp16 -> fp32 cooperative matrices usable (with 16-bit storage and the memory model
-    // enabled), and the subgroup size compute shaders get.
+    // Vulkan: fp16 x fp16 -> fp32 subgroup cooperative matrices usable (16-bit storage and the memory model enabled): every
+    // M x N x K the device reports (coopShapes), coopMatF16 = any of them; the subgroup size compute shaders get by default,
+    // and the range a pass may require (Vulkan 1.3 subgroup size control; min = max = subgroupSize without it).
+    struct MatShape { uint32_t m, n, k; };
+    std::vector<MatShape> coopShapes;
     bool        coopMatF16 = false;
-    uint32_t    subgroupSize = 0;
+    uint32_t    subgroupSize = 0, subgroupMin = 0, subgroupMax = 0;
     std::string Describe() const;
 };
 
@@ -120,7 +123,8 @@ public:
     virtual std::unique_ptr<Buffer>  CreateBuffer(uint64_t size, bool cuda = false) = 0;
     // Host data into a buffer, recorded into the current frame (between BeginFrame and EndFrame); the staging copy is freed later.
     virtual bool Upload(const Buffer& dst, const void* data, uint64_t size) = 0;
-    virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader) = 0;
+    // waveLanes (Vulkan): the subgroup size the pass requires (0: the driver's choice); must be in [subgroupMin, subgroupMax].
+    virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader, uint32_t waveLanes = 0) = 0;
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;
 
     virtual bool DropRung() = 0;  // the next network is made one rung lower; false: there is none

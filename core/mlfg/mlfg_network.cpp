@@ -160,13 +160,40 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
+    if (m_tier == Tier::CoopMat)
+        return "cooperative matrices fp16, fragments " + std::to_string(m_matSet->m) + "x" + std::to_string(m_matSet->n) + "x16, subgroup " + std::to_string(m_matSet->sg) + " (Vulkan)";
+    return m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
+}
+
+// The coopmat variant set for the device: one built for an fp16 fragment shape the device reports (M x N x 16) at a
+// subgroup size it runs (its default, or one it can require); larger fragments first, then the default subgroup size.
+// NFRUX_MLFG_MAT_SHAPE=MxN@SG (tests) asks for one set (still only if the device reports and runs it).
+const shaders::MlfgMatSet* PickMatSet(const Caps& c)
+{
+    if (!c.vulkan || !c.coopMatF16) return nullptr;
+    const char* want = Env("NFRUX_MLFG_MAT_SHAPE");
+    const shaders::MlfgMatSet* best = nullptr;
+    uint32_t                   score = 0;
+    for (const auto& s : shaders::kMlfgMatSets)
+    {
+        bool reported = false;
+        for (const auto& m : c.coopShapes) reported = reported || (m.m == s.m && m.n == s.n && m.k == 16);
+        const bool runs = s.sg == c.subgroupSize || (s.sg >= c.subgroupMin && s.sg <= c.subgroupMax);
+        if (!reported || !runs) continue;
+        char name[32];
+        snprintf(name, sizeof(name), "%ux%u@%u", s.m, s.n, s.sg);
+        if (want && strcmp(want, name)) continue;
+        const uint32_t sc = s.m * s.n * 4 + (s.sg == c.subgroupSize ? 2 : 0) + (s.sg >= 32 ? 1 : 0);
+        if (sc > score) best = &s, score = sc;
+    }
+    return best;
 }
 
 bool Network::SelectTier(std::string* error)
 {
     const Caps& caps = m_dev.caps();
-    const bool  mat  = caps.vulkan && caps.coopMatF16 && (caps.subgroupSize == 16 || caps.subgroupSize == 32 || caps.subgroupSize == 64);
+    m_matSet = PickMatSet(caps);
+    const bool  mat  = m_matSet != nullptr;
     const char* env  = Env("NFRUX_MLFG");  // tests: strict, no markers
     const char* ini  = env ? nullptr : Option(caps.vulkan ? "vulkan" : "d3d12", "amdnetwork");
     const char* want = env ? env : ini;
@@ -209,8 +236,8 @@ bool Network::SelectTier(std::string* error)
     }
     if (want && !mat)
     {
-        if (env) { if (error) *error = "NFRUX_MLFG=coopmat: no fp16 16x16x16 cooperative matrices here"; return false; }
-        Log("nfrux.ini: AmdNetwork=coopmat cannot be used here (no fp16 16x16x16 cooperative matrices): generic");
+        if (env) { if (error) *error = "NFRUX_MLFG=coopmat: no fp16 cooperative-matrix shape and subgroup size NFRUX has kernels for"; return false; }
+        Log("nfrux.ini: AmdNetwork=coopmat cannot be used here (no fp16 cooperative-matrix shape / subgroup size NFRUX has kernels for): generic");
         return true;
     }
     if (!mat) return true;
@@ -329,18 +356,13 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
         m_blob.resize(h.size() * 2), memcpy(m_blob.data(), h.data(), m_blob.size());
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
         m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
-        const uint32_t sg = m_dev.caps().subgroupSize;
-        const Shader* sh[4] = {sg == 16 ? &shaders::kMlfgMat3_16 : sg == 32 ? &shaders::kMlfgMat3_32 : &shaders::kMlfgMat3_64,
-                               sg == 16 ? &shaders::kMlfgMat2_16 : sg == 32 ? &shaders::kMlfgMat2_32 : &shaders::kMlfgMat2_64,
-                               sg == 16 ? &shaders::kMlfgMat1_16 : sg == 32 ? &shaders::kMlfgMat1_32 : &shaders::kMlfgMat1_64,
-                               sg == 16 ? &shaders::kMlfgMatT_16 : sg == 32 ? &shaders::kMlfgMatT_32 : &shaders::kMlfgMatT_64};
+        // The set's subgroup size, required where the device has a range (a varying size would not match the group size).
+        const Caps&    cp = m_dev.caps();
+        const uint32_t lanes = cp.subgroupMin != cp.subgroupMax ? m_matSet->sg : 0;
+        auto           mk = [&](int i) { return m_dev.CreatePass(*m_matSet->pass[i], lanes); };
         bool made = m_gpuWeights && m_gpuBias;
-        for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = m_dev.CreatePass(*sh[i]));
-        made = made && (m_matN2 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n2_16 : sg == 32 ? shaders::kMlfgMat3n2_32 : shaders::kMlfgMat3n2_64));
-        made = made && (m_matN1[0] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat3n1_16 : sg == 32 ? shaders::kMlfgMat3n1_32 : shaders::kMlfgMat3n1_64));
-        made = made && (m_matN1[1] = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMatTn1_16 : sg == 32 ? shaders::kMlfgMatTn1_32 : shaders::kMlfgMatTn1_64));
-        made = made && (m_mat1n3 = m_dev.CreatePass(sg == 16 ? shaders::kMlfgMat1n3_16 : sg == 32 ? shaders::kMlfgMat1n3_32 : shaders::kMlfgMat1n3_64));
-        if (!made) return fail("cooperative-matrix passes or weights buffer");
+        for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = mk(i));
+        made = made && (m_matN1[0] = mk(4)) && (m_matN1[1] = mk(5)) && (m_matN2 = mk(6)) && (m_mat1n3 = mk(7));        if (!made) return fail("cooperative-matrix passes or weights buffer");
     }
     else
     {

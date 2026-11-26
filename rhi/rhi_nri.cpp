@@ -268,9 +268,13 @@ public:
         c.dot4 = (h.mlFeatures & ffx_ml::FEATURE_INTEGER_DOT_PRODUCT) != 0, c.cooperativeMatrix = (h.mlFeatures & ffx_ml::FEATURE_COOPERATIVE_MATRIX) != 0;
         c.vulkan = true;
         {
-            VkPhysicalDeviceSubgroupProperties sp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+            VkPhysicalDeviceSubgroupSizeControlProperties sc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+            VkPhysicalDeviceSubgroupProperties sp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, &sc};
             VkPhysicalDeviceProperties2       p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
             if (auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(h.gipa(h.instance, "vkGetPhysicalDeviceProperties2"))) get(h.physicalDevice, &p2), c.subgroupSize = sp.subgroupSize;
+            // A required size only with the feature enabled (ffx_ml's bit) and for compute.
+            const bool sizeControl = (h.mlFeatures & ffx_ml::FEATURE_SUBGROUP_SIZE_CONTROL) && (sc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) && sc.minSubgroupSize;
+            c.subgroupMin = sizeControl ? sc.minSubgroupSize : c.subgroupSize, c.subgroupMax = sizeControl ? sc.maxSubgroupSize : c.subgroupSize;
             const uint32_t need = ffx_ml::FEATURE_COOPERATIVE_MATRIX | ffx_ml::FEATURE_VULKAN_MEMORY_MODEL | ffx_ml::FEATURE_SHADER_FLOAT16 | ffx_ml::FEATURE_STORAGE_BUFFER_16BIT;
             auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(h.gipa(h.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
             if ((h.mlFeatures & need) == need && props)
@@ -280,11 +284,16 @@ public:
                 std::vector<VkCooperativeMatrixPropertiesKHR> v(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
                 props(h.physicalDevice, &n, v.data());
                 for (auto& s : v)
-                    c.coopMatF16 = c.coopMatF16 || (s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                                                    s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.scope == VK_SCOPE_SUBGROUP_KHR);
+                    if (s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                        s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.scope == VK_SCOPE_SUBGROUP_KHR)
+                        c.coopShapes.push_back({s.MSize, s.NSize, s.KSize});
+                c.coopMatF16 = !c.coopShapes.empty();
             }
         }
-        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d (fp16 16x16x16 %d), subgroup %u", c.name.c_str(), c.dot4, c.cooperativeMatrix, c.coopMatF16, c.subgroupSize);
+        std::string shapes;
+        for (auto& m : c.coopShapes) shapes += (shapes.empty() ? "" : " ") + std::to_string(m.m) + "x" + std::to_string(m.n) + "x" + std::to_string(m.k);
+        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d (fp16 -> fp32 MxNxK: %s), subgroup %u (%u-%u)", c.name.c_str(), c.dot4, c.cooperativeMatrix, shapes.empty() ? "none" : shapes.c_str(),
+            c.subgroupSize, c.subgroupMin, c.subgroupMax);
         return true;
     }
 
@@ -518,7 +527,7 @@ public:
     }    struct Staged { nri::Buffer* buf; uint32_t slot, value; };
     std::vector<Staged> uploads;
 
-    std::unique_ptr<Pass> CreatePass(const Shader& s) override
+    std::unique_ptr<Pass> CreatePass(const Shader& s, uint32_t waveLanes) override
     {
         auto p = std::make_unique<PassN>();
         p->dev = this, p->name = s.name;
@@ -547,6 +556,7 @@ public:
         cd.shader.bytecode = isVk ? s.spirv : s.dxil, cd.shader.size = isVk ? s.spirvBytes : s.dxilBytes;
         if (!NRI_OK(n.CreatePipelineLayout(*dev, ld, p->layout))) return Log("%s: layout failed", s.name), nullptr;
         cd.pipelineLayout = p->layout;
+        cd.waveLaneNum = isVk ? waveLanes : 0;
         if (!NRI_OK(n.CreateComputePipeline(*dev, cd, p->pipeline))) return Log("%s: pipeline failed", s.name), nullptr;
         if (Env("NFRUX_TEST_NAMES")) n.SetDebugName(p->pipeline, "NFRUX pipeline");
         return p;

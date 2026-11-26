@@ -1,7 +1,8 @@
 // FSR FG4 network layers on Vulkan cooperative matrices (VK_KHR_cooperative_matrix, fp16 x fp16 -> fp32, 16 x 16 x 16):
 // NFRUX's "coopmat" tier of the ML runtime (core/mlfg). Same layers, constants and results as mlfg_conv.hlsl (the generic
 // tier) but for the order of the fp32 sums. AMD FidelityFX SDK v2.4.0, MIT; spec tools/ffx_extract/mlfg_net.py ('amd').
-// Builds: MLFG_CONV_K / MLFG_CONV_S = 3/1, 2/2, 1/1 or MLFG_CONV_T (transposed 2x2/2); MLFG_SG = the subgroup size.
+// Builds: MLFG_CONV_K / MLFG_CONV_S = 3/1, 2/2, 1/1 or MLFG_CONV_T (transposed 2x2/2); MLFG_SG = the subgroup size (the group's,
+// required at pipeline creation when it is not the default); MLFG_MM / MLFG_MN = the fragment shape.
 // A workgroup is one subgroup and makes 16 output pixels of a row (transposed: 16 input pixels -> 32 x 2 outputs) by 64
 // output channels (transposed: 32), group z; input channels 16 at a time: the 16 pixels' patch is staged in shared memory
 // (fp16) and every tap's A matrix read from it with a pixel stride, the weights' B matrices from the buffer.
@@ -50,6 +51,18 @@ layout(set = 0, binding = 6, std430) readonly buffer Bias { float bias[]; };
 #define NT 1
 #endif
 #define NB MLFG_NB  // 16-channel tiles a group (1: the layers with at most 16 outputs)
+// The fragment shape (the device's fp16 cooperative matrix, K 16): MLFG_MM x MLFG_MN, 8 or 16 each (default 16 x 16).
+#ifndef MLFG_MM
+#define MLFG_MM 16
+#endif
+#ifndef MLFG_MN
+#define MLFG_MN 16
+#endif
+#define SM (16 / MLFG_MM)
+#define SN (16 / MLFG_MN)
+#define ACC coopmat<float, gl_ScopeSubgroup, MLFG_MM, MLFG_MN, gl_MatrixUseAccumulator>
+#define MA coopmat<float16_t, gl_ScopeSubgroup, MLFG_MM, 16, gl_MatrixUseA>
+#define MB coopmat<float16_t, gl_ScopeSubgroup, 16, MLFG_MN, gl_MatrixUseB>
 shared uvec4 sIn[TINW * TINH * 2];  // the patch, 16 channels a pixel (fp16, 8 an element)
 shared float     sC[16 * 16 * NB];
 
@@ -133,10 +146,13 @@ void main()
 #else
     const ivec2 origin = tile * MLFG_CONV_S - PAD;
 #endif
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[NT][NB];
+    // The group's 16 pixels x 16 NB channels as fragments of the device's shape: MLFG_MM x MLFG_MN accumulators (K 16).
+    ACC acc[NT][NB][SM][SN];
     [[unroll]] for (int t = 0; t < NT; ++t)
         [[unroll]] for (int b = 0; b < NB; ++b)
-            acc[t][b] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (int i = 0; i < SM; ++i)
+                [[unroll]] for (int j = 0; j < SN; ++j)
+                    acc[t][b][i][j] = ACC(0.0);
 #if MLFG_CONV_K == 1 && !defined(MLFG_CONV_T)
     // 1x1: the A matrices straight from the tensors when the 16 pixels are inside and the 16-channel chunks are aligned
     // (c_x.z, from the host): no staging.
@@ -145,20 +161,21 @@ void main()
         const uint pix0 = uint(tile.y) * uint(c_in.x) + uint(tile.x);
         for (int c0 = 0; c0 < cin; c0 += 16)
         {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[NT];
-            [[unroll]] for (int t = 0; t < NT; ++t)
+            MA a[SM];
+            [[unroll]] for (int i = 0; i < SM; ++i)
             {
-                const uint pix = pix0 + uint(16 * t);
-                if (c0 < c_in.w) coopMatLoad(a[t], s0, pix * uint(c_in.z) + uint(c_in2.x + c0), uint(c_in.z), gl_CooperativeMatrixLayoutRowMajor);
-                else coopMatLoad(a[t], s1, pix * uint(c_in2.y) + uint(c0 - c_in.w + c_in2.z), uint(c_in2.y), gl_CooperativeMatrixLayoutRowMajor);
+                const uint pix = pix0 + uint(MLFG_MM * i);
+                if (c0 < c_in.w) coopMatLoad(a[i], s0, pix * uint(c_in.z) + uint(c_in2.x + c0), uint(c_in.z), gl_CooperativeMatrixLayoutRowMajor);
+                else coopMatLoad(a[i], s1, pix * uint(c_in2.y) + uint(c0 - c_in.w + c_in2.z), uint(c_in2.y), gl_CooperativeMatrixLayoutRowMajor);
             }
             [[unroll]] for (int b = 0; b < NB; ++b)
-            {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                coopMatLoad(w, wt, uint(c_add.z) + uint(c0 * coP + n0 + b * 16), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (int t = 0; t < NT; ++t)
-                    acc[t][b] = coopMatMulAdd(a[t], w, acc[t][b]);
-            }
+                [[unroll]] for (int j = 0; j < SN; ++j)
+                {
+                    MB w;
+                    coopMatLoad(w, wt, uint(c_add.z) + uint(c0 * coP + n0 + b * 16 + j * MLFG_MN), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (int i = 0; i < SM; ++i)
+                        acc[0][b][i][j] = coopMatMulAdd(a[i], w, acc[0][b][i][j]);
+                }
         }
     }
     else
@@ -189,29 +206,33 @@ void main()
         }
         barrier();
 #ifdef MLFG_CONV_T
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
-        coopMatLoad(a, sIn, 0, 2, gl_CooperativeMatrixLayoutRowMajor);
+        MA a[SM];
+        [[unroll]] for (int i = 0; i < SM; ++i)  // in uvec4s (2 a pixel)
+            coopMatLoad(a[i], sIn, uint(MLFG_MM * i * 2), 2, gl_CooperativeMatrixLayoutRowMajor);
         [[unroll]] for (int t = 0; t < 4; ++t)
             [[unroll]] for (int b = 0; b < NB; ++b)
-            {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
-                acc[t][b] = coopMatMulAdd(a, w, acc[t][b]);
-            }
+                [[unroll]] for (int j = 0; j < SN; ++j)
+                {
+                    MB w;
+                    coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16 + j * MLFG_MN), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (int i = 0; i < SM; ++i)
+                        acc[t][b][i][j] = coopMatMulAdd(a[i], w, acc[t][b][i][j]);
+                }
 #else
         [[unroll]] for (int t = 0; t < MLFG_CONV_K * MLFG_CONV_K; ++t)
         {
             const int ky = t / MLFG_CONV_K, kx = t % MLFG_CONV_K;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[NT];
-            [[unroll]] for (int m = 0; m < NT; ++m)  // in uvec4s (2 a pixel)
-                coopMatLoad(a[m], sIn, uint((ky * TINW + kx + 16 * MLFG_CONV_S * m) * 2), uint(2 * MLFG_CONV_S), gl_CooperativeMatrixLayoutRowMajor);
+            MA a[SM];
+            [[unroll]] for (int i = 0; i < SM; ++i)  // in uvec4s (2 a pixel)
+                coopMatLoad(a[i], sIn, uint((ky * TINW + kx + MLFG_MM * MLFG_CONV_S * i) * 2), uint(2 * MLFG_CONV_S), gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (int b = 0; b < NB; ++b)
-            {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
-                [[unroll]] for (int m = 0; m < NT; ++m)
-                    acc[m][b] = coopMatMulAdd(a[m], w, acc[m][b]);
-            }
+                [[unroll]] for (int j = 0; j < SN; ++j)
+                {
+                    MB w;
+                    coopMatLoad(w, wt, uint(c_add.z) + uint((t * ciPad + c0) * coP + n0 + b * 16 + j * MLFG_MN), uint(coP), gl_CooperativeMatrixLayoutRowMajor);
+                    [[unroll]] for (int i = 0; i < SM; ++i)
+                        acc[0][b][i][j] = coopMatMulAdd(a[i], w, acc[0][b][i][j]);
+                }
         }
 #endif
     }
@@ -220,7 +241,9 @@ void main()
     {
         barrier();
         [[unroll]] for (int b = 0; b < NB; ++b)
-            coopMatStore(acc[t][b], sC, uint(b * 16), uint(16 * NB), gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int i = 0; i < SM; ++i)
+                [[unroll]] for (int j = 0; j < SN; ++j)
+                    coopMatStore(acc[t][b][i][j], sC, uint(MLFG_MM * i * 16 * NB + b * 16 + j * MLFG_MN), uint(16 * NB), gl_CooperativeMatrixLayoutRowMajor);
         barrier();
         for (uint i = li; i < uint(16 * 8 * NB); i += uint(MLFG_SG))
         {

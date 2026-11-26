@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+namespace nfrux::shaders { struct MlfgMatSet; }
 namespace nfrux::mlfg
 {
 enum class Tier { Generic, CoopMat, Cuda };
@@ -99,7 +100,8 @@ private:
     uint32_t                m_frames = 0;
     std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4], m_matN1[2];  // coopmat: layers; narrow (one 16-output tile)
-    std::unique_ptr<Pass>   m_matN2, m_mat1n3;  // coopmat: 3x3 with 17-32 outputs (2 tiles); 1x1 with 48 / 96 outputs (3 tiles)
+    std::unique_ptr<Pass>   m_matN2, m_mat1n3;
+    const shaders::MlfgMatSet* m_matSet = nullptr;  // coopmat: the variant set (fragment shape, subgroup size)  // coopmat: 3x3 with 17-32 outputs (2 tiles); 1x1 with 48 / 96 outputs (3 tiles)
     std::unique_ptr<CudaKernels> m_cuda;
     bool                    m_fused = true;
     bool                    m_m2 = true;
