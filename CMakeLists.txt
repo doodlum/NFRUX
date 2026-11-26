@@ -50,7 +50,7 @@ add_executable(optical_flow_hardware experiments/optical_flow_hardware.cpp)
 target_include_directories(optical_flow_hardware PRIVATE $ENV{VULKAN_SDK}/Include)
 target_link_libraries(optical_flow_hardware $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 
-# What is handed out: the one DLL and the texts its licenses ask for. Nothing else.
+# What is handed out: the one DLL, the texts its licenses ask for, INSTALL.txt and the optional nfrux.ini. Nothing else.
 add_custom_target(package
     COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/package
     COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:nvngx_dlssg> ${CMAKE_BINARY_DIR}/package/nvngx_dlssg.dll

@@ -68,6 +68,8 @@ struct Ini
                 else { notes.push_back("nfrux.ini: " + key + "=" + value + " is not auto, 0 or 1: ignored"); continue; }
             }
             else if (key != "log") value = v;
+            else if (v == "true" || v == "on" || v == "yes") value = "1";  // Log: a flag or a file name
+            else if (v == "false" || v == "off" || v == "no") value = "0";
             values[section + "." + key] = value;
             notes.push_back("nfrux.ini: [" + section + "] " + key + "=" + value);
         }
@@ -82,6 +84,10 @@ struct Ini
         return p.substr(0, p.find_last_of(L"\\/") + 1);
     }
 };
+}
+std::wstring DllFolder() { return Ini::ModuleFolder(); }
+namespace
+{
 const Ini& TheIni() { static const Ini& ini = *new Ini; return ini; }
 }
 const char* Option(const char* section, const char* key)
@@ -102,26 +108,21 @@ void LogOptions()
 }
 bool        EnvFlag(const char* name, bool fallback) { const char* v = Env(name); return v ? strcmp(v, "0") != 0 : fallback; }
 
-static std::string LogPath()
+static std::wstring LogPath()
 {
     const char* v = Env("NFRUX_LOG");
     if (!v || !strcmp(v, "0"))
         return {};
-    if (strcmp(v, "1"))
-        return v;
-    HMODULE module = nullptr;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCSTR>(&LogPath), &module);
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(module, path, MAX_PATH);
-    const std::string s = path;
-    return s.substr(0, s.find_last_of("\\/") + 1) + "nfrux.log";
+    if (!strcmp(v, "1"))
+        return DllFolder() + L"nfrux.log";
+    std::wstring w(strlen(v) + 1, 0);  // a path the user gave, in the system code page
+    w.resize(MultiByteToWideChar(CP_ACP, 0, v, -1, w.data(), int(w.size())) - 1);
+    return w;
 }
-
 void Log(const char* fmt, ...)
 {
     static std::mutex m;
-    static FILE*      file = [] { const std::string p = LogPath(); return p.empty() ? nullptr : fopen(p.c_str(), "w"); }();
+    static FILE*      file = [] { const std::wstring p = LogPath(); return p.empty() ? nullptr : _wfopen(p.c_str(), L"w"); }();
     char    line[2048];
     va_list args;
     va_start(args, fmt);

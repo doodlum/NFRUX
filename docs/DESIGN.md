@@ -53,15 +53,15 @@ license, its clause 4 as an enforceable term, original notices, and a statement 
 
 Capacity: `kMaxGenerated = 5`, one constant for core, frontend and tests (histories, arrays, descriptor counts). n is always
 `DLSSG.MultiFrameCount` as given; t = (i + 1) / (n + 1) is never computed from a clamped count. n > 5: frames 1..5 at their
-own t, the last slots (k > 5, shown just before the real frame) are the back buffer (logged). The reported maximum is 5 (6x), `NFRUX_MAX_FRAMES` lowers it. What Streamline
+own t, the last slots (k > 5, shown just before the real frame) are the back buffer (logged). The reported maximum is 5 (6x); `NFRUX_MAX_FRAMES` (generated frames, 1-5) or nfrux.ini `MaxMultiplier` (2-6) lowers it, the environment winning. What Streamline
 and the host allow on a given GPU is theirs; A4 records it.
 
 Per rendered frame: luma pyramid, hints (camera reprojection of the previous depth, as the SDK; no
 scattered game vectors: measured no gain), optical flow once, reduction to the motion lane (<= 540 rows). Per generated frame: warps, hole fill, 20-channel
 tensor, network, inpainting, composite. A batch runs stage by stage.
 
-The graph is v14: channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0. All quantisation constants are
-`nfru_mfg_v1_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v1: params 0.2640706 / 89, gate 0.00392156 / -128; v2's are not used).
+The graph is v1 (v14's inputs): channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0; 17-18 are clamped to 0..1 (saturate). All quantisation constants are
+`nfru_mfg_v1_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).
 
 Flow at more than 1080 display rows: the SDK's colour reduction pass (01) gets an entry point and the flow, hints, flow scale
 and `_OfInputSizeRcp` use the reduced size (aspect kept, 1080 rows), as the SDK does. Sizes to 8K.
@@ -107,7 +107,7 @@ OutputInterpolated is always written too. A failure is returned only for a missi
 
 Parameters are read through the caller's `NVSDK_NGX_Parameter` vtable.
 PopulateParameters_Impl / capability values: `FrameGeneration.Available` = 1, `.NeedsUpdatedDriver` = 0,
-`.MinDriverVersionMajor/Minor` = 0, `.FeatureInitResult` = Success, `DLSSG.MultiFrameCountMax` = kMaxGenerated, `DLSSG.EstimateVRAMCallback` (an estimate from the display's size).
+`.MinDriverVersionMajor/Minor` = 0, `.FeatureInitResult` = Success, `DLSSG.MultiFrameCountMax` = MaxFrames() (kMaxGenerated, lowered by `NFRUX_MAX_FRAMES` or `MaxMultiplier`), `DLSSG.EstimateVRAMCallback` (an estimate from the display's size).
 `NVSDK_NGX_*_EvaluateFeature_C` is exported beside `EvaluateFeature`.
 
 States (DLSS-FG Programming Guide): D3D12 inputs arrive and leave in NON_PIXEL_SHADER_RESOURCE, outputs in UNORDERED_ACCESS. Vulkan outputs GENERAL; inputs
@@ -169,15 +169,28 @@ Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one AP
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8, fp16 or bf16: the float forms hold every int8 value and
 x - zero point exactly, and their float32 sums are the same integers while every partial sum is below 2^24. The bound (per output channel, max
 |x - zp| * sum |w| + |bias|) is computed from the weights when a network is made: 7,021,312 of 16,777,216 for this one; at 2^24 or more the float forms are not
-used. A prefix of a sum is at most the sum of absolute values, so partial sums are covered. Order when a float form is refused or fails its self-check: int8, dot4, integer. fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only by a host that reports it enabled
-(NFRUX_SetVulkanFeatures; the tests do, the loader does not). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
+used. A prefix of a sum is at most the sum of absolute values, so partial sums are covered. Order when a float form is refused or fails its self-check: int8, dot4, integer. fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only where it is known or assumed enabled
+(NFRUX_SetVulkanFeatures in the tests; the OptiScaler route's assumed features on NVIDIA; the loader does not enable it, so `coopmat_bf16` there falls back). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
 requantisation is off. `conv2d.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
 dilation 1, square kernel and stride, resize on source 0 only, shift >= 1, source strides equal to the words read): graph creation
 checks each layer and the rung fails if any is outside it. The shape list is written by hand in `build_shaders.py`; a shape missing from it fails creation.
 The `[flatten]` two-source load is split so no out-of-range address is formed. Outputs go to buffers and are copied to the
 params / gate textures on every path (paths that write images directly are an optimisation, checked by the same test).
 
-**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML`; a forced rung that is unavailable fails creation. For users, `nfrux.ini` beside the DLL (`core/log.cpp`, environment variables win): `Network` per API falls back to the automatic choice when it cannot be made, and a CUDA forced there still counts crash markers; the self-check applies to every choice.
+**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML` (tests: strict, no crash markers); a forced rung that is unavailable fails creation. For users, `nfrux.ini` beside the DLL (`core/log.cpp`; read once; `;` `#` and inline ` ;` comments; unknown keys logged; `auto` or a missing line is NFRUX's choice; flags take 0/1/true/false/on/off/yes/no). An environment variable wins over its key:
+
+| Section, key | Environment | Values |
+|---|---|---|
+| General MaxMultiplier | `NFRUX_MAX_FRAMES` (generated frames, so one less) | 2-6 |
+| General IgnoreCrashMarkers | `NFRUX_IGNORE_MARKERS` | flag |
+| General Log | `NFRUX_LOG` | flag (nfrux.log and nfrux_loader.log beside the DLL) or a file path |
+| D3D12 Network | `NFRUX_ML` | cuda, dot4, scalar |
+| Vulkan Network | `NFRUX_ML` | cuda, coopmat, coopmat_int8 / fp16 / bf16, dot4, scalar |
+| Vulkan AssumeFeatures | `NFRUX_VK_ASSUME_FEATURES` | flag |
+| Vulkan Dot4Tiled, Dot4Subgroup | `FFX_ML_DOT4_TILED`, `FFX_ML_DOT4_SUBGROUP` | flag; subgroup size |
+| Vulkan FullBarriers | `NFRUX_FULL_BARRIERS` | flag |
+
+`Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
 
 | | 1st | 2nd | floor |
 |---|---|---|---|
@@ -210,20 +223,20 @@ exact but slower than dot4. Neither is a rung.
 
 CUDA: `core/ml/cuda_network.cpp` writes PTX (sm_75, `mma.sync` m8n8k16 s8, one kernel a layer). Nothing is precompiled: the user's own driver links it for
 the GPU it is, on the worker thread, with a short-lived context matched by LUID (checked: the same PTX links for sm_75, 80, 86, 89, 90, 100 and 120). m8n8k16 is as
-fast here as sm_80's m16n8k16, so there is one form. GTX 16 (and T400 to T1200, MX450) reports sm_75 without tensor cores and is told apart by name, whole words (one that begins with RTX, T4, T4G; a table test in `ml_conformance_d3d12`); GTX 10 and 16 use dot4, the
+fast here as sm_80's m16n8k16, so there is one form. GTX 16 (and T400 to T1200, MX450) reports sm_75 without tensor cores and is told apart by name, whole words (a word that begins with RTX, or is exactly T4 or T4G; a table test in `ml_conformance_d3d12`); GTX 10 and 16 use dot4, the
 same hardware instruction CUDA would. Cubins are kept in memory only. NVAPI `CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` by public interface id
-launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS.
+launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS. Layer class of this rung (else it fails creation): square kernel up to 7, equal strides, dilation 1, weight zero point 0, single-rounding 32-bit rescale with shifts 2-62, up to 64 output channels, two sources only without resize. Layout: a warp computes 8 output pixels by 8 channels per mma tile; a layer of 20,000 output pixels or more gives a warp 2 such columns by up to 8 channel tiles, a smaller one (the low-resolution end of the U-Net) 1 by 1, so it has 8x the warps to fill the GPU (5-8% faster overall on the RTX 4070, 46 SMs; the threshold is not scaled by SM count; exact either way, RESULTS).
 
 On Vulkan the same kernels are launched by vkCmdCuLaunchKernelNVX (`core/ml/cuda_vulkan.cpp`): buffers by address, a full memory barrier where a layer reads what the last wrote. The loader enables the extension and
 bufferDeviceAddress; Streamline enables the extension itself, so on the OptiScaler route its presence is asked (the function's address) and buffer addresses are assumed with it. Same marker and self-check. A batch's networks run a
 layer at a time on both APIs (independent launches between barriers).
 
-AMD and Intel matrix hardware is reached through Vulkan cooperative matrices: any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
+AMD and Intel matrix hardware is reached through Vulkan cooperative matrices (behind a crash marker of their own off NVIDIA, since untested there: refused, dot4; tested on the RTX 4070 by forcing it, `NFRUX_TEST_MAT_MARKER`): any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
 the size can be required, else the driver's own. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to
 them (no cooperative vectors in the retail runtime; AMD's and Intel's are device-creation or vendor-driver extensions), so dot4.
-Crash safety, for what depends on vendor-specific launches (CUDA on both APIs) or on features the game may not have enabled (the NVIDIA default on the OptiScaler route): before the first use in a process an "attempts" file, named by
-device and driver file time, is counted up; it is removed when 40 recordings have completed since the network first ran at its real size (the 64-wide self-check does not count), or on an orderly end, and kept after a failed
-self-check or a device removal. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder: not used. The assumed features' marker is begun only when a network that is not CUDA's uses them. A game closed twice in its
+Crash safety, for what depends on vendor-specific launches (CUDA on both APIs) or on features the game may not have enabled (the NVIDIA default on the OptiScaler route): before the first use in a process an "attempts" file in %LOCALAPPDATA%\NFRUX (wide paths; logged with its name), named by
+rung, device (D3D12: also the adapter LUID) and nvcuda.dll's file time, is counted up; it is removed when 40 recordings have completed since the network first ran at its real size (the 64-wide self-check does not count), or on an orderly end, and kept after a failed
+self-check or (D3D12) a device removal; on Vulkan a device loss is not detected at teardown, so an orderly end after one clears it. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder or not writable: not used, logged. The assumed features' marker is begun only when a network that is not CUDA's uses them. A game closed twice in its
 first seconds has the same effect. Tested with a process that ends at the first real run. A device loss in the game's process cannot be recovered and is not claimed to be. A network made in place of one that could not be created at
 the real size has not been self-checked itself (the rung was: 64 wide). Where the features are known enabled, the cooperative-matrix and dot4 rungs are plain API use and have only the self-check.
 **D4. Optical flow.** The compute block match the network was trained with, everywhere. NVIDIA's optical flow hardware was measured (A12,
@@ -251,7 +264,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
 
 0. One file (2026-11-25): `nvngx_dlssg.dll` holds everything (shaders, weights, NRI, the loader, the C++ runtime statically). Its role is its file name:
    `nvngx_dlssg.dll` or `dlssg_to_fsr3_amd_is_better.dll` the feature; `dbghelp.dll` or `version.dll` the feature and the loader (their exports are
-   forwarded to Windows' own). Uninstalling is deleting it. The `package` target holds the DLL, INSTALL.txt, THIRD_PARTY.md and the license texts, nothing else. The DLL pins
+   forwarded to Windows' own). Uninstalling is deleting it. The `package` target holds the DLL, INSTALL.txt, THIRD_PARTY.md, the optional nfrux.ini (all auto) and the license texts, nothing else. The DLL pins
    itself when it hooks (patched imports point into it).
 1. OptiScaler, two routes:
    a. Releases (0.9.5 the newest): the dlssg-to-fsr3 slot. The DLL as `dlssg_to_fsr3_amd_is_better.dll` beside OptiScaler, `FGInput=nukems`, `FGOutput=nukems`.
@@ -355,7 +368,7 @@ RGB10A2; normal and inverted depth; odd sizes.
 | A11 | Import table and API call check: the DLL opens no shared handles and loads no other graphics API's DLL at run time (both are delay-loaded) (nvapi, nvcuda exempt on their rungs) in each mode | pass |
 | A12 | Optical flow hardware vs block match: true-frame PSNR on `test_bal`, `test_new` and cost, offline | recorded; delivered only within 0.05 dB (it is not) |
 | A13 | Licensing: THIRD_PARTY.md, model license shipped, changes stated | recorded |
-| A14 | Quality: PSNR vs true frames, 2x-6x, NFRUX vs Arm NFRU v2 (as released, and with NFRUX's timestep prior), held-out clips | recorded; mean not below Arm's at any multiplier |
+| A14 | Quality: LPIPS (alex) and PSNR vs true frames, 2x-6x, NFRUX vs Arm NFRU v2 (as released, and with NFRUX's timestep prior), held-out clips, `tests/quality_reference.py`; and a crop sheet looked at | recorded; mean LPIPS not above Arm's at any multiplier (PSNR recorded only: it rewards blending candidates, which looks soft; changed 2026-11-26 after review). v1: fails at 2x and 4x (RESULTS), open until a model that passes replaces it |
 | A15 | `package` target: its files listed; the DLL's imports; every license text THIRD_PARTY.md names is in it; no file name or text of a source project (search); installed and removed by one file copy as dbghelp.dll and as version.dll | as R9 |
 
 Why these numbers: a uniform 1-code error everywhere is 48 dB, 1 code on 6% of channels is 60 dB. 0.2 dB is the run-to-run noise of the training evals.

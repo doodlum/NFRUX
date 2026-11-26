@@ -164,6 +164,7 @@ public:
         wrapped.clear(), retired.clear(), scratch.clear();
         if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : Rung());
         if (vkMarked && !vk.marker.empty()) MarkerOk(vk.marker);
+        if (!matMarker.empty() && !Lost()) MarkerOk(matMarker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
         for (auto* x : pools) if (x) n.DestroyDescriptorPool(x);
@@ -405,6 +406,7 @@ public:
     bool        vkMarked = false;  // the assumed features' marker is begun
     bool        vkCuda = false;  // Vulkan: the last network made runs CUDA kernels
     std::string cudaMarker;
+    std::string matMarker;  // cooperative matrices off NVIDIA (untested there): begun, cleared like the others
     bool lastFloat = false, noFloats = false;  // float cooperative matrices: the last made, refused
     int rung = -1, topRung = 0;  // 0 cooperative matrices / CUDA, 1 dot4, 2 integers: the last made, the highest allowed
     bool DropRung() override
@@ -413,7 +415,7 @@ public:
         if (rung < 0 || rung >= 2) return false;
         if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
         if (isVk && rung == 0 && vkCuda) { cudaState = -1, vkCuda = false, cudaMarker.clear(); return true; }  // its marker stays; cooperative matrices next
-        if (isVk) vk.marker.clear();
+        if (isVk) vk.marker.clear(), matMarker.clear();  // a failed self-check keeps both markers
         if (isVk && rung == 0 && lastFloat && !noFloats) { noFloats = true; return true; }  // the int8 matrices next, if there are any
         topRung = rung + 1;
         return true;
@@ -490,6 +492,22 @@ public:
             }
             else
             {
+                // Off NVIDIA cooperative matrices are untested (no such GPU here): a driver that hangs creating or running them would hang every
+                // start, which the self-check cannot see. A marker of their own, as CUDA has; refused: dot4. NFRUX_ML (tests) is not guarded.
+                if (sel.path == ffx_ml::Path::CoopMat && (c.vendorId != uint32_t(nri::Vendor::NVIDIA) || EnvFlag("NFRUX_TEST_MAT_MARKER", false)) && (!ml || guarded) && matMarker.empty())
+                {
+                    char b[48];
+                    snprintf(b, sizeof(b), "vulkan_coopmat_%04x_%04x", c.vendorId, c.deviceId);
+                    if (MarkerBegin(b)) matMarker = b;
+                    else
+                    {
+                        if (ml) { if (error) *error = "cooperative matrices: crash marker"; return nullptr; }
+                        topRung = 1, lastFloat = false;
+                        sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Dot4, ffx_ml::MatType::None);
+                        if (sel.path != ffx_ml::Path::Dot4) topRung = 2, sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
+                        sel.rescaleFloat = false, rung = sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
+                    }
+                }
                 if (!vk.marker.empty() && !vkMarked && sel.path != ffx_ml::Path::Scalar)
                 {
                     vkMarked = MarkerBegin(vk.marker);
@@ -599,6 +617,7 @@ public:
         // Recordings from well after the network first ran have completed (those before it say nothing).
         if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : Rung());
         if (vkMarked && !vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
+        if (!matMarker.empty() && ran && finished >= firstRun + 40) MarkerOk(matMarker), matMarker.clear();
         nativeCmd = commands, t_recording = true;
         if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));
         if (isVk)

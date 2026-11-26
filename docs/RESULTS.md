@@ -101,7 +101,7 @@ A loader regression was caught by these (the loader patched its own imports: sta
 
 `experiments/cuda_launch.cpp`: PTX linked by nvcuda.dll (no toolkit), launched by NVAPI in a D3D12 compute list; chained kernels with UAV barriers 0 of 4096
 wrong, `mma.sync` m16n8k16 s8 product 0 of 128 wrong. `core/ml/cuda_network.cpp`: the whole network, one generated kernel per layer, exact against
-the CPU reference (64x64: 23 cases, 744x464 and 960x544: 5 each, 0 bytes). sm_80 and newer (RTX 30+); older NVIDIA GPUs fall to dot4. Creation
+the CPU reference (64x64: 23 cases, 744x464 and 960x544: 5 each, 0 bytes). sm_80 and newer (RTX 30+) at the time; superseded: m8n8k16 runs on sm_75 (RTX 20) as well (DESIGN D3). Creation
 about 0.7 s the first time at a size, under 0.05 s from the cubin cache (LOCALAPPDATA\NFRUX) - still inside Evaluate (worker thread owed).
 
 Time a network, 40 back to back, idle RTX 4070: 744x464 CUDA 0.155 ms, dot4 0.42, int32 0.85; 960x544 CUDA 0.194, dot4 0.58-0.63, int32 1.02
@@ -479,3 +479,20 @@ nfrux.ini (2026-11-25, headless harness, RTX 4070): every Network value on both 
 Shaders (2026-11-25, Vulkan timestamps, medians a dispatch over the harness's --time run, RTX 4070, training running): postprocess 0.0430 -> 0.0399 ms (the UI test one fetch a pixel through group memory), preprocess 0.0594 -> 0.0522 (gathers), one flow match dispatch 0.0164 -> 0.0143 (seven offsets between barriers). Output files of the recorded (24 an API) and synthetic (27 an API) scenes are byte-identical to before on both APIs in the shipped build; strict build: D3D12 and Vulkan identical, 63 of 63. NFRUX_TEST_TIMES now logs medians.
 
 Network, CUDA (2026-11-26, ml_conformance_d3d12, RTX 4070 idle with clocks held up, 6 runs, median): a layer under 20k pixels runs 1 output column x 1 channel tile a warp instead of 2 x 8, so the small U-Net layers fill the GPU. 744x464 0.166 -> 0.153 ms, 960x544 0.229 -> 0.218 ms. Splitting every layer that way, or reordering layers by depth (already in order), did not help. Exact on both APIs; NGX harness 158 checks, 0 failed. An idle RTX 40 stays at 210 MHz through a short test: earlier timings taken idle or beside training were unusable.
+
+## Review fixes and A3 / A14 with v1 (2026-11-26)
+
+Two design reviews (architecture: approve with changes; code accuracy: accurate with fixes). Fixed: the input quantisation constants were still v14's (1/255, 0.498039), now v1's metadata (0.003921557, 0.4980377); cooperative matrices off NVIDIA behind a crash marker of their own (refused: dot4; an ini-forced coopmat falls back, logged; tested on the RTX 4070 with NFRUX_TEST_MAT_MARKER, NGX harness Vulkan 78 checks, 0 failed, each way); markers and logs use wide paths and log their file (a user name outside the code page lost CUDA silently); Log=true / yes is a flag; the loader's log is beside the DLL. DESIGN corrected where the reviews found it wrong (ini table, MultiFrameCountMax, CUDA layer class and layout, bf16, markers, package).
+
+Strict build after the change: A5 replay of both 64-frame recordings at 2x, 4x and 6x, D3D12 against Vulkan, 0 differing bytes in every intermediate and output; A2a synthetic scenes (1080p, 4K, 8K, 3440x1440, 1277x719 at 2x/4x/6x; BGRA8 and RGB10A2; inverted depth): 22 of 22 identical.
+
+A3 / A14, test_new, 4 pairs a clip, shipped D3D12 build (`tests/quality_reference.py`, LPIPS added):
+
+| | 2x | 3x | 4x | 5x | 6x |
+|---|---|---|---|---|---|
+| NFRUX PSNR / LPIPS | 38.15 / .0414 | 39.16 / .0322 | 40.35 / .0395 | 33.56 / .0586 | 37.21 / .0373 |
+| torch v1 | 38.05 / .0416 | 39.23 / .0320 | 40.35 / .0395 | 33.51 / .0587 | 37.12 / .0373 |
+| Arm as released | 38.05 / .0395 | 38.79 / .0328 | 40.52 / .0374 | 33.44 / .0637 | 36.52 / .0387 |
+| Arm with prior | 38.05 / .0395 | 38.94 / .0320 | 40.56 / .0368 | 33.75 / .0589 | 36.76 / .0371 |
+
+A3 passes: NFRUX within 0.1 dB of torch on every multiplier's mean (limit 0.2; worst single frame -1.66 dB at 3x on a 57 dB pair). A14 (LPIPS, not above Arm as released) fails at 2x and 4x for v1, passes at 3x, 5x and 6x; PSNR says the same at 4x. The v15 retrain (LPIPS 0.5, no oracle loss) beat Arm at 2x-6x in its 4k-step probe and is the candidate to close it.

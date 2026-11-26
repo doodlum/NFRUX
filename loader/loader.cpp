@@ -17,7 +17,7 @@
 
 static FILE* g_log;
 static std::mutex g_m;
-static void L(const char* f, ...) { static const bool on = nfrux::Env("NFRUX_LOG") && strcmp(nfrux::Env("NFRUX_LOG"), "0"); if (!on) return; std::lock_guard<std::mutex> k(g_m); if (!g_log && !(g_log = fopen("nfrux_loader.log", "w"))) return; va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
+static void L(const char* f, ...) { static const bool on = nfrux::Env("NFRUX_LOG") && strcmp(nfrux::Env("NFRUX_LOG"), "0"); if (!on) return; std::lock_guard<std::mutex> k(g_m); if (!g_log && !(g_log = _wfopen((nfrux::DllFolder() + L"nfrux_loader.log").c_str(), L"w"))) return; va_list a; va_start(a, f); vfprintf(g_log, f, a); va_end(a); fputc('\n', g_log); fflush(g_log); }
 
 static std::map<std::string, void*> g_real;
 static std::set<void*> g_handles;

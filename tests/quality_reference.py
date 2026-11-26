@@ -4,6 +4,7 @@ held-out clips with true in-between frames. Runs in C:\\dev\\modelgym's venv; gy
 import json, os, random, subprocess, sys
 from pathlib import Path
 import numpy as np, torch
+import lpips
 sys.path.insert(0, r"C:\dev\modelgym\ng-model-gym\src")
 from ng_model_gym.usecases.nfru_mfg import pipeline as P
 from ng_model_gym.usecases.nfru_mfg.data_utils import load_pair
@@ -18,7 +19,7 @@ PAIRS = int(os.environ.get("PAIRS", "4"))
 out = Path(sys.argv[1]); tmp = out.parent / "rec"; gen = out.parent / "gen"
 for d in (tmp, gen): d.mkdir(parents=True, exist_ok=True)
 seqs = [p for d in (sys.argv[2:] or [r"C:\dev\modelgym\data\nfru6x\test_new"]) for p in sorted(Path(d).rglob("*.safetensors")) if os.environ.get("ONLY", "") in p.name]
-dev = torch.device("cuda"); cfg = PairDataset(seqs, 1, train=False); fe = FlowEstimator().to(dev)
+lp = None; dev = torch.device("cuda"); cfg = PairDataset(seqs, 1, train=False); fe = FlowEstimator().to(dev)
 tone = lambda x: (lambda y: y / (1 + y))(x * float(np.exp(2.0)))
 
 
@@ -62,6 +63,10 @@ def ours(w, h, n):
 acc, nets = {}, {}
 where = []
 def add(who, n, seq, v): acc.setdefault(who, {}).setdefault(f"{n}x", []).append(v)
+def both(who, n, seq, img, g):  # PSNR, and LPIPS (alex) under "who:lpips": A14 judges on LPIPS
+    global lp
+    lp = lp or lpips.LPIPS(net="alex", verbose=False).to(dev)
+    add(who, n, seq, psnr(img, g)); add(who + ":lpips", n, seq, lp(img.to(dev), g.to(dev), normalize=True).item())
 first = True
 for info in cfg.infos:
     s = info.step
@@ -83,16 +88,16 @@ for info in cfg.infos:
                     best.append((np.mean([psnr(f[None, :, y0:y0 + ch, x0:x0 + cw], g) for f, g in zip(ours(w, h, n), gt)]), sg))
                 print("motion vector sign", best, flush=True); SIGN = max(best)[1]; export(info, p1); first = False
             where += [(n, info.path.stem, p1, k) for k in range(n - 1)]
-            for f, g in zip(ours(w, h, n), gt): add("nfrux", n, info, psnr(f[None, :, y0:y0 + ch, x0:x0 + cw], g))
+            for f, g in zip(ours(w, h, n), gt): both("nfrux", n, info, f[None, :, y0:y0 + ch, x0:x0 + cw], g)
             with torch.no_grad():
                 st = build_state(d, fe, dev)
                 for who, ck in CKPT.items():
                     net, tc = load_net(ck, dev)
                     for j, t in enumerate(d["t"].tolist()):
                         o, _ = P.run_timestep(st, t, net, tc, display_crop=crop, logit_prior=who != "arm")
-                        add(who, n, info, psnr((o.cpu().clamp(0, 1) * 255).round() / 255, gt[j]))
+                        both(who, n, info, (o.cpu().clamp(0, 1) * 255).round() / 255, gt[j])
             for j, t in enumerate(d["t"].tolist()):
-                add("blend", n, info, psnr(((1 - t) * d["rgb_m1"] + t * d["rgb_p1"])[None, :, y0:y0 + ch, x0:x0 + cw], gt[j]))
+                both("blend", n, info, ((1 - t) * d["rgb_m1"] + t * d["rgb_p1"])[None, :, y0:y0 + ch, x0:x0 + cw], gt[j])
     print(info.path.stem, {a: {k: round(float(np.mean(v)), 2) for k, v in b.items()} for a, b in acc.items()}, flush=True)
 for k in sorted(acc["nfrux"]):  # the gap to torch by which generated frame
     n = int(k[0]); a, b = np.array(acc["nfrux"][k]).reshape(-1, n - 1), np.array(acc["torch"][k]).reshape(-1, n - 1)
@@ -104,8 +109,8 @@ hard = {}
 for k in acc["nfrux"]:
     m = np.array(acc["torch"][k]) < 45
     for a in acc: hard.setdefault(a, {})[k] = float(np.mean(np.array(acc[a][k])[m])) if m.any() else None
-print("pairs under 45 dB in torch:", {k: (int((np.array(acc["torch"][k]) < 45).sum()), {a: round(hard[a][k], 2) for a in hard if hard[a][k]}) for k in sorted(hard["torch"])})
+hard = {a: h for a, h in hard.items() if not a.endswith(":lpips")}; print("pairs under 45 dB in torch:", {k: (int((np.array(acc["torch"][k]) < 45).sum()), {a: round(hard[a][k], 2) for a in hard if hard[a][k]}) for k in sorted(hard["torch"])})
 res = {a: {k: [float(np.mean(v)), len(v)] for k, v in sorted(b.items())} for a, b in acc.items()}
 out.write_text(json.dumps(res, indent=1))
 for k in sorted(acc["nfrux"]):
-    print(k, {a: round(res[a][k][0], 2) for a in res}, "n", res["nfrux"][k][1])
+    print(k, {a: round(res[a][k][0], 4 if a.endswith(":lpips") else 2) for a in res}, "n", res["nfrux"][k][1])
