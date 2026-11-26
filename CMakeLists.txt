@@ -49,6 +49,10 @@ target_link_libraries(directml_convolution d3d12 dxgi dxguid DirectML)
 add_executable(optical_flow_hardware experiments/optical_flow_hardware.cpp)
 target_include_directories(optical_flow_hardware PRIVATE $ENV{VULKAN_SDK}/Include)
 target_link_libraries(optical_flow_hardware $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
+# Records the GPU work of AMD's FSR Frame Generation 4 DLL (docs/FFX_MLFG.md).
+add_executable(ffx_capture tools/ffx_extract/ffx_capture.cpp)
+target_include_directories(ffx_capture PRIVATE $ENV{VULKAN_SDK}/Include third_party/ffx_api)
+target_link_libraries(ffx_capture $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 
 # What is handed out: the one DLL, the texts its licenses ask for, INSTALL.txt and the optional nfrux.ini. Nothing else.
 add_custom_target(package
