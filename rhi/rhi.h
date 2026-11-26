@@ -83,7 +83,7 @@ struct Caps
     uint32_t    vendorId = 0, deviceId = 0;
     bool        native16Bit = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
     uint32_t    shaderModel = 0;  // D3D12: 60, 62, 64, 66, ...
-    bool        vulkan = false;
+    bool        vulkan = false, nvidia = false;
     // Vulkan: 16 x 16 x 16 fp16 x fp16 -> fp32 cooperative matrices usable (with 16-bit storage and the memory model
     // enabled), and the subgroup size compute shaders get.
     bool        coopMatF16 = false;
@@ -123,6 +123,11 @@ public:
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;
 
     virtual bool DropRung() = 0;  // the next network is made one rung lower; false: there is none
+    // D3D12, for CUDA kernels on NFRUX's buffers (core/mlfg): the device; the buffers into UNORDERED_ACCESS (a UAV barrier
+    // where they already are) and the current command list; a buffer's GPU virtual address. Null / 0 on Vulkan.
+    virtual void*    NativeDevice() { return nullptr; }
+    virtual void*    NativeAccess(const Buffer* const* buffers, uint32_t count) { return nullptr; }
+    virtual uint64_t NativeAddress(const Buffer& buffer) { return 0; }
     // A frame's recording into the host's command buffer / list; every wrapped image is back in its own state at EndFrame.
     virtual bool BeginFrame(void* commands) = 0;
     virtual void EndFrame() = 0;

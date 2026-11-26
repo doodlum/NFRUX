@@ -5,6 +5,7 @@
 #include "log.h"
 #include "marker.h"
 #include "mlfg_coopmat.h"
+#include "mlfg_cuda.h"
 #include "nfrux_shaders.h"
 
 #include <algorithm>
@@ -84,7 +85,7 @@ float Fp8(uint8_t b)
 }
 }  // namespace
 
-const char* TierName(Tier t) { return t == Tier::CoopMat ? "coopmat" : "generic"; }
+const char* TierName(Tier t) { return t == Tier::CoopMat ? "coopmat" : t == Tier::Cuda ? "cuda" : "generic"; }
 
 float Weights::W(uint32_t l, size_t i) const
 {
@@ -147,7 +148,7 @@ Network::~Network() = default;
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : "generic HLSL kernels (fp32, strict)";
+    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? "CUDA kernels, fp16 tensor cores (D3D12)" : "generic HLSL kernels (fp32, strict)";
 }
 
 bool Network::SelectTier(std::string* error)
@@ -159,10 +160,38 @@ bool Network::SelectTier(std::string* error)
     const char* want = env ? env : ini;
     m_tier = Tier::Generic;
     if (want && !strcmp(want, "generic")) return true;
-    if (want && strcmp(want, "coopmat"))
+    if (want && strcmp(want, "coopmat") && strcmp(want, "cuda"))
     {
-        if (env) { if (error) *error = std::string("NFRUX_MLFG=") + want + ": not generic or coopmat"; return false; }
-        Log("nfrux.ini: AmdNetwork=%s is not generic or coopmat: the automatic choice", want);
+        if (env) { if (error) *error = std::string("NFRUX_MLFG=") + want + ": not generic, coopmat or cuda"; return false; }
+        Log("nfrux.ini: AmdNetwork=%s is not generic, coopmat or cuda: the automatic choice", want);
+        want = nullptr;
+    }
+    // D3D12 on NVIDIA RTX: CUDA kernels on fp16 tensor cores (NVAPI launch), behind a crash marker as the int8 runtime's CUDA.
+    const bool cudaWanted = want ? !strcmp(want, "cuda") : (!caps.vulkan && caps.nvidia);
+    if (cudaWanted && !caps.vulkan)
+    {
+        std::string why;
+        char        b[64];
+        snprintf(b, sizeof(b), "d3d12_mlfg_cuda_%04x", caps.deviceId);
+        if (env || MarkerBegin(b))
+        {
+            if ((m_cuda = CudaKernels::Create(m_dev, &why)))
+            {
+                if (!env) m_marker = b;
+                m_tier = Tier::Cuda;
+                return true;
+            }
+            if (!env) MarkerOk(b);
+        }
+        else why = "crash marker";
+        if (env) { if (error) *error = "NFRUX_MLFG=cuda: " + why; return false; }
+        Log("FSR FG4 network: CUDA not used (%s)", why.c_str());
+        if (want) want = nullptr;
+    }
+    else if (want && !strcmp(want, "cuda"))
+    {
+        if (env) { if (error) *error = "NFRUX_MLFG=cuda: D3D12 only (Vulkan: coopmat)"; return false; }
+        Log("nfrux.ini: AmdNetwork=cuda is D3D12's: the automatic choice");
         want = nullptr;
     }
     if (want && !mat)
@@ -173,7 +202,7 @@ bool Network::SelectTier(std::string* error)
     }
     if (!mat) return true;
     // Off NVIDIA the cooperative matrices are untested (no such GPU here): a crash marker of their own, as the int8 runtime's.
-    if (!env && caps.vendorId != 0x10DE)
+    if (!env && !caps.nvidia)
     {
         char b[64];
         snprintf(b, sizeof(b), "vulkan_mlfg_coopmat_%04x_%04x", caps.vendorId, caps.deviceId);
@@ -195,7 +224,41 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     if (l0w % 32 || l0h % 32 || s2w % 4 || s2h % 4) return fail("network sizes");
     if (!SelectTier(error)) return false;
     m_offset.resize(kLayers), m_biasOffset.resize(kLayers);
-    if (m_tier == Tier::CoopMat)
+    if (m_tier == Tier::Cuda)
+    {
+        // mma fragments: per layer [kc][tap][ntp][lane] words, word = (W[k = 8 kc + 2q][n], W[k + 1][n]), n = 8 nt + g, lane = 4g + q;
+        // ntp = the n tiles rounded up to the kernel's 8 (transposed: 4). Biases fp32 [coPad64].
+        std::vector<uint32_t> h;
+        std::vector<float>    bias;
+        for (uint32_t l = 0; l < kLayers; ++l)
+        {
+            const LayerWeights& L = m_weights.layers[l];
+            const uint32_t taps = L.k * L.k, kc = (L.cin + 7) / 8, nb = L.kind == 1 ? 4 : 8, nt = (L.cout + 7) / 8, ntp = (nt + nb - 1) / nb * nb;
+            const uint32_t coP = (L.cout + 63) & ~63u;
+            m_offset[l] = uint32_t(h.size()), m_biasOffset[l] = uint32_t(bias.size());
+            h.resize(h.size() + size_t(kc) * taps * ntp * 32, 0);
+            bias.resize(bias.size() + std::max(coP, ntp * 8), 0.0f);
+            uint32_t* w = h.data() + m_offset[l];
+            auto at = [&](uint32_t t, uint32_t i, uint32_t o) -> uint16_t {
+                if (i >= L.cin || o >= L.cout) return 0;
+                return HalfBits(m_weights.W(l, L.kind == 0 ? (size_t(o) * L.cin + i) * taps + t : (size_t(i) * L.cout + o) * taps + t));
+            };
+            for (uint32_t c = 0; c < kc; ++c)
+                for (uint32_t t = 0; t < taps; ++t)
+                    for (uint32_t n = 0; n < ntp; ++n)
+                        for (uint32_t lane = 0; lane < 32; ++lane)
+                        {
+                            const uint32_t g = lane >> 2, q = lane & 3, k = c * 8 + 2 * q, o = n * 8 + g;
+                            w[((size_t(c) * taps + t) * ntp + n) * 32 + lane] = at(t, k, o) | (uint32_t(at(t, k + 1, o)) << 16);
+                        }
+            for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
+        }
+        m_blob.resize(h.size() * 4), memcpy(m_blob.data(), h.data(), m_blob.size());
+        m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
+        m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
+        if (!m_gpuWeights || !m_gpuBias) return fail("weights buffer");
+    }
+    else if (m_tier == Tier::CoopMat)
     {
         // fp16 [tap][ciPad16][coPad64], biases fp32 [coPad64].
         std::vector<uint16_t> h;
@@ -307,6 +370,22 @@ bool Network::Run(const Conv& c)
     const uint32_t writeEnd = c.writeEnd ? c.writeEnd : (L.cout + 1) & ~1u;
     if (!c.src || !c.out || (writeEnd & 1) || (c.out.ch & 1) || c.out.ch + writeEnd > c.out.pitch) return false;
     const View& s1 = c.src1 ? c.src1 : c.src;
+    if (m_tier == Tier::Cuda)
+    {
+        const uint32_t split = std::min(c.split, L.cin), nb = L.kind == 1 ? 4 : 8, nt = (std::max(L.cout, writeEnd) + 7) / 8, ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
+        if (nt > ntp || (split < L.cin && split % 8)) return false;
+        const Buffer* bufs[] = {c.src.buf, s1.buf, m_gpuWeights.get(), m_gpuBias.get(), c.add ? c.add.buf : c.src.buf, c.out.buf};
+        void* list = m_dev.NativeAccess(bufs, 6);
+        if (!list) return false;
+        CudaParams p = {m_dev.NativeAddress(*bufs[0]), m_dev.NativeAddress(*bufs[1]), m_dev.NativeAddress(*bufs[2]) + uint64_t(m_offset[c.layer]) * 4,
+                        m_dev.NativeAddress(*bufs[3]) + uint64_t(m_biasOffset[c.layer]) * 4, m_dev.NativeAddress(*bufs[4]), m_dev.NativeAddress(*bufs[5]),
+                        int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch) - int32_t(split), int32_t(split), int32_t(L.cin),
+                        int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch), int32_t(L.cout), int32_t(writeEnd), int32_t(c.act), c.fp8 ? 1 : 0,
+                        c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t((L.cin + 7) / 8), int32_t(ntp)};
+        const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+        const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, L.kind == 1 ? c.src.h : c.out.h, ntp / nb};
+        return m_cuda->Launch(list, shape, grid, p);
+    }
     if (m_tier == Tier::CoopMat)
     {
         struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {

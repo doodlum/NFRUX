@@ -199,6 +199,7 @@ public:
                    : NRI_OK(nri::nriGetInterface(*dev, NRI_INTERFACE(nri::WrapperD3D12Interface), &nd3)))) return false;
         const nri::DeviceDesc& dd = n.GetDeviceDesc(*dev);
         c.name = dd.adapterDesc.name, c.vendorId = uint32_t(dd.adapterDesc.vendor), c.deviceId = dd.adapterDesc.deviceId;
+        c.nvidia = dd.adapterDesc.vendor == nri::Vendor::NVIDIA;
         for (uint32_t i = 0; i < 4; ++i)
         {
             nri::SamplerDesc s = {};
@@ -400,6 +401,23 @@ public:
         n.CmdCopyBuffer(*cmd, *b.buf, 0, *up, 0, size);
         uploads.push_back({up, slot, slotValue[slot]});  // freed once its recording has finished
         return true;
+    }
+    void* NativeDevice() override { return isVk ? nullptr : d3d; }
+    void* NativeAccess(const Buffer* const* buffers, uint32_t count) override
+    {
+        if (isVk || !cmd) return nullptr;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            bool seen = false;
+            for (uint32_t j = 0; j < i; ++j) seen = seen || buffers[j] == buffers[i];
+            if (!seen) To(static_cast<const BufN&>(*buffers[i]), nri::AccessBits::SHADER_RESOURCE_STORAGE, nri::StageBits::COMPUTE_SHADER);
+        }
+        Flush();
+        return nativeCmd;
+    }
+    uint64_t NativeAddress(const Buffer& b) override
+    {
+        return isVk ? 0 : reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(static_cast<const BufN&>(b).buf))->GetGPUVirtualAddress();
     }
     struct Staged { nri::Buffer* buf; uint32_t slot, value; };
     std::vector<Staged> uploads;

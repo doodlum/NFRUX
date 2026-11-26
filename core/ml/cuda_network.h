@@ -13,6 +13,18 @@
 namespace nfrux
 {
 bool HasTensorCores(const char* name);  // an sm_75 device, by its name
+// The same CUDA path for other kernels (core/mlfg): PTX linked by the driver for the adapter, NVAPI modules and launches
+// into a D3D12 command list (buffers by GPU virtual address, in UNORDERED_ACCESS).
+namespace cuda
+{
+bool                 Available();                                       // NVAPI's CUDA launch and nvcuda.dll
+int                  ComputeCapability(LUID luid, std::string* error);  // 0: no tensor cores
+std::vector<uint8_t> Cubin(const std::string& ptx, LUID luid, std::string* error);  // cached per process and text
+void*                CreateModule(ID3D12Device* device, const std::vector<uint8_t>& cubin);
+void*                CreateFunction(ID3D12Device* device, void* module, const char* name);
+void                 Destroy(ID3D12Device* device, void* module, const std::vector<void*>& functions);
+bool                 Launch(ID3D12GraphicsCommandList* list, void* function, const uint32_t grid[3], uint32_t block, const void* params, uint32_t size);
+}  // namespace cuda
 // What both APIs launch: the kernels linked for the GPU, the constants and the layers.
 struct CudaPlan
 {

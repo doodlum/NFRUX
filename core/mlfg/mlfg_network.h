@@ -5,9 +5,11 @@
 // [Vulkan] AmdNetwork or NFRUX_MLFG):
 //   generic   HLSL kernels (kMlfgConv*), both APIs, any D3D12 FL12 / Vulkan 1.1 GPU; strict: the same bytes everywhere
 //   coopmat   Vulkan cooperative matrices fp16 x fp16 -> fp32 (VK_KHR_cooperative_matrix), every layer
+//   cuda      D3D12 on NVIDIA RTX: CUDA kernels, mma.sync fp16 -> fp32 (NVAPI launch, as the int8 network's)
 // A tier that is not the generic one gives the generic tier's results within fp32 summation-order differences.
 // SPDX-License-Identifier: MIT
 #pragma once
+#include "mlfg_cuda.h"
 #include "rhi.h"
 
 #include <memory>
@@ -16,7 +18,7 @@
 
 namespace nfrux::mlfg
 {
-enum class Tier { Generic, CoopMat };
+enum class Tier { Generic, CoopMat, Cuda };
 const char* TierName(Tier t);
 
 // The weights: NFRUX's own (embedded), or a file tools/mlfg_weights.py --bin made from a retrained npz.
@@ -95,6 +97,7 @@ private:
     uint32_t                m_frames = 0;
     std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4];
+    std::unique_ptr<CudaKernels> m_cuda;
     std::vector<std::unique_ptr<Pass>> m_layerPasses, m_layerPassesBig;  // NFRUX_TEST_TIMES
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch

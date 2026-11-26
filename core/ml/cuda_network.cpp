@@ -367,6 +367,33 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
     return !out.cubin.empty();
 }
 
+namespace cuda
+{
+bool                 Available() { return Nv().ok; }
+int                  ComputeCapability(LUID luid, std::string* error) { return Nv().ok ? nfrux::ComputeCapability(luid, error) : 0; }
+std::vector<uint8_t> Cubin(const std::string& ptx, LUID luid, std::string* error) { return nfrux::Cubin(ptx, luid, error); }
+void* CreateModule(ID3D12Device* device, const std::vector<uint8_t>& cubin)
+{
+    void* m = nullptr;
+    return Nv().createModule && !Nv().createModule(device, cubin.data(), uint32_t(cubin.size()), &m) ? m : nullptr;
+}
+void* CreateFunction(ID3D12Device* device, void* module, const char* name)
+{
+    void* f = nullptr;
+    return Nv().createFunction && !Nv().createFunction(device, module, name, &f) ? f : nullptr;
+}
+void Destroy(ID3D12Device* device, void* module, const std::vector<void*>& functions)
+{
+    if (Nv().destroyFunction) for (void* f : functions) if (f) Nv().destroyFunction(device, f);
+    if (Nv().destroyModule && module) Nv().destroyModule(device, module);
+}
+bool Launch(ID3D12GraphicsCommandList* list, void* function, const uint32_t grid[3], uint32_t block, const void* params, uint32_t size)
+{
+    const nfrux::Launch l = {function, {grid[0], grid[1], grid[2]}, {block, 1, 1}, 0, params, size};
+    return Nv().launch && Nv().launch(list, &l, 1) == 0;
+}
+}  // namespace cuda
+
 std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error)
 {
     auto fail = [&](const std::string& m) -> std::unique_ptr<CudaGraph> { if (error) *error = m; return nullptr; };
