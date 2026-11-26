@@ -33,15 +33,16 @@ struct Ptx
     }
 };
 
+void SoftmaxEpilogue(Ptx& w, int R, int xr);
 // One kernel: shape 0 = 3x3/1 (pad 1), 1 = 2x2/2, 2 = 1x1, 3 = transposed 2x2/2; NB n tiles (8 channels each) a warp.
-std::string Kernel(int shape, int NB, bool split = false)
+std::string Kernel(int shape, int NB, bool split = false, bool softmax = false)
 {
     const bool T = shape == 3;
     const int  K = shape == 0 ? 3 : shape == 1 ? 2 : shape == 2 ? 1 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0;
     const int  taps = K * K, NA = T ? 4 : 1;  // accumulator sets (transposed: one per output phase)
     static const char* names[4] = {"conv3", "conv2", "conv1", "convT"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + (split ? "k" : softmax ? "x" : "") + (split ? "(.param .align 8 .b8 P[144])\n{\n" : "(.param .align 8 .b8 P[128])\n{\n");
     w(".reg .b32 %%r<160>; .reg .b64 %%rd<160>; .reg .f32 %%f<200>; .reg .pred %%p<120>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // s0 s1 w b add out
     // r1 inW r2 inH r3 p0 r4 ch0 r5 p1 r6 ch1m r7 split r8 cin r9 outW r10 outH r11 po r12 cho r13 cout r14 writeEnd r15 act
@@ -133,6 +134,12 @@ std::string Kernel(int shape, int NB, bool split = false)
         w("ret;");
         return w.s + "}\n";
     }
+    if (softmax)  // the stage-2 head (5 logits, one n tile) with kMlfgSoftmax5 as its epilogue: the same bits as the two passes
+    {
+        SoftmaxEpilogue(w, 2, 0);
+        w("ret;");
+        return w.s + "}\n";
+    }
     // Epilogue: bias, add, activation, rounding (fp8 e4m3 as torch, then fp16 round to nearest even), two channels a word.
     for (int a = 0; a < NA; ++a)
         for (int j = 0; j < NB; ++j)
@@ -216,12 +223,12 @@ void Epilogue(Ptx& w, int NB, int R)
 // g + 16, ...) by NB n tiles: each B fragment serves MT products (the loads, not the tensor cores, limit the 16-pixel
 // kernel). Addresses: a base per 8-row group plus a per-tap offset; zero padding by predicates (x per kx and group, y per
 // ky). A second source only for 1x1 (the FasterNet concatenation). Same products per output, same order: same bits.
-std::string KernelM(int shape, int NB, int MT)
+std::string KernelM(int shape, int NB, int MT, bool softmax = false)
 {
     const int K = shape == 0 ? 3 : shape == 1 ? 2 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0, taps = K * K, R = 2 * MT;
     static const char* names[3] = {"conv3", "conv2", "conv1"};
     Ptx w;
-    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "m" + std::to_string(MT) + "(.param .align 8 .b8 P[128])\n{\n";
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "m" + std::to_string(MT) + (softmax ? "x" : "") + "(.param .align 8 .b8 P[128])\n{\n";
     w(".reg .b32 %%r<200>; .reg .b64 %%rd<200>; .reg .f32 %%f<200>; .reg .pred %%p<160>; .reg .b16 %%h<8>;");
     for (int i = 0; i < 6; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
     for (int i = 0; i < 20; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 48 + i * 4);
@@ -238,8 +245,8 @@ std::string KernelM(int shape, int NB, int MT)
         w("mul.lo.s32 %%r37, %%r%d, %d; mad.lo.s32 %%r37, %%r36, %%r1, %%r37;", 80 + r, S);
         w("mad.lo.s32 %%r38, %%r37, %%r3, %%r4; mul.wide.s32 %%rd7, %%r38, 2; add.s64 %%rd%d, %%rd1, %%rd7;", 100 + 2 * r);
         w("mad.lo.s32 %%r38, %%r37, %%r5, %%r6; mul.wide.s32 %%rd7, %%r38, 2; add.s64 %%rd%d, %%rd2, %%rd7;", 101 + 2 * r);
-        for (int kx = 0; kx < K; ++kx)  // x predicates p(40 + kx R + r)
-            w("mad.lo.s32 %%r39, %%r%d, %d, %d; setp.ge.s32 %%p5, %%r39, 0; setp.lt.s32 %%p6, %%r39, %%r1; and.pred %%p%d, %%p5, %%p6;", 80 + r, S, kx - pad, 40 + kx * R + r);
+        for (int kx = 0; kx < K; ++kx)  // x predicates p(120 + kx R + r)
+            w("mad.lo.s32 %%r39, %%r%d, %d, %d; setp.ge.s32 %%p5, %%r39, 0; setp.lt.s32 %%p6, %%r39, %%r1; and.pred %%p%d, %%p5, %%p6;", 80 + r, S, kx - pad, 120 + kx * R + r);
     }
     for (int ky = 0; ky < K; ++ky)  // y predicates p(35 + ky)
         w("add.s32 %%r39, %%r36, %d; setp.ge.s32 %%p5, %%r39, 0; setp.lt.s32 %%p6, %%r39, %%r2; and.pred %%p%d, %%p5, %%p6;", ky - pad, 35 + ky);
@@ -260,7 +267,7 @@ std::string KernelM(int shape, int NB, int MT)
         const int ky = t / K, kx = t % K;
         for (int r = 0; r < R; ++r)
         {
-            w("and.pred %%p70, %%p%d, %%p%d;", 35 + ky, 40 + kx * R + r);  // tap in range
+            w("and.pred %%p70, %%p%d, %%p%d;", 35 + ky, 120 + kx * R + r);  // tap in range
             if (taps == 1) w("selp.b64 %%rd62, %%rd%d, %%rd%d, %%p9; add.s64 %%rd62, %%rd62, %%rd61;", 100 + 2 * r, 101 + 2 * r);
             else w("add.s64 %%rd62, %%rd%d, %%rd%d; add.s64 %%rd62, %%rd62, %%rd61;", 100 + 2 * r, 130 + t);
             w("and.pred %%p62, %%p70, %%p60; and.pred %%p63, %%p70, %%p61; and.pred %%p64, %%p63, %%p100; not.pred %%p65, %%p64;");
@@ -282,7 +289,8 @@ std::string KernelM(int shape, int NB, int MT)
     }
     w("add.s64 %%rd8, %%rd8, %%rd60; add.s32 %%r40, %%r40, 1; bra LOOP;");
     w("END:");
-    Epilogue(w, NB, R);
+    if (softmax) SoftmaxEpilogue(w, R, 80);
+    else Epilogue(w, NB, R);
     w("ret;");
     return w.s + "}\n";
 }
@@ -593,6 +601,54 @@ std::string ReduceKernel()
     w("ret;");
     return w.s + "}\n";
 }
+// kMlfgSoftmax5 after the head layer (one n tile: lanes 4g + q hold channels 2q, 2q + 1 of pixels g, g + 8): the logits
+// rounded to fp16 as the layer stores them, gathered from the quad's lanes 0-2 (shuffles, before any branch); every lane
+// computes the five weights as the shader does (max from 0, FExp's Cody-Waite + polynomial, the sum in order, IEEE
+// division) and stores its pair of the [H][W][8] weights: q 0 (w0, w1), 1 (w2, w3), 2 (w4, 0), 3 (0, 0).
+void SoftmaxEpilogue(Ptx& w, int R, int xr)  // R rows of 8 pixels, x in r(xr + r) (xr 0: Kernel's r27 / r28)
+{
+    w("shl.b32 %%r60, %%r23, 1; and.b32 %%r76, %%r21, 28;");  // c = 2q, the quad's lane 0
+    w("mul.wide.s32 %%rd64, %%r60, 4; add.s64 %%rd64, %%rd4, %%rd64; ld.global.f32 %%f180, [%%rd64]; ld.global.f32 %%f181, [%%rd64+4];");
+    w("setp.eq.u32 %%p80, %%r23, 0; setp.eq.u32 %%p81, %%r23, 1; setp.eq.u32 %%p82, %%r23, 2;");
+    for (int r = 0; r < R; ++r)
+    {
+        const int x = xr ? xr + r : r ? 28 : 27;
+        w("add.rn.f32 %%f100, %%f%d, %%f180; add.rn.f32 %%f101, %%f%d, %%f181;", r * 2, r * 2 + 1);
+        w("cvt.rn.f16.f32 %%h5, %%f100; cvt.rn.f16.f32 %%h6, %%f101; cvt.f32.f16 %%f100, %%h5; cvt.f32.f16 %%f101, %%h6;");
+        w("add.u32 %%r77, %%r76, 1; add.u32 %%r78, %%r76, 2;");
+        w("shfl.sync.idx.b32 %%f110, %%f100, %%r76, 31, 0xffffffff; shfl.sync.idx.b32 %%f111, %%f101, %%r76, 31, 0xffffffff;");
+        w("shfl.sync.idx.b32 %%f112, %%f100, %%r77, 31, 0xffffffff; shfl.sync.idx.b32 %%f113, %%f101, %%r77, 31, 0xffffffff;");
+        w("shfl.sync.idx.b32 %%f114, %%f100, %%r78, 31, 0xffffffff;");
+        w("mov.f32 %%f115, 0f00000000;");
+        for (int k = 0; k < 5; ++k) w("max.f32 %%f115, %%f115, %%f%d;", 110 + k);
+        for (int k = 0; k < 5; ++k)
+        {
+            const int x = 120, e = 130 + k;
+            w("sub.rn.f32 %%f%d, %%f%d, %%f115;", x, 110 + k);
+            w("mul.rn.f32 %%f121, %%f%d, 0f3FB8AA3B; add.rn.f32 %%f121, %%f121, 0f3F000000; cvt.rmi.f32.f32 %%f122, %%f121;", x);  // k
+            w("mul.rn.f32 %%f121, %%f122, 0f3F317200; sub.rn.f32 %%f123, %%f%d, %%f121; mul.rn.f32 %%f121, %%f122, 0f35BFBE8E; sub.rn.f32 %%f123, %%f123, %%f121;", x);  // r
+            w("mov.f32 %%f124, 0f39500D01;");
+            for (const char* c : {"0f3AB60B61", "0f3C088889", "0f3D2AAAAB", "0f3E2AAAAB", "0f3F000000"})
+                w("mul.rn.f32 %%f124, %%f124, %%f123; add.rn.f32 %%f124, %%f124, %s;", c);
+            w("mul.rn.f32 %%f125, %%f123, %%f123; mul.rn.f32 %%f125, %%f124, %%f125; add.rn.f32 %%f125, %%f125, %%f123; add.rn.f32 %%f125, %%f125, 0f3F800000;");
+            // LdExp(e, k): below 2^-126 in two steps
+            w("cvt.rzi.s32.f32 %%r79, %%f122; setp.lt.s32 %%p83, %%r79, -126; mul.rn.f32 %%f126, %%f125, 0f00800000; @%%p83 mov.f32 %%f125, %%f126; @%%p83 add.s32 %%r79, %%r79, 126;");
+            w("max.s32 %%r79, %%r79, -126; min.s32 %%r79, %%r79, 127; add.s32 %%r79, %%r79, 127; shl.b32 %%r79, %%r79, 23; mov.b32 %%f126, %%r79; mul.rn.f32 %%f%d, %%f125, %%f126;", e);
+            w("setp.gt.f32 %%p84, %%f%d, 0f42B17218; @%%p84 mov.f32 %%f%d, 0f7F800000; setp.lt.f32 %%p84, %%f%d, 0fC2CFF1B4; @%%p84 mov.f32 %%f%d, 0f00000000;", x, e, x, e);
+            w("setp.nan.f32 %%p84, %%f%d, %%f%d; @%%p84 mov.f32 %%f%d, %%f%d;", x, x, e, x);
+        }
+        w("mov.f32 %%f140, %%f130; add.rn.f32 %%f140, %%f140, %%f131; add.rn.f32 %%f140, %%f140, %%f132; add.rn.f32 %%f140, %%f140, %%f133; add.rn.f32 %%f140, %%f140, %%f134;");
+        for (int k = 0; k < 5; ++k) w("div.rn.f32 %%f%d, %%f%d, %%f140;", 130 + k, 130 + k);
+        w("mov.f32 %%f141, 0f00000000; mov.f32 %%f142, 0f00000000;");
+        w("@%%p80 mov.f32 %%f141, %%f130; @%%p80 mov.f32 %%f142, %%f131; @%%p81 mov.f32 %%f141, %%f132; @%%p81 mov.f32 %%f142, %%f133; @%%p82 mov.f32 %%f141, %%f134;");
+        const int lab = w.label++;
+        w("setp.lt.s32 %%p23, %%r%d, %%r9; setp.lt.s32 %%p24, %%r25, %%r10; and.pred %%p23, %%p23, %%p24; @!%%p23 bra SKIP%d;", x, lab);
+        w("mad.lo.s32 %%r65, %%r25, %%r9, %%r%d;", x);
+        w("cvt.rn.f16.f32 %%h5, %%f141; cvt.rn.f16.f32 %%h6, %%f142; mov.b32 %%r72, {%%h5, %%h6};");
+        w("mad.lo.s32 %%r73, %%r65, %%r11, %%r12; add.s32 %%r73, %%r73, %%r60; mul.wide.s32 %%rd66, %%r73, 2; add.s64 %%rd66, %%rd6, %%rd66; st.global.u32 [%%rd66], %%r72;");
+        w("SKIP%d:", lab);
+    }
+}
 }  // namespace
 
 // kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
@@ -605,10 +661,10 @@ std::string CudaPtx(bool fp8)
     for (int s = 0; s < 4; ++s)
         for (int nb : kNbs)
             if (s < 3 || nb <= 4) p += Kernel(s, nb);
-    for (int s = 0; s < 3; ++s) p += KernelM(s, 8, 2);
+    for (int s = 0; s < 3; ++s) p += KernelM(s, 8, 2), p += KernelM(s, 4, 2);
     p += KernelS(8, 2);
-    p += Kernel(0, 8, true), p += ReduceKernel();
-    p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 8, 16, 8);  // the layers' padded n tiles (CudaNb)
+    p += Kernel(0, 8, true), p += ReduceKernel(), p += Kernel(0, 1, false, true), p += KernelM(0, 1, 4), p += KernelM(0, 1, 4, true);
+    p += FnKernel(48, 16, 2, 16, 8), p += FnKernel(64, 32, 4, 16, 8);  // the layers' padded n tiles (CudaNb)
     return p;
 }
 
@@ -631,8 +687,8 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
         for (int i = 0; i < 6; ++i)
             if ((s < 3 || kNbs[i] <= 4) && !fn(k->m_conv[s][i], std::string(names[s]) + "_" + std::to_string(kNbs[i]))) return fail("CUDA function");
     for (int s = 0; s < 3; ++s)
-        if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2")) return fail("CUDA function");
-    if (!fn(k->m_convS, "conv3_8s2") || !fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek")) return fail("CUDA function");
+        if (!fn(k->m_convM[s], std::string(names[s]) + "_8m2") || !fn(k->m_convM4[s], std::string(names[s]) + "_4m2")) return fail("CUDA function");
+    if (!fn(k->m_convS, "conv3_8s2") || !fn(k->m_splitK, "conv3_8k") || !fn(k->m_reduce, "reducek") || !fn(k->m_softmax, "conv3_1x") || !fn(k->m_conv1m4, "conv3_1m4") || !fn(k->m_softmaxM4, "conv3_1m4x")) return fail("CUDA function");
     for (int i = 0; i < 2; ++i)
         if (!fn(k->m_fnk[i], i ? "fn64" : "fn48")) return fail("CUDA function");
     for (int i = 0; i < 2 && fp8; ++i)
@@ -643,8 +699,8 @@ CudaKernels::~CudaKernels()
 {
     std::vector<void*> f(m_fnk, m_fnk + 2);
     f.insert(f.end(), m_fn8, m_fn8 + 2);
-    f.insert(f.end(), m_convM, m_convM + 3);
-    f.push_back(m_convS), f.push_back(m_splitK), f.push_back(m_reduce);
+    f.insert(f.end(), m_convM, m_convM + 3), f.insert(f.end(), m_convM4, m_convM4 + 3);
+    f.push_back(m_convS), f.push_back(m_splitK), f.push_back(m_reduce), f.push_back(m_softmax), f.push_back(m_conv1m4), f.push_back(m_softmaxM4);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
     m_dev.CudaDestroy(m_module, f);
 }
@@ -654,9 +710,9 @@ bool CudaKernels::LaunchFn(const Buffer* const* bufs, uint32_t n, uint32_t C, bo
     return m_dev.CudaLaunch(fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
-bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged) const
+bool CudaKernels::LaunchM(const Buffer* const* bufs, uint32_t n, int shape, const uint32_t grid[3], const CudaParams& p, bool staged, bool nb4) const
 {
-    return m_dev.CudaLaunch(staged && shape == 0 ? m_convS : m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+    return m_dev.CudaLaunch(nb4 ? m_convM4[shape] : staged && shape == 0 ? m_convS : m_convM[shape], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 
 bool CudaKernels::Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const
@@ -673,5 +729,19 @@ bool CudaKernels::LaunchSplit(const Buffer* const* bufs, uint32_t n, const uint3
     if (!m_dev.CudaLaunch(m_splitK, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n)) return false;
     const uint32_t rg[3] = {(pixels * uint32_t(p.c.writeEnd / 2) + 127) / 128, 1, 1};
     return m_dev.CudaLaunch(m_reduce, rg, 128, &p, sizeof(p), bufs, n);
+}
+}  // namespace nfrux::mlfg
+namespace nfrux::mlfg
+{
+bool CudaKernels::LaunchSoftmax(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const CudaParams& p, bool m4) const
+{
+    return m_dev.CudaLaunch(m4 ? m_softmaxM4 : m_softmax, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+}
+}  // namespace nfrux::mlfg
+namespace nfrux::mlfg
+{
+bool CudaKernels::LaunchM4(const Buffer* const* bufs, uint32_t n, const uint32_t grid[3], const CudaParams& p) const
+{
+    return m_dev.CudaLaunch(m_conv1m4, grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
 }
 }  // namespace nfrux::mlfg

@@ -55,7 +55,7 @@ struct Tensor
 class Network
 {
 public:
-    enum Act { None = 0, Leaky = 1, Relu = 2 };
+    enum Act { None = 0, Leaky = 1, Relu = 2, Softmax = 3 };  // Softmax: CUDA's stage-2 head only (FusedSoftmax)
     // l0: the stage-1 level-0 tensor size (mlfg_sizes 'l0'); s2: the stage-2 tensor size ('s2').
     static std::unique_ptr<Network> Create(Device& dev, uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error);
     ~Network();
@@ -68,8 +68,10 @@ public:
     bool Encoders(const View& netIn);
     // One flow block (0-3) of stage 1: in (its size S) -> out13 (13 channels, size S).
     bool FlowBlock(uint32_t block, const View& in, const View& out13);
-    // Stage 2 (passes 154-188 up to the softmax): the 24-channel input -> 5 fp16 logits.
-    bool Stage2(const View& in, const View& logits);
+    // Stage 2 (passes 154-188 up to the softmax): the 24-channel input -> 5 fp16 logits. With weights and FusedSoftmax():
+    // the head's epilogue is kMlfgSoftmax5 and writes the [H][W][8] blend weights instead (the softmax pass is skipped).
+    bool Stage2(const View& in, const View& logits, const View* weights = nullptr);
+    bool FusedSoftmax() const { return m_tier == Tier::Cuda && m_fusedSoftmax; }
     // One layer (exposed for tests): out = round(act(conv(src | src1) + bias + add)).
     struct Conv
     {
@@ -103,7 +105,9 @@ private:
     bool                    m_fused = true;
     bool                    m_fusedMat = false;  // coopmat's and generic's fused FasterNet (NFRUX_MLFG_FUSED=1)
     bool                    m_m2 = true;
+    bool                    m_m4 = true;  // CUDA: 64 pixels a warp for one-n-tile 3x3 (NFRUX_MLFG_NO_M4=1: off)
     bool                    m_staged = false;  // CUDA 3x3: shared-memory staging (NFRUX_MLFG_STAGING=1; measured neutral)
+    bool                    m_fusedSoftmax = true;  // CUDA: softmax in the head (NFRUX_MLFG_SOFTMAX_PASS=1: the pass)
     bool                    m_splitK = true;   // CUDA: split-K for the low-resolution 3x3 layers (NFRUX_MLFG_NO_SPLITK=1: off)
     static constexpr uint32_t kPartialFloats = 2u << 20;  // split-K's fp32 partial sums (8 MB)
     std::unique_ptr<Buffer> m_partial;

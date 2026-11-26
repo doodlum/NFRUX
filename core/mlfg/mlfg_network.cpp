@@ -61,8 +61,9 @@ float Half(uint16_t h)
 uint32_t CudaNb(const LayerWeights& L)
 {
     if (L.cout <= 16 && (L.kind == 1 || L.k == 3)) return 1;
-    return L.kind == 1 ? 4 : 8;
-}uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
+    return L.kind == 1 || L.cout <= 32 ? 4 : 8;  // 17-32 outputs: 4 (8 computed half zeros)
+}
+uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
 {
     uint32_t u;
     memcpy(&u, &f, 4);
@@ -241,6 +242,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     // NFRUX_MLFG_STAGING=1.
     m_staged = EnvFlag("NFRUX_MLFG_STAGING", false);
     m_splitK = !EnvFlag("NFRUX_MLFG_NO_SPLITK", false);
+    m_m4 = !EnvFlag("NFRUX_MLFG_NO_M4", false);
+    m_fusedSoftmax = !EnvFlag("NFRUX_MLFG_SOFTMAX_PASS", false);
     // The fused FasterNet kernels of the coopmat and generic tiers: slower than the layers on the RTX 4070 (coopmat +1.0 ms at
     // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
     // untested elsewhere. Off unless NFRUX_MLFG_FUSED=1. CUDA's is on (NFRUX_MLFG_UNFUSED=1 turns every one off).
@@ -430,8 +433,11 @@ bool Network::Run(const Conv& c)
         const uint32_t grid[3] = {L.kind == 1 ? (c.src.w + 15) / 16 : (c.out.w + 15) / 16, ((L.kind == 1 ? c.src.h : c.out.h) + kCudaWarps - 1) / kCudaWarps, ntp / nb};
         // 32 pixels a warp (each B fragment twice) for the 8-tile convolutions without a second source on 3x3 / 2x2.
         // Only where that still gives 256 warps or more (measured: the 30- and 60-pixel-wide stage-1 layers get slower).
-        const bool m2 = nb == 8 && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
+        const bool m2 = (nb == 8 || nb == 4) && L.kind == 0 && m_m2 && (L.k == 1 || split >= L.cin) && uint64_t((c.out.w + 31) / 32) * c.out.h * (ntp / nb) >= 256;
         const uint32_t gridM[3] = {(c.out.w + 31) / 32, grid[1], grid[2]};
+        // One n tile on 3x3 (the stage-2 head, narrow outputs): 64 pixels a warp.
+        const bool     m4 = nb == 1 && ntp == 1 && shape == 0 && split >= L.cin && m_m4;
+        const uint32_t gridM4[3] = {(c.out.w + 63) / 64, grid[1], 1};
         const bool staged = m_staged && L.k == 3 && split >= L.cin && c.src.pitch % 2 == 0 && c.src.ch % 2 == 0;  // shared-memory staging
         // Split-K for the low-resolution 3x3 layers that fill few warps: S splits of the channel chunks each write fp32 sums,
         // a second pass adds them in split order (the same bytes every run, on both APIs) and runs the epilogue.
@@ -441,7 +447,9 @@ bool Network::Run(const Conv& c)
             splits = std::min({4u, (256 + warps - 1) / warps, kc / 2});
         while (splits > 1 && uint64_t(splits) * pixels * ntp * 8 > kPartialFloats) --splits;
         bool ok;
-        if (splits > 1)
+        if (c.act == Softmax)  // the head with the softmax epilogue (Stage2's weights)
+            ok = shape == 0 && nb == 1 && ntp == 1 && L.cout == 5 && m_cuda->LaunchSoftmax(bufs, 6, m4 ? gridM4 : grid, p, m4);
+        else if (splits > 1)
         {
             const uint32_t per = (kc + splits - 1) / splits;
             splits = (kc + per - 1) / per;
@@ -450,7 +458,8 @@ bool Network::Run(const Conv& c)
             const uint32_t sg[3] = {grid[0], grid[1], grid[2] * splits};
             ok = m_cuda->LaunchSplit(sb, 7, sg, sp, pixels);
         }
-        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
+        else if (m4) ok = m_cuda->LaunchM4(bufs, 6, gridM4, p);
+        else ok = m2 ? m_cuda->LaunchM(bufs, 6, shape, gridM, p, staged && nb == 8, nb == 4) : m_cuda->Launch(bufs, 6, shape, nb, grid, p);
         if (label[0]) m_dev.Mark(label);
         return ok;
     }
@@ -596,7 +605,7 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
     return Run(c);
 }
 
-bool Network::Stage2(const View& in, const View& logits)
+bool Network::Stage2(const View& in, const View& logits, const View* weights)
 {
     const uint32_t W = in.w, H = in.h;
     const View t32 = Sized(m_t32, W, H, 32);
@@ -618,6 +627,11 @@ bool Network::Stage2(const View& in, const View& logits)
         if (!FasterNet(kS2B3 + 3 * j, 48, 16, j % 2 ? x48 : y48, j % 2 ? y48 : x48, pc16, h96, nullptr, nullptr)) return false;
     c = {}, c.layer = kS2Up, c.src = y48, c.out = t32;  // fp16
     if (!Run(c)) return false;
+    if (weights && FusedSoftmax())  // CUDA: the softmax in the head's epilogue, straight to the blend weights
+    {
+        c = {}, c.layer = kS2Head, c.src = t32, c.out = *weights, c.act = Softmax, c.writeEnd = 8;
+        return Run(c);
+    }
     c = {}, c.layer = kS2Head, c.src = t32, c.out = logits;  // fp16 logits (the softmax pass follows)
     return Run(c);
 }
