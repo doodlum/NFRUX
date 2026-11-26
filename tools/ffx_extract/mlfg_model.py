@@ -75,6 +75,25 @@ class Emulator:
         self.sizes = torch.from_numpy(sizes_table(capture).astype(np.int64))
         self.dev = device
         self.glue = {}
+        # int8 simulation of NFRUX's runtime: None (AMD precision), 'calibrate' (record ranges) or 'int8'
+        self.quant = None
+        self.stats = {}
+
+    def fq(self, v, key):
+        """Record the range of v under key ('calibrate') or fake-quantise it to symmetric per-tensor int8 ('int8')."""
+        if self.quant is None: return v
+        a = v.abs().max()
+        if self.quant == 'calibrate':
+            self.stats[key] = torch.maximum(self.stats[key], a) if key in self.stats else a
+            return v
+        s = (self.stats[key] if key in self.stats else a).clamp(min=1e-8) / 127.0
+        return torch.clamp(torch.round(v / s), -128, 127) * s
+
+    def wq(self, W):
+        """Per-output-channel symmetric int8 weights ('int8' only)."""
+        if self.quant != 'int8': return W
+        s = W.abs().amax(dim=(1, 2, 3)).clamp(min=1e-12).view(-1, 1, 1, 1) / 127.0
+        return torch.clamp(torch.round(W / s), -127, 127) * s
 
     def size(self, idx):
         return int(self.sizes[idx][0]), int(self.sizes[idx][1])
@@ -95,6 +114,7 @@ class Emulator:
         else:
             iw, ih = ow, oh
         x = read(scratch, acts[0], iw, ih, I)            # the shader reads whole 16-channel windows
+        x = self.fq(x, (p, 'in')); W = self.wq(W)
         if m['op'] == 'conv_transpose':
             y = F.conv_transpose2d(x[None], W.permute(1, 0, 2, 3), b, stride=2)[0]
         else:
@@ -102,12 +122,14 @@ class Emulator:
             y = F.conv2d(x[None], W, b, stride=m['stride'], padding=pad)[0]
         C = out_t['logical'][2]
         if m['residual']: y = y + x[:y.shape[0]]
+        if m['act'] in ('leaky', 'relu'): y = self.fq(y, (p, 'pre'))   # the runtime's TABLE reads an int8 pre-activation
         if m['act'] == 'leaky': y = leaky(y)
         elif m['act'] == 'relu': y = torch.relu(y)
         elif m['act'] == 'softmax_max0':
             y = q16(y[:C])
             mx = torch.clamp(y.amax(0, keepdim=True), min=0.0)
             e = torch.exp(y - mx); y = e / e.sum(0, keepdim=True)
+        if m['act'] != 'softmax_max0': y = self.fq(y, (p, 'out'))
         y = amd_zero(y, C)
         Cw = C if out_t['kind'] == 'Tensor4' and out_t['storage'][2] < (C + 15) // 16 * 16 else min(y.shape[0], (C + 15) // 16 * 16)
         write(scratch, out_t, y[:Cw], ow, oh)
@@ -125,14 +147,15 @@ class Emulator:
             x = read(scratch, acts[0], ow, oh, Cn)
         else:  # 176: block at low res, then up-conv to the skip's resolution
             x = read(scratch, acts[0], ow // 2, oh // 2, Cn)
-        pc = q8(F.conv2d(x[None, :P], Wp, bp, padding=1)[0])
+        x = self.fq(x, (p, 'in'))
+        pc = self.fq(q8(F.conv2d(x[None, :P], self.wq(Wp), bp, padding=1)[0]), (p, 'pconv'))
         h = torch.cat([pc, x[P:]], 0)
-        h = q8(torch.relu(F.conv2d(h[None], We, be)[0]))
-        y = q8(F.conv2d(h[None], Wj, bj)[0] + x)
+        h = self.fq(q8(torch.relu(self.fq(F.conv2d(h[None], self.wq(We), be)[0], (p, 'expand_pre')))), (p, 'expand'))
+        y = self.fq(q8(F.conv2d(h[None], self.wq(Wj), bj)[0] + x), (p, 'out'))
         if m['op'] != 'fasternet':
             Wu, bu = self.w[m['up']['w']], self.w[m['up']['b']]   # [O=48, I=64, 2, 2]
             skip = read(scratch, acts[1], ow, oh, Wu.shape[0])
-            y = q8(F.conv_transpose2d(y[None], Wu.permute(1, 0, 2, 3), bu, stride=2)[0] + skip)
+            y = self.fq(q8(F.conv_transpose2d(y[None], self.wq(Wu).permute(1, 0, 2, 3), bu, stride=2)[0] + skip), (p, 'up'))
         write(scratch, acts[-1], y, ow, oh)
 
     def run_passes(self, scratch, first, last, ctx=None):

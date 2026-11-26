@@ -1,6 +1,6 @@
 // Records what AMD FSR Frame Generation 4 (amd_fidelityfx_framegeneration_vk.dll) does on the GPU, headless.
 //
-//   ffx_capture DLL OUT_DIR [--frames N] [--size WxH] [--spoof-amd] [--validate] [--inputs DIR] [--dump-passes F A B] [--dump-images F]
+//   ffx_capture DLL OUT_DIR [--frames N] [--size WxH] [--spoof-amd] [--validate] [--inputs DIR] [--dump-passes F A B] [--dump-images F] [--patch-cb]
 //
 // The DLL is loaded directly (it exports the FFX API). Its vulkan-1.dll import table is patched and the
 // vkGetDeviceProcAddr it is given is wrapped, so every Vulkan call it makes goes through the hooks below. Written to
@@ -46,6 +46,8 @@ namespace fs = std::filesystem;
 
 static std::string gOut;
 static bool        gSpoof = false;
+static bool        gPatchCb = false;
+static int         gFrame = 0;
 static std::recursive_mutex gLock;
 static FILE*       gLog;
 
@@ -55,7 +57,8 @@ struct ImageInfo  { uint32_t id; VkImageCreateInfo ci; };
 struct ViewInfo   { uint32_t id; VkImage image; VkFormat format; };
 struct Desc       { VkDescriptorType type; VkBuffer buffer; VkDeviceSize offset, range; VkImageView view; VkSampler sampler; };
 struct Pipeline   { uint32_t id; std::string module, entry; std::vector<uint8_t> spec; VkPipelineLayout layout; };
-struct Record     { std::string text; std::vector<std::pair<VkBuffer, std::pair<VkDeviceSize, VkDeviceSize>>> snap; std::vector<std::pair<VkBuffer, std::pair<VkDeviceSize, VkDeviceSize>>> upload; };
+struct CbPatch    { VkBuffer buf; VkDeviceSize off; int kind; };  // --patch-cb: kind 1 = CsDilate, 2 = CsFrameInterpolationConstants
+struct Record     { std::string text; std::vector<std::pair<VkBuffer, std::pair<VkDeviceSize, VkDeviceSize>>> snap; std::vector<std::pair<VkBuffer, std::pair<VkDeviceSize, VkDeviceSize>>> upload; std::vector<CbPatch> patch; };
 struct CbState
 {
     VkPipeline pipeline = 0;
@@ -256,6 +259,12 @@ static void RecordDispatch(VkCommandBuffer cb, const char* what)
             uint32_t dv = 0;
             if (d.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || d.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) dv = k < dyn.size() ? dyn[k++] : 0;
             r.text += " s" + std::to_string(si) + "b" + std::to_string(key >> 32) + "[" + std::to_string(uint32_t(key)) + "]=" + DescText(d, &r.snap, dv);
+            if (gPatchCb && (key >> 32) == 256 && d.buffer && d.range == 80 && HostPtr(d.buffer, 0))
+            {
+                int kind = pl.entry == "main" ? 1 : pl.entry.rfind("mlfi_", 0) == 0 ? 2 : 0;
+                if (kind == 2 && gFrame == 0) kind = 0;  // the first frame really is a reset
+                if (kind) r.patch.push_back({d.buffer, d.offset + dv, kind});
+            }
         }
     }
     for (auto& [si, m] : st.pushDesc)
@@ -266,7 +275,7 @@ static void RecordDispatch(VkCommandBuffer cb, const char* what)
 
 // --dump-passes FRAME FIRST LAST: after each ML pass FIRST..LAST of frame FRAME, copy the whole scratch buffer
 // (binding 128) to a host-visible buffer; written as passes/<frame>_<pass>.bin when the frame is done.
-static int gDumpFrame = -1, gDumpFirst = 0, gDumpLast = -1, gFrame = 0;
+static int gDumpFrame = -1, gDumpFirst = 0, gDumpLast = -1;
 static VkDevice gDev;
 static VkPhysicalDeviceMemoryProperties gMemProps;
 struct PassDump { int pass; VkBuffer buf; VkDeviceMemory mem; void* ptr; VkDeviceSize size; };
@@ -583,6 +592,14 @@ static void Flush(VkCommandBuffer cb)
     if (it == gCbs.end()) return;
     for (auto& r : it->second.records)
     {
+        for (auto& p : r.patch)
+        {
+            // Without a swapchain ffxConfigure fails, so the DLL never latches the configure state: CsDilate.colorRect
+            // stays (0,0)-(0,0) and every frame is flagged reset. Patch in what a configured full-screen context gives.
+            uint8_t* q = (uint8_t*)HostPtr(p.buf, p.off);
+            if (p.kind == 1) { float* rc = (float*)(q + 64); if (rc[0] == 0 && rc[1] == 0 && rc[2] == 0 && rc[3] == 0) rc[2] = rc[3] = 1.0f; }
+            if (p.kind == 2) *(int32_t*)(q + 16) = 0;
+        }
         fprintf(gLog, "%llu s%u %s", (unsigned long long)gSeq++, gSubmits, r.text.c_str());
         for (auto& [b, rg] : r.snap)
             if (auto p = HostPtr(b, rg.first)) fprintf(gLog, " | buf%u+%llu=%s", gBuffers[b].id, (unsigned long long)rg.first, Hex(p, size_t(rg.second)).c_str());
@@ -904,6 +921,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--inputs") && i + 1 < argc) inputs = argv[++i];
         else if (!strcmp(argv[i], "--dump-passes") && i + 3 < argc) gDumpFrame = atoi(argv[++i]), gDumpFirst = atoi(argv[++i]), gDumpLast = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dump-images") && i + 1 < argc) gImgFrame = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--patch-cb")) gPatchCb = true;
     }
     for (const char* d : {"modules", "uploads", "buffers"}) fs::create_directories(fs::path(gOut) / d);
     gLog = fopen((fs::path(gOut) / "log.txt").string().c_str(), "w");
