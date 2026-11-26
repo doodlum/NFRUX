@@ -578,6 +578,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL H_vkCreateImage(VkDevice d, const VkImageC
     return r;
 }
 
+// Samplers and immutable samplers: logged so the filter of every sampler binding is known.
+static PFN_vkCreateSampler r_vkCreateSampler;
+static PFN_vkCreateDescriptorSetLayout r_vkCreateDescriptorSetLayout;
+static std::unordered_map<VkSampler, uint32_t> gSamplers;
+static VKAPI_ATTR VkResult VKAPI_CALL H_vkCreateSampler(VkDevice d, const VkSamplerCreateInfo* ci, const VkAllocationCallbacks* a, VkSampler* s)
+{
+    VkResult r = r_vkCreateSampler(d, ci, a, s);
+    std::lock_guard<std::recursive_mutex> l(gLock);
+    if (r == VK_SUCCESS)
+    {
+        uint32_t id = uint32_t(gSamplers.size());
+        gSamplers[*s] = id;
+        fprintf(gLog, "SAMPLER smp%u mag %d min %d mip %d addr %d,%d unnorm %d\n", id, int(ci->magFilter), int(ci->minFilter), int(ci->mipmapMode),
+                int(ci->addressModeU), int(ci->addressModeV), int(ci->unnormalizedCoordinates));
+    }
+    return r;
+}
+static VKAPI_ATTR VkResult VKAPI_CALL H_vkCreateDescriptorSetLayout(VkDevice d, const VkDescriptorSetLayoutCreateInfo* ci, const VkAllocationCallbacks* a, VkDescriptorSetLayout* out)
+{
+    VkResult r = r_vkCreateDescriptorSetLayout(d, ci, a, out);
+    std::lock_guard<std::recursive_mutex> l(gLock);
+    for (uint32_t i = 0; i < ci->bindingCount; ++i)
+    {
+        auto& b = ci->pBindings[i];
+        if (b.pImmutableSamplers)
+            for (uint32_t k = 0; k < b.descriptorCount; ++k)
+                fprintf(gLog, "IMMUTABLE layout %p binding %u -> smp%d\n", (void*)*out, b.binding,
+                        gSamplers.count(b.pImmutableSamplers[k]) ? int(gSamplers[b.pImmutableSamplers[k]]) : -1);
+    }
+    return r;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL H_vkCreateImageView(VkDevice d, const VkImageViewCreateInfo* ci, const VkAllocationCallbacks* a, VkImageView* v)
 {
     VkResult r = r_vkCreateImageView(d, ci, a, v);
@@ -691,7 +723,7 @@ static PFN_vkVoidFunction Hooked(const char* name)
     H(vkCmdPushConstants) H(vkCmdDispatch) H(vkCmdDispatchIndirect) H(vkCmdCopyBuffer) H(vkCmdCopyBufferToImage) H(vkCmdUpdateBuffer)
     H(vkCmdFillBuffer) H(vkCreateBuffer) H(vkBindBufferMemory) H(vkMapMemory) H(vkCreateImage) H(vkCreateImageView) H(vkQueueSubmit)
     H(vkQueueSubmit2) H(vkBeginCommandBuffer) H(vkGetPhysicalDeviceProperties) H(vkGetPhysicalDeviceProperties2)
-    H(vkCmdPushDescriptorSetKHR) H(vkCmdClearColorImage) H(vkCmdCopyImage) H(vkGetDeviceProcAddr) H(vkGetInstanceProcAddr)
+    H(vkCmdPushDescriptorSetKHR) H(vkCmdClearColorImage) H(vkCmdCopyImage) H(vkGetDeviceProcAddr) H(vkGetInstanceProcAddr) H(vkCreateSampler) H(vkCreateDescriptorSetLayout)
 #undef H
     if (!strcmp(name, "vkQueueSubmit2KHR")) return (PFN_vkVoidFunction)H_vkQueueSubmit2;
     return nullptr;
@@ -898,7 +930,7 @@ static Ctx MakeDevice(bool validate)
     R(vkCreateShaderModule) R(vkCreateComputePipelines) R(vkCmdBindPipeline) R(vkCmdBindDescriptorSets) R(vkUpdateDescriptorSets)
     R(vkCmdPushConstants) R(vkCmdDispatch) R(vkCmdDispatchIndirect) R(vkCmdCopyBuffer) R(vkCmdCopyBufferToImage) R(vkCmdUpdateBuffer)
     R(vkCmdFillBuffer) R(vkCreateBuffer) R(vkBindBufferMemory) R(vkMapMemory) R(vkCreateImage) R(vkCreateImageView) R(vkQueueSubmit)
-    R(vkQueueSubmit2) R(vkBeginCommandBuffer) R(vkCmdPushDescriptorSetKHR) R(vkCmdClearColorImage) R(vkCmdCopyImage)
+    R(vkCreateSampler) R(vkCreateDescriptorSetLayout) R(vkQueueSubmit2) R(vkBeginCommandBuffer) R(vkCmdPushDescriptorSetKHR) R(vkCmdClearColorImage) R(vkCmdCopyImage)
 #undef R
     r_vkGetPhysicalDeviceProperties = vkGetPhysicalDeviceProperties;
     r_vkGetPhysicalDeviceProperties2 = vkGetPhysicalDeviceProperties2;
