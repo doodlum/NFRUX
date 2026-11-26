@@ -283,6 +283,7 @@ bool MlfgInterpolator::Frame(const FrameInputs& in, uint32_t count, uint32_t tot
         }
     }
     dev.Mark("mlfg generated frames");
+    net->FrameDone();
     dev.CopyTexture(color, backup);
     memcpy(vpm1, vp0, 64), memcpy(vp0, in.viewProjection, 64);
     hc ^= 1;

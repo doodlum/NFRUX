@@ -9,7 +9,7 @@ add_compile_options(/Zi /MP /EHsc /wd4244 /wd4267)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 option(NFRUX_STRICT_MATH "No fused or reordered shader arithmetic: D3D12 and Vulkan give the same bytes (the proof build). Off: the shipped build" OFF)
 set(GEN ${CMAKE_BINARY_DIR}/shaders)
-file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/shaders/*.hlsl core/shaders/*.hlsli core/ml/*.hlsl)
+file(GLOB_RECURSE SHADER_DEPS core/gpu/*.h core/shaders/*.glsl core/shaders/*.h core/shaders/*.hlsl core/shaders/*.hlsli core/shaders/*.comp core/ml/*.hlsl)
 add_custom_command(OUTPUT ${GEN}/nfrux_shaders.h
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/build_shaders.py ${CMAKE_SOURCE_DIR}/core ${GEN} ${NFRUX_STRICT_MATH}
     DEPENDS ${SHADER_DEPS} tools/build_shaders.py VERBATIM)

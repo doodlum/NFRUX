@@ -83,6 +83,11 @@ struct Caps
     uint32_t    vendorId = 0, deviceId = 0;
     bool        native16Bit = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
     uint32_t    shaderModel = 0;  // D3D12: 60, 62, 64, 66, ...
+    bool        vulkan = false;
+    // Vulkan: 16 x 16 x 16 fp16 x fp16 -> fp32 cooperative matrices usable (with 16-bit storage and the memory model
+    // enabled), and the subgroup size compute shaders get.
+    bool        coopMatF16 = false;
+    uint32_t    subgroupSize = 0;
     std::string Describe() const;
 };
 

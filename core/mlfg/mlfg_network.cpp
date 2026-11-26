@@ -3,6 +3,8 @@
 
 #include "amd_mlfg_weights.h"
 #include "log.h"
+#include "marker.h"
+#include "mlfg_coopmat.h"
 #include "nfrux_shaders.h"
 
 #include <algorithm>
@@ -50,6 +52,29 @@ float Half(uint16_t h)
     const uint32_t u = e == 31 ? (s | 0x7F800000u | (m << 13)) : (s | ((e + 112u) << 23) | (m << 13));
     memcpy(&f, &u, 4);
     return f;
+}
+uint16_t HalfBits(float f)  // round to nearest even (the weights are fp16 / fp8 values: exact)
+{
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    const uint32_t s = (u >> 16) & 0x8000u, e = (u >> 23) & 0xFFu;
+    uint32_t       m = u & 0x7FFFFFu;
+    if (e == 0xFF) return uint16_t(s | 0x7C00u | (m ? 0x200u : 0u));
+    const int E = int(e) - 112;
+    if (E >= 31) return uint16_t(s | 0x7C00u);
+    if (E <= 0)
+    {
+        if (E < -10) return uint16_t(s);
+        m |= 0x800000u;
+        const uint32_t shift = uint32_t(14 - E), rem = m & ((1u << shift) - 1u), half = 1u << (shift - 1u);
+        uint32_t       q = m >> shift;
+        if (rem > half || (rem == half && (q & 1u))) ++q;
+        return uint16_t(s | q);
+    }
+    uint32_t       q   = (uint32_t(E) << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (q & 1u))) ++q;
+    return uint16_t(s | q);
 }
 float Fp8(uint8_t b)
 {
@@ -125,13 +150,89 @@ std::string Network::Describe() const
     return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : "generic HLSL kernels (fp32, strict)";
 }
 
+bool Network::SelectTier(std::string* error)
+{
+    const Caps& caps = m_dev.caps();
+    const bool  mat  = caps.vulkan && caps.coopMatF16 && (caps.subgroupSize == 16 || caps.subgroupSize == 32 || caps.subgroupSize == 64);
+    const char* env  = Env("NFRUX_MLFG");  // tests: strict, no markers
+    const char* ini  = env ? nullptr : Option(caps.vulkan ? "vulkan" : "d3d12", "amdnetwork");
+    const char* want = env ? env : ini;
+    m_tier = Tier::Generic;
+    if (want && !strcmp(want, "generic")) return true;
+    if (want && strcmp(want, "coopmat"))
+    {
+        if (env) { if (error) *error = std::string("NFRUX_MLFG=") + want + ": not generic or coopmat"; return false; }
+        Log("nfrux.ini: AmdNetwork=%s is not generic or coopmat: the automatic choice", want);
+        want = nullptr;
+    }
+    if (want && !mat)
+    {
+        if (env) { if (error) *error = "NFRUX_MLFG=coopmat: no fp16 16x16x16 cooperative matrices here"; return false; }
+        Log("nfrux.ini: AmdNetwork=coopmat cannot be used here (no fp16 16x16x16 cooperative matrices): generic");
+        return true;
+    }
+    if (!mat) return true;
+    // Off NVIDIA the cooperative matrices are untested (no such GPU here): a crash marker of their own, as the int8 runtime's.
+    if (!env && caps.vendorId != 0x10DE)
+    {
+        char b[64];
+        snprintf(b, sizeof(b), "vulkan_mlfg_coopmat_%04x_%04x", caps.vendorId, caps.deviceId);
+        if (!MarkerBegin(b)) return true;
+        m_marker = b;
+    }
+    m_tier = Tier::CoopMat;
+    return true;
+}
+
+void Network::FrameDone()
+{
+    if (!m_marker.empty() && ++m_frames >= 120) MarkerOk(m_marker), m_marker.clear();
+}
+
 bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error)
 {
     auto fail = [&](const char* m) { if (error) *error = m; return false; };
     if (l0w % 32 || l0h % 32 || s2w % 4 || s2h % 4) return fail("network sizes");
+    if (!SelectTier(error)) return false;
+    m_offset.resize(kLayers), m_biasOffset.resize(kLayers);
+    if (m_tier == Tier::CoopMat)
+    {
+        // fp16 [tap][ciPad16][coPad64], biases fp32 [coPad64].
+        std::vector<uint16_t> h;
+        std::vector<float>    bias;
+        for (uint32_t l = 0; l < kLayers; ++l)
+        {
+            const LayerWeights& L = m_weights.layers[l];
+            const uint32_t taps = L.k * L.k, ciP = (L.cin + 15) & ~15u, coP = (L.cout + 63) & ~63u;
+            m_offset[l] = uint32_t(h.size()), m_biasOffset[l] = uint32_t(bias.size());
+            h.resize(h.size() + size_t(taps) * ciP * coP, 0);
+            bias.resize(bias.size() + coP, 0.0f);
+            uint16_t* w = h.data() + m_offset[l];
+            for (uint32_t o = 0; o < L.cout; ++o)
+                for (uint32_t i = 0; i < L.cin; ++i)
+                    for (uint32_t t = 0; t < taps; ++t)
+                    {
+                        const size_t src = L.kind == 0 ? (size_t(o) * L.cin + i) * taps + t : (size_t(i) * L.cout + o) * taps + t;
+                        w[(size_t(t) * ciP + i) * coP + o] = HalfBits(m_weights.W(l, src));
+                    }
+            for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
+        }
+        m_blob.resize(h.size() * 2), memcpy(m_blob.data(), h.data(), m_blob.size());
+        m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
+        m_gpuWeights = m_dev.CreateBuffer(m_blob.size()), m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size());
+        const uint32_t sg = m_dev.caps().subgroupSize;
+        const Shader* sh[4] = {sg == 16 ? &shaders::kMlfgMat3_16 : sg == 32 ? &shaders::kMlfgMat3_32 : &shaders::kMlfgMat3_64,
+                               sg == 16 ? &shaders::kMlfgMat2_16 : sg == 32 ? &shaders::kMlfgMat2_32 : &shaders::kMlfgMat2_64,
+                               sg == 16 ? &shaders::kMlfgMat1_16 : sg == 32 ? &shaders::kMlfgMat1_32 : &shaders::kMlfgMat1_64,
+                               sg == 16 ? &shaders::kMlfgMatT_16 : sg == 32 ? &shaders::kMlfgMatT_32 : &shaders::kMlfgMatT_64};
+        bool made = m_gpuWeights && m_gpuBias;
+        for (int i = 0; i < 4; ++i) made = made && (m_mat[i] = m_dev.CreatePass(*sh[i]));
+        if (!made) return fail("cooperative-matrix passes or weights buffer");
+    }
+    else
+    {
     // Generic tier: fp32 weights, [tap][cin][coPad] then the bias [coPad], coPad = cout rounded up to 8.
     std::vector<float> f;
-    m_offset.resize(kLayers);
     for (uint32_t l = 0; l < kLayers; ++l)
     {
         const LayerWeights& L = m_weights.layers[l];
@@ -152,9 +253,29 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     m_blob.resize(f.size() * 4);
     memcpy(m_blob.data(), f.data(), m_blob.size());
     m_gpuWeights = m_dev.CreateBuffer(m_blob.size());
-    m_conv3 = m_dev.CreatePass(shaders::kMlfgConv3), m_conv2 = m_dev.CreatePass(shaders::kMlfgConv2);
-    m_conv1 = m_dev.CreatePass(shaders::kMlfgConv1), m_convT = m_dev.CreatePass(shaders::kMlfgConvT);
-    if (!m_gpuWeights || !m_conv3 || !m_conv2 || !m_conv1 || !m_convT) return fail("network passes or weights buffer");
+    const Shader* sh[4][2] = {{&shaders::kMlfgConv3, &shaders::kMlfgConv3s}, {&shaders::kMlfgConv2, &shaders::kMlfgConv2s},
+                              {&shaders::kMlfgConv1, &shaders::kMlfgConv1s}, {&shaders::kMlfgConvT, &shaders::kMlfgConvTs}};
+    bool made = m_gpuWeights != nullptr;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j) made = made && (m_conv[i][j] = m_dev.CreatePass(*sh[i][j]));
+    if (!made) return fail("network passes or weights buffer");
+    if (EnvFlag("NFRUX_TEST_TIMES", false))  // profiling: a pass of its own per layer, so the times say which
+    {
+        static std::vector<std::string> names(2 * kLayers);
+        static std::vector<Shader>      copies(2 * kLayers);
+        m_layerPasses.resize(kLayers), m_layerPassesBig.resize(kLayers);
+        for (uint32_t l = 0; l < kLayers; ++l)
+            for (int j = 0; j < 2; ++j)
+            {
+                const LayerWeights& L = m_weights.layers[l];
+                Shader& c = copies[2 * l + j];
+                c = *sh[L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2][j];
+                names[2 * l + j] = "layer " + std::to_string(l) + " " + c.name;
+                c.name = names[2 * l + j].c_str();
+                (j ? m_layerPasses : m_layerPassesBig)[l] = m_dev.CreatePass(c);
+            }
+    }
+    }
     bool ok = true;
     auto tensor = [&](Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) {
         t.w = w, t.h = h, t.pitch = pitch;
@@ -174,8 +295,9 @@ bool Network::Prepare()
 {
     if (m_uploaded) return true;
     if (!m_dev.Upload(*m_gpuWeights, m_blob.data(), m_blob.size())) return false;
+    if (m_gpuBias && !m_dev.Upload(*m_gpuBias, m_biasBlob.data(), m_biasBlob.size())) return false;
     m_uploaded = true;
-    std::vector<uint8_t>().swap(m_blob);
+    std::vector<uint8_t>().swap(m_blob), std::vector<uint8_t>().swap(m_biasBlob);
     return true;
 }
 
@@ -185,16 +307,37 @@ bool Network::Run(const Conv& c)
     const uint32_t writeEnd = c.writeEnd ? c.writeEnd : (L.cout + 1) & ~1u;
     if (!c.src || !c.out || (writeEnd & 1) || (c.out.ch & 1) || c.out.ch + writeEnd > c.out.pitch) return false;
     const View& s1 = c.src1 ? c.src1 : c.src;
+    if (m_tier == Tier::CoopMat)
+    {
+        struct { int32_t in[4], in2[4], out[4], cfg[4], add[4], x[4]; } k = {
+            {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
+            {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
+            {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
+            {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
+            {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 63) & ~63u)},
+            {int32_t(m_biasOffset[c.layer]), int32_t((L.cin + 15) & ~15u), 0, 0}};
+        const int shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+        const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
+                          Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf), Bind::Buf(6, *m_gpuBias)};
+        if (L.kind == 1) return m_mat[3]->Dispatch(b, 7, (c.src.w + 15) / 16, c.src.h, (L.cout + 31) / 32);
+        return m_mat[shape]->Dispatch(b, 7, (c.out.w + 15) / 16, c.out.h, (L.cout + 63) / 64);
+    }
     struct { int32_t in[4], in2[4], out[4], cfg[4], add[4]; } k = {
         {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(std::min(c.split, L.cin))},
         {int32_t(c.src.ch), int32_t(s1.pitch), int32_t(s1.ch), int32_t(L.cin)},
         {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
         {int32_t(L.cout), int32_t(c.act), c.fp8 ? 1 : 0, int32_t(writeEnd)},
         {c.add ? int32_t(c.add.pitch) : 0, int32_t(c.add.ch), int32_t(m_offset[c.layer]), int32_t((L.cout + 7) & ~7u)}};
-    Pass* p = L.kind == 1 ? m_convT.get() : L.k == 3 ? m_conv3.get() : L.k == 2 ? m_conv2.get() : m_conv1.get();
+    // Shape, and tile: 16 x 16 (16 x 8 for 2x2/2) pixels a group, or 4 x 4 with the channels in 4 slices where the large
+    // tile would give few groups (the low-resolution layers). Chosen from sizes only: the same on every API.
+    const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+    const uint32_t zs = (std::max(L.cout, writeEnd) + 7) / 8, th = shape == 1 ? 8 : 16;
+    const bool     small = uint64_t((c.out.w + 15) / 16) * ((c.out.h + th - 1) / th) * zs < 768;
+    Pass*          p = m_conv[shape][small ? 1 : 0].get();
+    if (!m_layerPasses.empty() && m_layerPasses[c.layer]) p = small ? m_layerPasses[c.layer].get() : m_layerPassesBig[c.layer].get();
     const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(2, *s1.buf), Bind::Buf(3, *m_gpuWeights),
                       Bind::Buf(4, c.add ? *c.add.buf : *c.src.buf), Bind::Buf(5, *c.out.buf)};
-    return p->Dispatch(b, 6, (c.out.w + 7) / 8, (c.out.h + 7) / 8, (std::max(L.cout, writeEnd) + 7) / 8);
+    return small ? p->Dispatch(b, 6, (c.out.w + 3) / 4, (c.out.h + 3) / 4, zs) : p->Dispatch(b, 6, (c.out.w + 15) / 16, (c.out.h + th - 1) / th, zs);
 }
 
 namespace

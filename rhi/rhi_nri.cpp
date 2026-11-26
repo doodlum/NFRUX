@@ -262,7 +262,25 @@ public:
         if (!NRI_OK(nri::nriCreateDeviceFromVKDevice(d, dev)) || !Init()) return false;
         
         c.dot4 = (h.mlFeatures & ffx_ml::FEATURE_INTEGER_DOT_PRODUCT) != 0, c.cooperativeMatrix = (h.mlFeatures & ffx_ml::FEATURE_COOPERATIVE_MATRIX) != 0;
-        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d", c.name.c_str(), c.dot4, c.cooperativeMatrix);
+        c.vulkan = true;
+        {
+            VkPhysicalDeviceSubgroupProperties sp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+            VkPhysicalDeviceProperties2       p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sp};
+            if (auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(h.gipa(h.instance, "vkGetPhysicalDeviceProperties2"))) get(h.physicalDevice, &p2), c.subgroupSize = sp.subgroupSize;
+            const uint32_t need = ffx_ml::FEATURE_COOPERATIVE_MATRIX | ffx_ml::FEATURE_VULKAN_MEMORY_MODEL | ffx_ml::FEATURE_SHADER_FLOAT16 | ffx_ml::FEATURE_STORAGE_BUFFER_16BIT;
+            auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(h.gipa(h.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+            if ((h.mlFeatures & need) == need && props)
+            {
+                uint32_t n = 0;
+                props(h.physicalDevice, &n, nullptr);
+                std::vector<VkCooperativeMatrixPropertiesKHR> v(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+                props(h.physicalDevice, &n, v.data());
+                for (auto& s : v)
+                    c.coopMatF16 = c.coopMatF16 || (s.MSize == 16 && s.NSize == 16 && s.KSize == 16 && s.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && s.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                                    s.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && s.scope == VK_SCOPE_SUBGROUP_KHR);
+            }
+        }
+        Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d (fp16 16x16x16 %d), subgroup %u", c.name.c_str(), c.dot4, c.cooperativeMatrix, c.coopMatF16, c.subgroupSize);
         return true;
     }
 

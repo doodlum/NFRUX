@@ -61,6 +61,7 @@ public:
     std::string Describe() const;
 
     bool Prepare();  // the weights' upload, recorded into the first frame
+    void FrameDone();  // a frame was recorded: the crash marker is cleared after the first 120
     // Passes 2-16: rgb0 / rgb1 (ch 0-2 / 3-5 of net_in) -> features into ch 6-11 / 12-17.
     bool Encoders(const View& netIn);
     // One flow block (0-3) of stage 1: in (its size S) -> out13 (13 channels, size S).
@@ -82,15 +83,19 @@ public:
 private:
     Network(Device& d) : m_dev(d) {}
     bool Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error);
+    bool SelectTier(std::string* error);
     bool FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, const View& y, const View& pc, const View& h, const View* skip, const View* upOut);
     Device&                 m_dev;
     Tier                    m_tier = Tier::Generic;
     Weights                 m_weights;
-    std::vector<uint32_t>   m_offset;  // the layer's weights in the tier's buffer (floats / halves)
-    std::vector<uint8_t>    m_blob;    // the tier's weights until uploaded
-    std::unique_ptr<Buffer> m_gpuWeights;
-    std::unique_ptr<Pass>   m_conv3, m_conv2, m_conv1, m_convT;
+    std::vector<uint32_t>   m_offset, m_biasOffset;  // the layer's weights in the tier's buffers (floats / halves)
+    std::vector<uint8_t>    m_blob, m_biasBlob;  // the tier's weights until uploaded
+    std::unique_ptr<Buffer> m_gpuWeights, m_gpuBias;
+    std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames
+    uint32_t                m_frames = 0;
+    std::unique_ptr<Pass>   m_conv[4][2];  // 3x3, 2x2/2, 1x1, transposed; large / small tile
     std::unique_ptr<Pass>   m_mat[4];
+    std::vector<std::unique_ptr<Pass>> m_layerPasses, m_layerPassesBig;  // NFRUX_TEST_TIMES
     bool                    m_uploaded = false;
     Tensor                  m_a, m_b, m_c, m_d;                                 // stage-1 scratch
     Tensor                  m_t32, m_x48, m_y48, m_skip, m_pc16, m_h96, m_x64, m_y64, m_pc32, m_h128, m_u32;  // stage 2
