@@ -37,7 +37,8 @@ public:
     // shape 0-2, 8 n tiles, 32 pixels of a row a warp: grid (W / 32 rounded up, rows / kCudaWarps, n tiles / 8).
     bool LaunchM(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const;
     // A whole FasterNet block (no up), 16 pixels of a row a warp: grid (W / 16 rounded up, H, 1).
-    bool LaunchFn(void* list, uint32_t C, const uint32_t grid[3], const FnParams& p) const;
+    bool LaunchFn(void* list, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const;  // fp8: the e4m3 kernel (FP8 weights)
+    bool Fp8() const { return m_fn8[0] != nullptr; }  // sm_89+: e4m3 tensor cores
 
 private:
     CudaKernels() = default;
@@ -45,7 +46,9 @@ private:
     void*         m_module = nullptr;
     void*         m_conv[4][6] = {};
     void*         m_fnk[2] = {};
+    void*         m_fn8[2] = {};
     void*         m_convM[3] = {};  // 3x3 / 2x2 / 1x1, 8 n tiles, 32 pixels a warp
 };
-std::string CudaPtx();  // tests
+std::string CudaPtx(bool fp8);  // tests
+int         Fp8Channel(int kpos);  // an fp8 k chunk's position -> input channel within its 32 (weights' packing)
 }  // namespace nfrux::mlfg

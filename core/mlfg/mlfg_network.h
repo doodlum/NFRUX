@@ -90,7 +90,9 @@ private:
     Device&                 m_dev;
     Tier                    m_tier = Tier::Generic;
     Weights                 m_weights;
-    std::vector<uint32_t>   m_offset, m_biasOffset, m_nb;  // the layer's weights in the tier's buffers (floats / halves)
+    std::vector<uint32_t>   m_offset, m_biasOffset, m_nb, m_off8;  // m_off8: FP8 FasterNet weights (bytes)
+    std::vector<uint8_t>    m_blob8;
+    std::unique_ptr<Buffer> m_gpuW8;  // the layer's weights in the tier's buffers (floats / halves)
     std::vector<uint8_t>    m_blob, m_biasBlob;  // the tier's weights until uploaded
     std::unique_ptr<Buffer> m_gpuWeights, m_gpuBias;
     std::string             m_marker;  // crash marker (cooperative matrices off NVIDIA), cleared after 120 frames

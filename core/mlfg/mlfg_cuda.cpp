@@ -8,6 +8,7 @@
 #include "mlfg_cuda.h"
 
 #include "cuda_network.h"
+#include "log.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -347,11 +348,118 @@ std::string FnKernel(int C, int P, int ntpP, int ntpE, int ntpJ)
     w("ret;");
     return w.s + "}\n";
 }
+// The FasterNet block on FP8 tensor cores (sm_89+: mma.m16n8k32 e4m3 x e4m3 -> fp32). Every operand is an fp8 value
+// already (x and each step's rounded output; the stage-2 weights), so the products are exact and only the fp32 sums'
+// order differs from the fp16 kernel. K order inside a 32-chunk is permuted (kpos -> channel Fp8Channel) so that an
+// accumulator fragment (columns 2q, 2q + 1 of four n tiles) is directly an A fragment; the weights are packed the same
+// way (Network, Fp8Channel). Chunks: pconv P = 16 two taps a chunk (the 10th tap zero), P = 32 a tap a chunk; expand
+// and project 32 input channels a chunk (past C / 2C zero).
+std::string FnKernel8(int C, int P)
+{
+    const int TP = P / 8, TE = 2 * C / 8, TJ = C / 8, KCP = P == 16 ? 5 : 9, KCE = (C + 31) / 32, KCJ = 2 * C / 32;
+    Ptx w;
+    w.s = ".visible .entry fn" + std::to_string(C) + "f8(.param .align 8 .b8 P[72])\n{\n";
+    w(".reg .b32 %%r<220>; .reg .b64 %%rd<80>; .reg .f32 %%f<200>; .reg .pred %%p<60>; .reg .b16 %%h<120>;");
+    for (int i = 0; i < 8; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);
+    w("ld.param.u32 %%r1, [P+64]; ld.param.u32 %%r2, [P+68];");
+    w("mov.u32 %%r21, %%tid.x; and.b32 %%r21, %%r21, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3;");
+    w("mov.u32 %%r24, %%ctaid.x; shl.b32 %%r24, %%r24, 4; mov.u32 %%r25, %%ctaid.y; mov.u32 %%r35, %%tid.x; shr.u32 %%r35, %%r35, 5; mad.lo.u32 %%r25, %%r25, %d, %%r35; add.u32 %%r27, %%r24, %%r22; add.u32 %%r28, %%r27, 8;", kCudaWarps);
+    w("mul.wide.u32 %%rd9, %%r21, 8; mul.wide.u32 %%rd20, %%r23, 4; mul.wide.u32 %%rd21, %%r23, 8;");  // lane*8 (two B words), q*4, q*8
+    for (int t = 0; t < 9; ++t)
+    {
+        w("add.s32 %%r30, %%r25, %d; setp.ge.s32 %%p5, %%r30, 0; setp.lt.s32 %%p6, %%r30, %%r2; and.pred %%p5, %%p5, %%p6;", t / 3 - 1);
+        for (int r = 0; r < 2; ++r)
+        {
+            const int pr = 10 + t * 2 + r;
+            w("add.s32 %%r31, %%r%d, %d; setp.ge.s32 %%p6, %%r31, 0; setp.lt.s32 %%p7, %%r31, %%r1; and.pred %%p6, %%p6, %%p7; and.pred %%p%d, %%p5, %%p6;", r ? 28 : 27, t % 3 - 1, pr);
+            w("mad.lo.s32 %%r32, %%r30, %%r1, %%r31; selp.b32 %%r32, %%r32, 0, %%p%d; mul.lo.s32 %%r32, %%r32, %d; mul.wide.s32 %%rd10, %%r32, 2; add.s64 %%rd%d, %%rd1, %%rd10;", pr, C, 30 + t * 2 + r);
+            w("add.s64 %%rd%d, %%rd%d, %%rd20;", 30 + t * 2 + r, 30 + t * 2 + r);
+        }
+    }
+    int lab = 0;
+    // Channels ch, ch + 1 of x at tap t, row r, as an e4m3 pair in %h<dst> (0 outside).
+    auto x8 = [&](int t, int r, int ch, int dst) {
+        w("mov.u32 %%r58, 0; @%%p%d ld.global.u32 %%r58, [%%rd%d+%d]; cvt.rn.satfinite.e4m3x2.f16x2 %%h%d, %%r58;", 10 + t * 2 + r, 30 + t * 2 + r, ch * 2, dst);
+        (void)lab;
+    };
+    auto pack = [&](int dst, int lo, int hi) { w("mov.b32 %%r%d, {%%h%d, %%h%d};", dst, lo, hi); };
+    auto mma = [&](int f) {
+        w("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%%f%d, %%f%d, %%f%d, %%f%d}, {%%r50, %%r51, %%r52, %%r53}, {%%r54, %%r55}, {%%f%d, %%f%d, %%f%d, %%f%d};", f, f + 1, f + 2, f + 3, f, f + 1, f + 2, f + 3);
+    };
+    auto bload = [&](int wreg, int kc, int nt, int NT) { w("add.s64 %%rd11, %%rd%d, %%rd9; ld.global.v2.u32 {%%r54, %%r55}, [%%rd11+%d];", wreg, ((kc * NT + nt) * 32) * 8); };
+    // Epilogue of n tile n: fp8 values; e4m3 pairs into h<dst> (row a), h<dst+1> (row b), or for the last step fp16 stores.
+    auto finish = [&](int f, int breg, int n, bool relu, bool residual, int dst) {
+        w("add.s64 %%rd12, %%rd%d, %%rd21; ld.global.f32 %%f180, [%%rd12+%d]; ld.global.f32 %%f181, [%%rd12+%d];", breg, n * 32, n * 32 + 4);
+        for (int r = 0; r < 2; ++r)
+        {
+            w("add.rn.f32 %%f182, %%f%d, %%f180; add.rn.f32 %%f183, %%f%d, %%f181;", f + 2 * r, f + 2 * r + 1);
+            if (residual)
+                w("mov.u32 %%r59, 0; @%%p%d ld.global.u32 %%r59, [%%rd%d+%d]; mov.b32 {%%h3, %%h4}, %%r59; cvt.f32.f16 %%f184, %%h3; cvt.f32.f16 %%f185, %%h4; add.rn.f32 %%f182, %%f182, %%f184; add.rn.f32 %%f183, %%f183, %%f185;",
+                  18 + r, 38 + r, n * 16);
+            if (relu) w("max.f32 %%f182, %%f182, 0f00000000; max.f32 %%f183, %%f183, 0f00000000;");
+            Fp8(w, 182), Fp8(w, 183);
+            if (dst >= 0) w("cvt.rn.satfinite.e4m3x2.f32 %%h%d, %%f183, %%f182;", dst + r);  // (high, low)
+            else
+                w("cvt.rn.f16.f32 %%h5, %%f182; cvt.rn.f16.f32 %%h6, %%f183; mov.b32 %%r72, {%%h5, %%h6}; @%%p%d st.global.u32 [%%rd%d+%d], %%r72;", 18 + r, 14 + r, n * 16);
+        }
+    };
+    // --- pconv: chunk c: kpos < 16 tap a, >= 16 tap b (P = 16: taps 2c, 2c + 1; P = 32: tap c, channels 0-15 | 16-31).
+    for (int i = 0; i < TP * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int c = 0; c < KCP; ++c)
+    {
+        const int ta = P == 16 ? 2 * c : c, tb = P == 16 ? 2 * c + 1 : c, cb = P == 16 ? 0 : 16;
+        for (int r = 0; r < 2; ++r)
+        {
+            x8(ta, r, 0, 10), x8(ta, r, 8, 11);
+            pack(50 + r, 10, 11);
+            if (tb < 9) x8(tb, r, cb, 12), x8(tb, r, cb + 8, 13), pack(52 + r, 12, 13);
+            else w("mov.u32 %%r%d, 0;", 52 + r);
+        }
+        for (int n = 0; n < TP; ++n) bload(3, c, n, TP), mma(n * 4);
+    }
+    for (int n = 0; n < TP; ++n) finish(n * 4, 6, n, false, false, 20 + 2 * n);  // pc tile n: h(20 + 2n) row a, (21 + 2n) row b
+    // --- expand: chunk c: channels 32c + lc: < P from pc tiles, < C from x (centre tap 4), else 0.
+    auto pair = [&](int ci, int r, int dst) {  // the e4m3 pair of channels ci, ci + 1 (ci = 8 tile + 2q structure) into h<dst>
+        if (ci < P) w("mov.b16 %%h%d, %%h%d;", dst, 20 + 2 * (ci / 8) + r);
+        else if (ci < C) x8(4, r, ci, dst);
+        else w("mov.b16 %%h%d, 0;", dst);
+    };
+    for (int i = 0; i < TE * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int c = 0; c < KCE; ++c)
+    {
+        for (int r = 0; r < 2; ++r)
+        {
+            pair(32 * c, r, 10), pair(32 * c + 8, r, 11), pack(50 + r, 10, 11);
+            pair(32 * c + 16, r, 12), pair(32 * c + 24, r, 13), pack(52 + r, 12, 13);
+        }
+        for (int n = 0; n < TE; ++n) bload(4, c, n, TE), mma(n * 4);
+    }
+    for (int n = 0; n < TE; ++n) finish(n * 4, 7, n, true, false, 40 + 2 * n);  // h tile n: h(40 + 2n), (41 + 2n)
+    // --- project + x, stored.
+    for (int i = 0; i < TJ * 4; ++i) w("mov.f32 %%f%d, 0f00000000;", i);
+    for (int c = 0; c < KCJ; ++c)
+    {
+        for (int r = 0; r < 2; ++r)
+        {
+            pack(50 + r, 40 + 2 * (4 * c) + r, 40 + 2 * (4 * c + 1) + r);
+            pack(52 + r, 40 + 2 * (4 * c + 2) + r, 40 + 2 * (4 * c + 3) + r);
+        }
+        for (int n = 0; n < TJ; ++n) bload(5, c, n, TJ), mma(n * 4);
+    }
+    w("sub.s64 %%rd13, %%rd2, %%rd1; add.s64 %%rd14, %%rd38, %%rd13; add.s64 %%rd15, %%rd39, %%rd13;");
+    for (int n = 0; n < TJ; ++n) finish(n * 4, 8, n, false, true, -1);
+    w("ret;");
+    return w.s + "}\n";
+}
 }  // namespace
 
-std::string CudaPtx()
+// kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
+int Fp8Channel(int kp) { return (kp >= 16 ? 16 : 0) + 8 * ((kp % 4) / 2) + 2 * ((kp % 16) / 4) + (kp % 2); }
+
+std::string CudaPtx(bool fp8)
 {
-    std::string p = ".version 7.0\n.target sm_75\n.address_size 64\n";
+    std::string p = fp8 ? ".version 8.4\n.target sm_89\n.address_size 64\n" : ".version 7.0\n.target sm_75\n.address_size 64\n";
+    if (fp8) p += FnKernel8(48, 16), p += FnKernel8(64, 32);
     for (int s = 0; s < 4; ++s)
         for (int nb : kNbs)
             if (s < 3 || nb <= 4) p += Kernel(s, nb);
@@ -365,8 +473,11 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
     auto fail = [&](const std::string& m) -> std::unique_ptr<CudaKernels> { if (error) *error = m; return nullptr; };
     auto* d3d = static_cast<ID3D12Device*>(dev.NativeDevice());
     if (!d3d || !cuda::Available()) return fail("no NVAPI CUDA launch");
-    if (!cuda::ComputeCapability(d3d->GetAdapterLuid(), error)) return nullptr;
-    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(), d3d->GetAdapterLuid(), error);
+    const int cc = cuda::ComputeCapability(d3d->GetAdapterLuid(), error);
+    if (!cc) return nullptr;
+    // FP8 tensor cores from sm_89 (RTX 40): the module for that target with the e4m3 FasterNet kernels.
+    const bool fp8 = cc >= 89 && !EnvFlag("NFRUX_MLFG_NO_FP8", false);
+    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtx(fp8), d3d->GetAdapterLuid(), error);
     if (cubin.empty()) return nullptr;
     std::unique_ptr<CudaKernels> k(new CudaKernels());
     k->m_device = d3d;
@@ -379,19 +490,23 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
         if (!(k->m_convM[s] = cuda::CreateFunction(d3d, k->m_module, (std::string(names[s]) + "_8m2").c_str()))) return fail("CreateCuFunction");
     for (int i = 0; i < 2; ++i)
         if (!(k->m_fnk[i] = cuda::CreateFunction(d3d, k->m_module, i ? "fn64" : "fn48"))) return fail("CreateCuFunction");
+    for (int i = 0; i < 2 && fp8; ++i)
+        if (!(k->m_fn8[i] = cuda::CreateFunction(d3d, k->m_module, i ? "fn64f8" : "fn48f8"))) return fail("CreateCuFunction");
     return k;
 }
 CudaKernels::~CudaKernels()
 {
     std::vector<void*> f(m_fnk, m_fnk + 2);
+    f.insert(f.end(), m_fn8, m_fn8 + 2);
     f.insert(f.end(), m_convM, m_convM + 3);
     for (auto& s : m_conv) f.insert(f.end(), s, s + 6);
     cuda::Destroy(m_device, m_module, f);
 }
 
-bool CudaKernels::LaunchFn(void* list, uint32_t C, const uint32_t grid[3], const FnParams& p) const
+bool CudaKernels::LaunchFn(void* list, uint32_t C, bool fp8, const uint32_t grid[3], const FnParams& p) const
 {
-    return cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), m_fnk[C == 48 ? 0 : 1], grid, 32 * kCudaWarps, &p, sizeof(p));
+    void* f = fp8 ? m_fn8[C == 48 ? 0 : 1] : m_fnk[C == 48 ? 0 : 1];
+    return f && cuda::Launch(static_cast<ID3D12GraphicsCommandList*>(list), f, grid, 32 * kCudaWarps, &p, sizeof(p));
 }
 
 bool CudaKernels::LaunchM(void* list, int shape, const uint32_t grid[3], const CudaParams& p) const

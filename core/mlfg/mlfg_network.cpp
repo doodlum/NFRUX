@@ -159,7 +159,7 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
-    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? "CUDA kernels, fp16 tensor cores (D3D12)" : "generic HLSL kernels (fp32, strict)";
+    return m_tier == Tier::CoopMat ? "cooperative matrices fp16 (Vulkan)" : m_tier == Tier::Cuda ? (m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks (D3D12)" : "CUDA kernels, fp16 tensor cores (D3D12)") : "generic HLSL kernels (fp32, strict)";
 }
 
 bool Network::SelectTier(std::string* error)
@@ -240,7 +240,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     // 4K, generic D3D12 +7.7 / Vulkan -0.3 ms at 1080p: one-subgroup groups, shared-memory round trips, register pressure);
     // untested elsewhere. Off unless NFRUX_MLFG_FUSED=1. CUDA's is on (NFRUX_MLFG_UNFUSED=1 turns every one off).
     m_fusedMat = m_fused && EnvFlag("NFRUX_MLFG_FUSED", false);
-    m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers);
+    m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers), m_off8.resize(kLayers);
     if (m_tier == Tier::Cuda)
     {
         // mma fragments: per layer [kc][tap][ntp][lane] words, word = (W[k = 8 kc + 2q][n], W[k + 1][n]), n = 8 nt + g, lane = 4g + q;
@@ -270,6 +270,34 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
                             w[((size_t(c) * taps + t) * ntp + n) * 32 + lane] = at(t, k, o) | (uint32_t(at(t, k + 1, o)) << 16);
                         }
             for (uint32_t o = 0; o < L.cout; ++o) bias[m_biasOffset[l] + o] = m_weights.B(l, o);
+        }
+        // FP8 tensor cores: the FasterNet layers' weights again, as e4m3 B fragments of 32-channel k chunks ([chunk][n][lane]
+        // two words; channel order Fp8Channel; pconv P = 16: two taps a chunk).
+        if (m_cuda->Fp8())
+        {
+            for (uint32_t l = kS2B1; l < kS2Up; ++l)
+            {
+                if (l == kS2D2 || l == kS2B2 + 15) continue;  // d2, up: not in a fused block
+                const LayerWeights& L = m_weights.layers[l];
+                const uint32_t taps = L.k * L.k, nt = L.cout / 8;
+                const bool     pconv = L.k == 3, two = pconv && L.cin == 16;
+                const uint32_t chunks = pconv ? (two ? 5 : 9) : (L.cin + 31) / 32;
+                m_off8[l] = uint32_t(m_blob8.size());
+                m_blob8.resize(m_blob8.size() + size_t(chunks) * nt * 32 * 8, 0);
+                for (uint32_t c = 0; c < chunks; ++c)
+                    for (uint32_t n = 0; n < nt; ++n)
+                        for (uint32_t lane = 0; lane < 32; ++lane)
+                            for (uint32_t i = 0; i < 8; ++i)
+                            {
+                                const uint32_t kp = (i < 4 ? 4 * (lane & 3) + i : 16 + 4 * (lane & 3) + i - 4), lc = uint32_t(Fp8Channel(int(kp)));
+                                uint32_t t = 0, ci = 32 * c + lc;
+                                if (pconv) t = two ? 2 * c + lc / 16 : c, ci = two ? lc % 16 : lc;
+                                if (t >= taps || ci >= L.cin || !L.fp8) continue;
+                                const uint32_t o = 8 * n + (lane >> 2);
+                                m_blob8[m_off8[l] + ((size_t(c) * nt + n) * 32 + lane) * 8 + i] = m_weights.data[L.weights + (size_t(o) * L.cin + ci) * taps + t];
+                            }
+            }
+            if (!(m_gpuW8 = m_dev.CreateBuffer(m_blob8.size()))) return fail("weights buffer");
         }
         m_blob.resize(h.size() * 4), memcpy(m_blob.data(), h.data(), m_blob.size());
         m_biasBlob.resize(bias.size() * 4), memcpy(m_biasBlob.data(), bias.data(), m_biasBlob.size());
@@ -366,6 +394,8 @@ bool Network::Prepare()
     if (m_uploaded) return true;
     if (!m_dev.Upload(*m_gpuWeights, m_blob.data(), m_blob.size())) return false;
     if (m_gpuBias && !m_dev.Upload(*m_gpuBias, m_biasBlob.data(), m_biasBlob.size())) return false;
+    if (m_gpuW8 && !m_dev.Upload(*m_gpuW8, m_blob8.data(), m_blob8.size())) return false;
+    std::vector<uint8_t>().swap(m_blob8);
     m_uploaded = true;
     std::vector<uint8_t>().swap(m_blob), std::vector<uint8_t>().swap(m_biasBlob);
     return true;
@@ -496,16 +526,17 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
     if (m_tier == Tier::Cuda && m_fused && x.pitch == C && y.pitch == C && !x.ch && !y.ch)
     {
         // One kernel for pconv, expand and project: the same products, order and roundings as the three layers.
-        const Buffer* bufs[] = {x.buf, y.buf, m_gpuWeights.get(), m_gpuBias.get()};
+        const bool    f8 = m_gpuW8 != nullptr;
+        const Buffer* bufs[] = {x.buf, y.buf, f8 ? m_gpuW8.get() : m_gpuWeights.get(), m_gpuBias.get()};
         void* list = m_dev.NativeAccess(bufs, 4);
         if (!list) return false;
-        const uint64_t wa = m_dev.NativeAddress(*m_gpuWeights), ba = m_dev.NativeAddress(*m_gpuBias);
-        const FnParams p = {m_dev.NativeAddress(*x.buf), m_dev.NativeAddress(*y.buf), wa + uint64_t(m_offset[first]) * 4, wa + uint64_t(m_offset[first + 1]) * 4,
-                            wa + uint64_t(m_offset[first + 2]) * 4, ba + uint64_t(m_biasOffset[first]) * 4, ba + uint64_t(m_biasOffset[first + 1]) * 4,
+        const uint64_t wa = m_dev.NativeAddress(*bufs[2]), ba = m_dev.NativeAddress(*m_gpuBias);
+        auto wo = [&](uint32_t l) { return f8 ? wa + m_off8[l] : wa + uint64_t(m_offset[l]) * 4; };
+        const FnParams p = {m_dev.NativeAddress(*x.buf), m_dev.NativeAddress(*y.buf), wo(first), wo(first + 1), wo(first + 2), ba + uint64_t(m_biasOffset[first]) * 4, ba + uint64_t(m_biasOffset[first + 1]) * 4,
                             ba + uint64_t(m_biasOffset[first + 2]) * 4, int32_t(x.w), int32_t(x.h)};
         const uint32_t grid[3] = {(x.w + 15) / 16, (x.h + kCudaWarps - 1) / kCudaWarps, 1};
-        if (!m_cuda->LaunchFn(list, C, grid, p)) return false;
-        if (m_dev.Timing()) m_dev.Mark(C == 48 ? "FasterNet 48 (fused)" : "FasterNet 64 (fused)");
+        if (!m_cuda->LaunchFn(list, C, f8, grid, p)) return false;
+        if (m_dev.Timing()) m_dev.Mark(C == 48 ? (f8 ? "FasterNet 48 (fused, fp8)" : "FasterNet 48 (fused)") : (f8 ? "FasterNet 64 (fused, fp8)" : "FasterNet 64 (fused)"));
         if (!skip) return true;
         c.layer = first + 3, c.src = y, c.add = *skip, c.out = *upOut, c.fp8 = true;
         return Run(c);
