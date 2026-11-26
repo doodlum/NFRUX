@@ -528,3 +528,16 @@ Gates after the last change: mlfg_passes 68/68; mlfg_net 76/76 on each sample, e
 47.8-48.8 / 44.1-45.0 dB vs the fp64-summed net, yardstick minus 3 = 46.8-47.2 / 41.5-42.4); parity --strict (generic,
 strict build) 0 differing bytes; ngx_harness Model=amd 77/78 per API (RGB10A2 PQ quality, as before), Model=nfru 158/158;
 build-ship and build-strict green. Details: docs/FFX_MLFG.md "Speed work, round 2".
+
+## FSR FG4 port, speed round 3 (2026-11-26, commits d2f9380..87209cb)
+
+GPU shared with the v16 training run (17-28% utilisation sampled); round 2's last commit rebuilt and run interleaved
+with this one, median of 3, ms a rendered frame, before / after: cuda D3D12 1080p 2x 2.59 / 2.65, 4K 2x 9.02 / 9.08, 4K
+4x 17.7 / 17.6; cuda Vulkan 3.17 / 3.24, 7.69 / 8.00, 14.8 / 15.0; coopmat 3.93 / 3.86, 11.9 / 11.75, 26.6 / 25.8 (noise
+level at this load). Kept: the composite's split weight upsample (kMlfgWeightsH; same bytes; composite 1.01 -> 0.72 +
+0.09 ms). Measured and removed under the 0.2-0.3 ms rule: e4m3 stage-2 tensors with Vulkan FP8 (stage 2 4.48 -> 4.41 ms),
+ldmatrix staging (neutral), and round 2's small items (fp16 accumulation, CUDA staging, fused softmax, 64-pixel / 4-tile
+kernels, fused coopmat / generic FasterNet). Not done: the stage-2 input pass fused with its 3x3 layer (would save about
+0.1 ms). Gates on the final state: mlfg_passes 74/74 (68 + the rows-path checks); mlfg_net 76/76 on each sample (cuda
+47.4-49.3 / 44.0-45.0 dB vs the fp64-summed net); parity --strict 0 differing bytes; ngx_harness Model=amd 77/78 per API
+(RGB10A2 PQ quality), Model=nfru 158/158; build-ship and build-strict green.

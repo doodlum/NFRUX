@@ -202,7 +202,7 @@ params / gate textures on every path (paths that write images directly are an op
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 | FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores, FP8 for stage 2's FasterNet blocks on RTX 40+ (NVAPI, crash marker) | - | generic (strict HLSL) |
-| FSR FG4 (Model=amd), Vulkan | NVIDIA RTX: the same CUDA kernels (VK_NVX_binary_import, crash marker; identical bytes to D3D12) | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA; FP8 1x1 layers opt-in) | generic (strict HLSL) |
+| FSR FG4 (Model=amd), Vulkan | NVIDIA RTX: the same CUDA kernels (VK_NVX_binary_import, crash marker; identical bytes to D3D12) | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA) | generic (strict HLSL) |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of

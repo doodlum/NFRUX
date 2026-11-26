@@ -204,6 +204,8 @@ softmax into the head's epilogue.
 
 ### Speed work, round 2 (2026-11-26)
 
+(Round 3 removed several of the items below as too small or switched off: CUDA staging, the fused softmax, the 64-pixel and 4-tile CUDA kernels, Vulkan FP8, fp16 accumulation, the fused coopmat kernel. See round 3.)
+
 Same RTX 4070, idle this time. `parity --bench` (16 frames a submission, median of 30, ms a rendered frame); "before" is
 round 1's last commit (26878cb) rebuilt in a worktree and measured on the same idle GPU, so the columns compare directly
 (round 1's own table above was taken under a training job and reads about 5-10% high).
@@ -253,28 +255,16 @@ What changed, in the order done:
 9. **fp16 accumulation** (shipped build only; `NFRUX_STRICT_MATH` builds compile none of it and keep their bytes):
    see below.
 
-#### fp16 accumulation: which layers and why
+#### fp16 accumulation (measured, then removed in round 3)
 
-GeForce runs `mma.sync` with f16 accumulate at twice the f32 rate. Three forms were measured on every CUDA layer at 4K:
-fp32 (as before), fp16 over the whole reduction, and fp16 within each 8-channel chunk (all taps; the chunk sums added
-into fp32). Whole-reduction fp16 everywhere fails the yardstick (46.6-47.1 dB against 46.8-47.2 needed); chunked fp16
-everywhere passes narrowly but is slower overall (7.7 against 7.3 ms): the tensor cores are rarely the limit here,
-and on the 96-192-channel 3x3 layers the f16 kernels ran slower (more instructions a chunk, conversions). So the
-choice is per layer, kept only where it is faster:
-
-| Layers | Accumulator | Why |
-|---|---|---|
-| 1, 2, 5, 6 (encoders 3x3 32->32), 10 (2x2 96->192), 23 (2x2 64->128), 48 (3x3 24->24) | fp16 within each chunk, fp32 across chunks | 25-30% faster each (0.04 -> 0.03 ms, 0.032 -> 0.022, 0.025 -> 0.018); error not measurable on its own (within +-0.3 dB of fp32) |
-| 60 (stage-2 input, 3x3 24->32) | fp32 | 8% faster but -0.5 to -1.4 dB on the 4x outputs: its inputs carry the largest magnitudes |
-| every other plain layer (96-192-channel 3x3, transposed, the head, split-K) | fp32 | f16 slower or no faster |
-| fused FasterNet (fp16 and FP8 kernels) | fp32 | not tried for FP8 f16-accumulate: the fp16 result above (latency, not rate, bound) gives no reason to expect a gain |
-
-Gain -0.08 ms at 4K 2x; accuracy with the list against the fp64-summed net: 47.8 / 48.3 / 47.8 / 48.8 dB (sample 1,
-2x and 4x; fp32 47.9-49.2) and 45.0 / 44.6 / 45.0 / 44.1 dB (sample 2; fp32 44.5-45.2). `NFRUX_MLFG_NO_ACC16=1` turns it
-off, `NFRUX_MLFG_ACC16_LAYERS=a,b,..` replaces the list (tests). Coopmat: chunked float16_t-accumulator variants exist
-(3x3, 2x2, 3x3 with 1 / 2 tiles); on the RTX 4070 they are slower (stage 1 2.67 -> 2.78 ms) and cost ~1.9 dB, so no
-layer uses them by default; `NFRUX_MLFG_MAT_ACC16_LAYERS=*|a,b,..` selects them for measurement on other vendors.
-
+GeForce runs `mma.sync` with f16 accumulate at twice the f32 rate, so three forms were measured on every CUDA layer at
+4K: fp32, fp16 over the whole reduction, and fp16 within each 8-channel chunk (chunk sums added into fp32). Whole-sum
+fp16 failed the yardstick (46.6-47.1 dB against 46.8-47.2 needed). Chunked fp16 everywhere passed narrowly but was
+slower overall (7.7 against 7.3 ms): these kernels are latency-bound, not limited by the tensor rate, and on the
+96-192-channel 3x3 layers the f16 version was slower. Kept per layer only where faster (encoders, two 2x2 layers, one
+24-channel 3x3) it saved 0.08 ms and cost 0.5-0.7 dB. Coopmat float16_t accumulators were slower on the RTX 4070 and cost
+~1.9 dB. All of it was removed in round 3 (too small a gain for the code paths, switches and accuracy it cost):
+CUDA and coopmat accumulate in fp32 everywhere, in both builds.
 #### Where 4K 2x goes now (cuda D3D12, 7.1 ms; per-pass sum 6.3 ms)
 
 Stage-1 layers 1.97, composite 1.01, stage-2 network 0.82 (FasterNet FP8 0.45 + 64-ch 0.15 + rest), splats 0.43,
@@ -289,3 +279,44 @@ the glue is AMD's exact integer arithmetic (composite upsample, point-sample tex
 tensors. Not done, by expected payoff: stage-2 tensors as e4m3 bytes (halves its traffic; exact), a separable
 precomputed weight upsample for the composite, fusing the stage-2 input pass with its 3x3 layer, ldmatrix-based
 staging for the 16-pixel kernels.
+
+### Speed work, round 3 (2026-11-26)
+
+The GPU was shared with the v16 training run throughout (nvidia-smi sampled 17-28% utilisation, 2.5-4 GB used), so
+absolute times are higher than round 2's idle figures. The before/after pairs below were run interleaved: round 2's last
+commit (a8dfe85) was rebuilt in a worktree, the two exes alternated, 3 repetitions, median. `parity --bench`, ms a
+rendered frame:
+
+| Tier | 1080p 2x before / after | 4K 2x before / after | 4K 4x before / after |
+|---|---|---|---|
+| cuda D3D12 | 2.59 / 2.65 | 9.02 / 9.08 | 17.7 / 17.6 |
+| cuda Vulkan | 3.17 / 3.24 | 7.69 / 8.00 | 14.8 / 15.0 |
+| coopmat Vulkan | 3.93 / 3.86 | 11.9 / 11.75 | 26.6 / 25.8 |
+
+At this load the difference is about noise: the composite change below gains ~0.2 ms a generated frame, and removing the
+small speed-ups gives back about as much on CUDA. Removing them was the point (the rule since round 3: keep a speed-up
+only if it saves about 0.2-0.3 ms at 4K or more without extra code paths, switches or accuracy cost).
+
+1. **Stage 2's tensors as e4m3 bytes** (coopmat, exact, bit-identical outputs): the layers stage e4m3 bytes, the FP8 path
+   loads A matrices straight from the tensors, outputs four e4m3 channels a word. With the fp16 matrices it was slower
+   (stage 2 4.48 -> 5.23 ms: every staged byte is decoded and the direct 1x1 loads are lost). With the FP8 matrices
+   (VK_EXT_shader_float8) it was the fastest combination but only just: stage 2 4.48 -> 4.41 ms (project layers 0.135
+   -> 0.10 ms, expand layers slower: 48-channel inputs pad to two 32-channel chunks). That is under the rule, so the e4m3
+   storage, the FP8 shader and the float8 device plumbing were removed again. CUDA's stage 2 was not converted: its fused
+   blocks already keep pconv / expand outputs in registers, so only the 48 / 64-channel block inputs and outputs move
+   (estimated under 0.15 ms).
+2. **Composite: the weights' upsample split** (kept). `kMlfgWeightsH` makes the horizontal fp16 mixes once a column per
+   weight row ([TH][W][8]); the composite reads two of those texels and does the vertical mix. Same bytes
+   (mlfg_passes.py: the rows path equals the one-pass composite at t = 0.5 and 0.25). Composite 1.01 -> 0.72 ms plus
+   0.09 ms for the new pass at 4K (idle-ish), per generated frame.
+3. **Stage-2 input pass fused with its 3x3 layer**: not done. The fusion needs the pass's exact glue arithmetic (warps,
+   splat coverage, point-sample texel choice) inside the CUDA / coopmat kernels, and what it can save is the 24-channel
+   tensor's write and read (about 0.1-0.13 ms at 4K): under the rule.
+4. **ldmatrix staging (CUDA)**: tried on the shared-memory-staged 3x3 kernel: bit-identical, neutral (7.02-7.31 against
+   7.02-7.10 ms). Removed together with the staged kernel itself (neutral since round 2).
+
+Removed in round 3 (code, shaders and switches): fp16 accumulation (CUDA kernel variants and coopmat float16_t
+accumulators; see above), the CUDA staged 3x3 kernel and its ldmatrix variant, the softmax fused into the head (0.08 ms),
+the 64-pixel one-tile and the 4-tile CUDA kernels (0.04 / 0.06 ms), coopmat FP8 with e4m3 tensors (0.07 ms), the fused
+coopmat and generic FasterNet kernels (slower), the unused coopmat multi-tile (MT) and 2-tile 1x1 variants. Kept from
+round 2: CUDA on Vulkan, split-K, the branchless fp16 rounding, coopmat 16-byte staging and its 2- / 3-tile layers.
