@@ -103,7 +103,11 @@ const char* Env(const char* name)
 }
 void LogOptions()
 {
-    static const bool once = [] { for (const auto& s : TheIni().notes) Log("%s", s.c_str()); return true; }();
+    static const bool once = [] {
+        Log("NFRUX %s", NFRUX_VERSION_STRING);
+        for (const auto& s : TheIni().notes) Log("%s", s.c_str());
+        return true;
+    }();
     (void)once;
 }
 bool        EnvFlag(const char* name, bool fallback) { const char* v = Env(name); return v ? strcmp(v, "0") != 0 : fallback; }
