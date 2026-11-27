@@ -81,6 +81,8 @@ struct TexN : Texture
     nri::PlaneBits  planes = nri::PlaneBits::ALL;
     uint64_t        native = 0;
     mutable nri::AccessLayoutStage state = {nri::AccessBits::NONE, nri::Layout::UNDEFINED, nri::StageBits::ALL};
+    mutable uint32_t group = 0, dispatch = 0;  // the dispatch group and the dispatch that last bound it (DevN::Drain)
+    mutable bool     groupWrite = false;      // bound for writing in that group
     ~TexN() override;
 };
 struct BufN : Buffer
@@ -89,6 +91,8 @@ struct BufN : Buffer
     nri::Buffer*     buf = nullptr;
     nri::Descriptor *srv = nullptr, *uav = nullptr;
     mutable nri::AccessStage state = {nri::AccessBits::NONE, nri::StageBits::NONE};
+    mutable uint32_t group = 0, dispatch = 0;
+    mutable bool     groupWrite = false;
     ~BufN() override;
 };
 struct PassN : Pass
@@ -608,7 +612,7 @@ public:
                 return timerNext = kTimers, -1;
         }
         const int t = timerNext++;
-        Flush();
+        Drain();
         n.CmdResetQueries(*cmd, *timerPool, 2 * t, 2);
         n.CmdEndQuery(*cmd, *timerPool, 2 * t);
         return t;
@@ -616,7 +620,7 @@ public:
     void TimerEnd(int t) override
     {
         if (t < 0 || !cmd) return;
-        Flush();
+        Drain();
         n.CmdEndQuery(*cmd, *timerPool, 2 * t + 1);
         n.CmdCopyQueries(*cmd, *timerPool, 2 * t, 2, *timerBack, uint64_t(t) * 16);
         timerAt[t] = {slot, slotValue[slot]};
@@ -835,6 +839,7 @@ public:
             if (!NRI_OK(nd3.CreateCommandBufferD3D12(*dev, d, cmd))) return false;
         }
         if (!TakeSlot()) { n.DestroyCommandBuffer(cmd), cmd = nullptr; return false; }
+        pending.clear(), ++group;
         usedConstants    = 0;
         n.ResetDescriptorPool(*pools[slot]);
         n.CmdSetDescriptorPool(*cmd, *pools[slot]);
@@ -843,9 +848,10 @@ public:
     }
     void EndFrame() override
     {
+        Drain();
         for (size_t i = 0; i < wrapped.size(); ++i) To(*wrapped[i], wrappedHome[i]);
         Flush();
-        if (timed && markCount) { Mark("end"); n.CmdCopyQueries(*cmd, *marks, slot * kMarks, markCount, *markBack, uint64_t(slot) * kMarks * 8); }
+        if (timed && markCount) { MarkRaw("end"); n.CmdCopyQueries(*cmd, *marks, slot * kMarks, markCount, *markBack, uint64_t(slot) * kMarks * 8); }
         markCount = 0;
         if (!hostBack.empty()) static_cast<ID3D12GraphicsCommandList*>(nativeCmd)->ResourceBarrier(UINT(hostBack.size()), hostBack.data()), hostBack.clear();
         // Everything recorded before finished: then this recording's own value into its own slot, visible to the host.
@@ -915,6 +921,7 @@ public:
             const uint32_t compute = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE;
             if (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT || (e.state & ~compute) == 0)
             {
+                Drain();  // recorded now: after what is pending
                 D3D12_RESOURCE_BARRIER b = {};
                 b.Transition = {static_cast<ID3D12Resource*>(e.handle), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATES(e.state), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
                 list->ResourceBarrier(1, &b);
@@ -954,9 +961,37 @@ public:
         n.CmdBarrier(*cmd, b);
         tb.clear(), bb.clear();
     }
+    // Dispatches are recorded in groups (PassN::Dispatch): one that binds nothing another of the group writes, and writes nothing
+    // another binds, joins it; the group's barriers are recorded together before its dispatches. Anything else drains it first.
+    struct Pending { PassN* pass; nri::DescriptorSet* set; uint32_t gx, gy; };
+    std::vector<Pending> pending;
+    uint32_t group = 1, dispatchSerial = 0;
+    const bool grouping = !EnvFlag("NFRUX_FULL_BARRIERS", false) && !EnvFlag("NFRUX_TEST_NO_GROUPS", false);
+    void Drain()
+    {
+        if (pending.empty()) return;
+        Flush();
+        for (const Pending& p : pending)
+        {
+            if (boundPass != p.pass)  // the passes of a frame repeat back to back, one a timestep
+            {
+                n.CmdSetPipelineLayout(*cmd, nri::BindPoint::COMPUTE, *p.pass->layout);
+                n.CmdSetPipeline(*cmd, *p.pass->pipeline);
+                boundPass = p.pass;
+            }
+            nri::SetDescriptorSetDesc sd = {0, p.set, nri::BindPoint::COMPUTE};
+            n.CmdSetDescriptorSet(*cmd, sd);
+            if (timed && !markCount) MarkRaw("begin");
+            n.CmdDispatch(*cmd, {p.gx, p.gy, 1});
+            if (timed) MarkRaw(p.pass->name.c_str());
+        }
+        pending.clear();
+        ++group;
+    }
     void Copy(const Texture& s, uint32_t sx, uint32_t sy, const Texture& d, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h)
     {
         auto &a = static_cast<const TexN&>(s), &b = static_cast<const TexN&>(d);
+        Drain();
         To(a, kSrc), To(b, kDst), Flush();
         nri::TextureRegionDesc rs = {}, rd = {};
         rs.x = nri::Dim_t(sx), rs.y = nri::Dim_t(sy), rd.x = nri::Dim_t(dx), rd.y = nri::Dim_t(dy);
@@ -975,7 +1010,7 @@ public:
     // A word into one of the host's buffers (D3D12: in COPY_DEST, as Streamline gives it).
     void WriteWord(void* buffer, uint32_t value) override
     {
-        Flush();
+        Drain();
         if (isVk)
         {
             const auto vc = static_cast<VkCommandBuffer>(nativeCmd);
@@ -1013,6 +1048,7 @@ public:
         auto& a = static_cast<const TexN&>(t);
         const uint32_t pitch = (t.width * TexelSize(t.format) + 255) & ~255u;
         if (!Ones(uint64_t(pitch) * t.height)) return;
+        Drain();
         To(a, kDst), Flush();
         nri::TextureDataLayoutDesc l = {0, pitch, pitch * t.height};
         nri::TextureRegionDesc r = {};
@@ -1023,6 +1059,7 @@ public:
     {
         auto& a = static_cast<const BufN&>(b);
         if (!Ones(a.size)) return;
+        Drain();
         To(a, nri::AccessBits::COPY_DESTINATION, nri::StageBits::COPY), Flush();
         n.CmdCopyBuffer(*cmd, *a.buf, 0, *ones, 0, a.size);
     }
@@ -1033,6 +1070,7 @@ public:
         for (uint32_t i = 0; i < count; ++i) real = real || static_cast<NetN&>(*nets[i]).width > 64;
         if (real && !ran) ran = true, firstRun = finished;
         if (real && Env("NFRUX_TEST_DIE_AT_RUN")) TerminateProcess(GetCurrentProcess(), 99);  // as a driver crash would
+        Drain();
         for (uint32_t i = 0; i < count; ++i)
         {
             auto& x = static_cast<NetN&>(*nets[i]);
@@ -1129,6 +1167,7 @@ public:
             if (it->first == r.size) { r.buf = it->second, freeReads.erase(it); break; }
         if (!r.buf) r.buf = Committed(r.size, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE);
         if (!r.buf) return;
+        Drain();
         To(a, kSrc), Flush();
         nri::TextureDataLayoutDesc l = {0, pitch, pitch * t.height};
         nri::TextureRegionDesc rg = {};
@@ -1147,6 +1186,12 @@ public:
     std::map<std::string, std::vector<float>> times;
     uint32_t        timedFrames = 0;
     void Mark(const char* label) override
+    {
+        if (!timed) return;
+        Drain();
+        MarkRaw(label);
+    }
+    void MarkRaw(const char* label)
     {
         if (!timed || markCount >= kMarks) return;
         if (!marks)
@@ -1204,6 +1249,23 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
     if (bindings.size() > kMaxBindings) return Log("%s: %zu bindings", name.c_str(), bindings.size()), false;
     nri::Descriptor*               ds[kMaxBindings];
     nri::UpdateDescriptorRangeDesc up[kMaxBindings];
+    // Joins the pending group unless it touches what the group writes, or writes what the group touches (one dispatch may bind a texture twice).
+    const uint32_t serial = ++d.dispatchSerial;
+    bool conflict = !d.grouping;
+    for (uint32_t k = 0; k < count && !conflict; ++k)
+    {
+        const Bind& f = binds[k];
+        bool w = false, found = false;
+        for (const ShaderBinding& b : bindings) if (b.binding == f.binding) w = b.kind == BindKind::UavTexture || b.kind == BindKind::UavBuffer, found = true;
+        if (!found) continue;
+        if (f.texture) { auto& x = static_cast<const TexN&>(*f.texture); conflict = x.group == d.group && x.dispatch != serial && (x.groupWrite || w); }
+        else if (f.buffer) { auto& x = static_cast<const BufN&>(*f.buffer); conflict = x.group == d.group && x.dispatch != serial && (x.groupWrite || w); }
+    }
+    if (conflict) d.Drain();
+    auto mark = [&](uint32_t& g, uint32_t& disp, bool& gw, bool w) {
+        if (g != d.group) g = d.group, gw = false;
+        gw = gw || w, disp = serial;
+    };
     for (size_t i = 0; i < bindings.size(); ++i)
     {
         const ShaderBinding& b = bindings[i];
@@ -1223,6 +1285,7 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
             auto& x = static_cast<const BufN&>(*f->buffer);
             const bool w = b.kind == BindKind::UavBuffer;
             d.To(x, w ? nri::AccessBits::SHADER_RESOURCE_STORAGE : nri::AccessBits::SHADER_RESOURCE, nri::StageBits::COMPUTE_SHADER);
+            mark(x.group, x.dispatch, x.groupWrite, w);
             ds[i] = w ? x.uav : x.srv;
         }
         else if (f->texture)
@@ -1230,24 +1293,15 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
             auto& x = static_cast<const TexN&>(*f->texture);
             const bool w = b.kind == BindKind::UavTexture;
             d.To(x, w ? kUav : kSrv);
+            mark(x.group, x.dispatch, x.groupWrite, w);
             ds[i] = w ? x.uav : x.srv;
         }
         if (!ds[i]) return Log("%s: no view for binding %u", name.c_str(), b.binding), false;
         up[i] = {set, uint32_t(i), 0, &ds[i], 1};
     }
     d.n.UpdateDescriptorRanges(up, uint32_t(bindings.size()));
-    d.Flush();
-    if (d.boundPass != this)  // the passes of a frame repeat back to back, one a timestep
-    {
-        d.n.CmdSetPipelineLayout(*d.cmd, nri::BindPoint::COMPUTE, *layout);
-        d.n.CmdSetPipeline(*d.cmd, *pipeline);
-        d.boundPass = this;
-    }
-    nri::SetDescriptorSetDesc sd = {0, set, nri::BindPoint::COMPUTE};
-    d.n.CmdSetDescriptorSet(*d.cmd, sd);
-    if (d.timed && !d.markCount) d.Mark("begin");
-    d.n.CmdDispatch(*d.cmd, {gx, gy, 1});
-    if (d.timed) d.Mark(name.c_str());
+    d.pending.push_back({this, set, gx, gy});
+    if (!d.grouping) d.Drain();
     return true;
 }
 }  // namespace

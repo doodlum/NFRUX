@@ -161,7 +161,7 @@ struct Interpolator::Impl
     PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post;
     PassPtr  mvHints, pyramidP, flowWarp, match, median, bilateral;
     Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion, ofColour;
-    Tex      computedMv, flow, flowHint, pyramid[2], fWarp, fMatch, fSub, fMed, fFlow;
+    Tex      computedMv, flow, pyramid[2], fWarp, fMatch, fSub, fMed, fFlow;
     bool     pyramidValid = false;
     uint32_t dynCur = 0, depthCur = 0, prepCur = 0, pyrCur = 0;
     uint64_t frame = 0;
@@ -174,7 +174,11 @@ struct Interpolator::Impl
     bool MakePass(PassPtr& p, const Shader& a, const Shader& b) { p = dev.CreatePass(s.depthInverted ? b : a); return p != nullptr; }
     bool Create(std::string* error);
     bool MakeOuts(uint32_t n, std::string* error);
-    bool Flow(const FrameInputs& in, const Texture& color, const Texture& depth, const Texture& mv, bool reset);
+    // The flow in parts, so that the motion vectors' passes, which do not need it, are recorded between them (and run beside them).
+    bool Hints(const FrameInputs& in);
+    ImageConstants Image() const;
+    bool Pyramid(const Texture& color, int32_t l);
+    bool Match(bool reset);
     bool Frame(const FrameInputs& in, uint32_t count, uint32_t total);
 };
 
@@ -237,7 +241,7 @@ bool Interpolator::Impl::Create(std::string* error)
         for (auto& t : prep) tex(t, lane, mvLane);
     if (display.height > 1080) tex(ofColour, lane, ofInput);
     if (allInput) tex(reducedMotion, Format::RG16Float, mvLane);
-    tex(computedMv, Format::RG16Float, of), tex(flow, Format::RG16Float, of), tex(flowHint, Format::RG16Float, of);
+    tex(computedMv, Format::RG16Float, of), tex(flow, Format::RG16Float, of);
     for (auto& t : pyramid) tex(t, Format::R8Unorm, {level[1].width, uint32_t(rows)});
     tex(fWarp, Format::R8Unorm, level[2]), tex(fMatch, Format::R32Uint, level[2]);
     tex(fSub, Format::RG16Float, level[2]), tex(fMed, Format::RG16Float, level[2]), tex(fFlow, Format::RG16Float, level[2]);
@@ -289,7 +293,7 @@ bool Interpolator::Impl::MakeOuts(uint32_t n, std::string* error)
     return true;
 }
 
-bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const Texture& depth, const Texture& mv, bool reset)
+bool Interpolator::Impl::Hints(const FrameInputs& in)
 {
     const Texture& depthPrev = *depthTm1[depthCur];
     MvHintsConstants h = {};
@@ -302,29 +306,41 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
     float invPrev[16];
     Invert(lastVP, invPrev);
     Multiply(in.viewProjection, invPrev, h.motion_matrix_m1p1);
-    {
-        const Bind b[] = {Bind::Data(0, &h, sizeof(h)), Bind::Tex(1, depthPrev), Bind::Tex(2, *computedMv)};
-        if (!mvHints->Dispatch(b, 3, Groups(of.width, 16), Groups(of.height, 16))) return false;
-    }
-    dev.CopyTexture(*computedMv, *flow);
-    const Texture &p1 = *pyramid[pyrCur], &m1 = *pyramid[pyrCur ^ 1];
+    const Bind b[] = {Bind::Data(0, &h, sizeof(h)), Bind::Tex(1, depthPrev), Bind::Tex(2, *computedMv)};
+    return mvHints->Dispatch(b, 3, Groups(of.width, 16), Groups(of.height, 16));
+}
+
+ImageConstants Interpolator::Impl::Image() const
+{
     ImageConstants ic = {};
     ic.src_dims[0] = int32_t(ofInput.width), ic.src_dims[1] = int32_t(ofInput.height);
     ic.hint_dims[0] = int32_t(of.width), ic.hint_dims[1] = int32_t(of.height);
     ic.unorm8 = s.outputFormat == Format::RGBA8Unorm || s.outputFormat == Format::BGRA8Unorm;
-    for (int32_t l = 1; l < 6; ++l)
-    {
-        const Dims d = level[l], p = level[l - 1];
-        ic.level = l, ic.level_row = row[l], ic.coarse_row = row[l - 1];
-        ic.level_dims[0] = int32_t(d.width), ic.level_dims[1] = int32_t(d.height);
-        ic.coarse_dims[0] = int32_t(p.width), ic.coarse_dims[1] = int32_t(p.height);
-        const Bind b[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, color), Bind::Tex(2, p1)};
-        if (!pyramidP->Dispatch(b, 3, Groups(d.width), Groups(d.height))) return false;
-    }
+    return ic;
+}
+
+bool Interpolator::Impl::Pyramid(const Texture& color, int32_t l)  // TP1's level l
+{
+    ImageConstants ic = Image();
+    const Dims     d = level[l], p = level[l - 1];
+    ic.level = l, ic.level_row = row[l], ic.coarse_row = row[l - 1];
+    ic.level_dims[0] = int32_t(d.width), ic.level_dims[1] = int32_t(d.height);
+    ic.coarse_dims[0] = int32_t(p.width), ic.coarse_dims[1] = int32_t(p.height);
+    const Bind b[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, color), Bind::Tex(2, *pyramid[pyrCur])};
+    return pyramidP->Dispatch(b, 3, Groups(d.width), Groups(d.height));
+}
+
+// After the hints and all of TP1's pyramid: the flow (levels 5 to 2), or the hints as the flow.
+bool Interpolator::Impl::Match(bool reset)
+{
+    const Texture &p1 = *pyramid[pyrCur], &m1 = *pyramid[pyrCur ^ 1];
+    ImageConstants ic = Image();
     static const bool noFlow = EnvFlag("NFRUX_TEST_NO_FLOW", false);  // cost measurement: the hints as the flow
-    if (pyramidValid && !reset && !noFlow)
+    if (!pyramidValid || reset || noFlow)
+        dev.CopyTexture(*computedMv, *flow);
+    else
     {
-        dev.CopyTexture(*flow, *flowHint);
+        // The last level writes every texel of the flow (level 2 covers the hints' size): the hints are read where they are.
         for (int32_t l = 5; l >= 2; --l)
         {
             const Dims d = level[l], cc = l == 5 ? Dims{0, 0} : level[l + 1];
@@ -336,13 +352,11 @@ bool Interpolator::Impl::Flow(const FrameInputs& in, const Texture& color, const
             const Bind mb[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, m1), Bind::Tex(2, *fWarp), Bind::Tex(3, *fFlow), Bind::Tex(4, *fSub), Bind::Tex(5, *fMatch)};
             const Bind md[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, *fSub), Bind::Tex(2, *fMed)};
             const Bind bl[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, m1), Bind::Tex(2, p1), Bind::Tex(3, *fMed), Bind::Tex(4, *fMatch),
-                               Bind::Tex(5, *flowHint), Bind::Tex(6, *fFlow), Bind::Tex(7, *flow)};
+                               Bind::Tex(5, *computedMv), Bind::Tex(6, *fFlow), Bind::Tex(7, *flow)};
             if (!flowWarp->Dispatch(w, 4, gx, gy) || !match->Dispatch(mb, 6, gx, gy) || !median->Dispatch(md, 3, gx, gy) || !bilateral->Dispatch(bl, 8, gx, gy))
                 return false;
         }
     }
-    pyramidValid = true;
-    pyrCur ^= 1;
     return true;
 }
 
@@ -398,7 +412,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         if (!downOf->Dispatch(b, 3, Groups(ofInput.width, kFiGroup), Groups(ofInput.height, kFiGroup))) return false;
     }
     const Texture& flowColour = ofColour ? *ofColour : color;
-    if (!Flow(in, flowColour, depth, mv, reset))
+    if (!Hints(in))
         return false;
     memcpy(lastVP, in.viewProjection, sizeof(lastVP));
 
@@ -427,14 +441,19 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     set(0);
     if (allInput && !downAll->Dispatch(downB, 7, lx, ly)) return false;
     if (colourDown && !downColour->Dispatch(downB, 7, lx, ly)) return false;
+    // The pyramid's levels between the warps (each level reads the one before; the first warp writes what the others read).
+    if (!Pyramid(flowColour, 1) || !warpRun(0) || !Pyramid(flowColour, 2)) return false;
+    for (uint32_t i = 1; i < count; ++i) { set(i); if (!warpRun(i)) return false; }
+    for (int32_t l = 3; l < 6; ++l) if (!Pyramid(flowColour, l)) return false;
+    if (!Match(reset)) return false;
+    pyramidValid = true;
+    pyrCur ^= 1;
     if (reset)
     {
-        if (!warpRun(0)) return false;
         dev.Clear(dynTp1, 1.0f);
         dev.CopyTexture(color, backup);
         return true;
     }
-    for (uint32_t i = 0; i < count; ++i) { set(i); if (!warpRun(i)) return false; }
     for (uint32_t i = 0; i < count; ++i)
     {
         set(i);
@@ -526,7 +545,7 @@ std::vector<std::pair<std::string, const Texture*>> Interpolator::Intermediates(
 {
     const Impl& i = *m;
     const Out&  o = i.outs[0];
-    return {{"pyramid", i.pyramid[i.pyrCur ^ 1].get()}, {"hints", i.computedMv.get()}, {"flow_hint", i.flowHint.get()}, {"flow", i.flow.get()},
+    return {{"pyramid", i.pyramid[i.pyrCur ^ 1].get()}, {"hints", i.computedMv.get()}, {"flow_hint", i.computedMv.get()}, {"flow", i.flow.get()},
             {"depth", i.depthTm1[i.depthCur].get()}, {"motion_t", o.qMotionTp1.get()}, {"flow_t", o.qFlowTm1.get()}, {"flow_filled", o.filledFlowTm1.get()},
             {"seed", o.seed.get()}, {"params", o.net->params}, {"gate", o.net->gate}, {"inpaint", o.inpaint.get()}, {"output", o.output.get()}};
 }
