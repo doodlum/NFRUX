@@ -71,43 +71,44 @@ void main()
     }
     barrier();
     // A thread's tile rows (two of the 12 x 8 row-sum places: li and li + 64): their TM1 texels kept for every row of offsets.
-    const FfxInt32 y0 = li / 8, x0 = li % 8, y1 = (li + 64) / 8;
-    const bool     two = li + 64 < kT * 8;
-    float t0[5], t1[5];
-    [[unroll]] for (FfxInt32 i = 0; i < 5; ++i)
+    // A thread's row-sum runs (two of the 12 rows x 7 offsets: li and li + 64): their TM1 row kept for every row of offsets.
+    const FfxInt32 y0 = li % kT, x0 = li / kT, y1 = (li + 64) % kT, x1 = (li + 64) / kT;
+    const bool     two = li + 64 < kT * SW;
+    float t0[kT], t1[kT];
+    [[unroll]] for (FfxInt32 i = 0; i < kT; ++i)
     {
-        t0[i] = sT[y0 * kT + x0 + i];
-        t1[i] = two ? sT[y1 * kT + x0 + i] : 0.0f;
+        t0[i] = sT[y0 * kT + i];
+        t1[i] = two ? sT[y1 * kT + i] : 0.0f;
     }
     float      best    = 3.0e38f;
     FfxInt32x2 intFlow = FfxInt32x2(0);
     // A row of seven offsets at a time: all their row sums (5 differences, for the tile's 12 rows and the group's 8 columns), then the block sums.
-    // A row-sum place reads its search row's 11 texels once for the seven offsets.
+    // A run is one tile row at one offset: its 12 differences, then the 8 row sums sliding along it (exact: integers).
     for (FfxInt32 sy = 0; sy < SW; ++sy)
     {
         {
-            float w[SW + 4];
-            [[unroll]] for (FfxInt32 j = 0; j < SW + 4; ++j)
-                w[j] = sW[(y0 + sy) * kW + x0 + j];
-            [[unroll]] for (FfxInt32 sx = 0; sx < SW; ++sx)
+            float d[kT];
+            [[unroll]] for (FfxInt32 i = 0; i < kT; ++i)
+                d[i] = abs(sW[(y0 + sy) * kW + x0 + i] - t0[i]);
+            float h = d[0] + d[1] + d[2] + d[3] + d[4];
+            sH[x0 * kT * 8 + y0 * 8] = h;
+            [[unroll]] for (FfxInt32 x = 1; x < 8; ++x)
             {
-                float h = 0.0f;
-                [[unroll]] for (FfxInt32 i = 0; i < 5; ++i)
-                    h += abs(w[i + sx] - t0[i]);
-                sH[sx * kT * 8 + y0 * 8 + x0] = h;
+                h += d[x + 4] - d[x - 1];
+                sH[x0 * kT * 8 + y0 * 8 + x] = h;
             }
         }
         if (two)
         {
-            float w[SW + 4];
-            [[unroll]] for (FfxInt32 j = 0; j < SW + 4; ++j)
-                w[j] = sW[(y1 + sy) * kW + x0 + j];
-            [[unroll]] for (FfxInt32 sx = 0; sx < SW; ++sx)
+            float d[kT];
+            [[unroll]] for (FfxInt32 i = 0; i < kT; ++i)
+                d[i] = abs(sW[(y1 + sy) * kW + x1 + i] - t1[i]);
+            float h = d[0] + d[1] + d[2] + d[3] + d[4];
+            sH[x1 * kT * 8 + y1 * 8] = h;
+            [[unroll]] for (FfxInt32 x = 1; x < 8; ++x)
             {
-                float h = 0.0f;
-                [[unroll]] for (FfxInt32 i = 0; i < 5; ++i)
-                    h += abs(w[i + sx] - t1[i]);
-                sH[sx * kT * 8 + y1 * 8 + x0] = h;
+                h += d[x + 4] - d[x - 1];
+                sH[x1 * kT * 8 + y1 * 8 + x] = h;
             }
         }
         barrier();
