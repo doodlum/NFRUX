@@ -1,6 +1,6 @@
 # Release notes
 
-## 1.0.0
+## 0.0.1
 
 The first release. Tuned for NVIDIA RTX 40; every other GPU runs through NFRUX's general paths (README, "Status").
 
@@ -14,7 +14,7 @@ The first release. Tuned for NVIDIA RTX 40; every other GPU runs through NFRUX's
 - **Vulkan**: NFRUX uses only features that are enabled on the game's device. On OptiScaler's routes that means CUDA kernels on RTX, and
   the 32-bit integer network on other GPUs.
 - **Cost on an RTX 4070**, ms per rendered frame, D3D12: 0.93 at 1080p 2x, 2.67 at 1080p 6x, 1.47 at 4K 2x, 4.38 at 4K 6x.
-- **Help wanted**: only the RTX 4070 has been measured. The benchmark kit (`NFRUX_bench_kit_1.0.0.zip`, docs/OPTIMISING.md) checks
+- **Help wanted**: only the RTX 4070 has been measured. The benchmark kit (`NFRUX_bench_kit_0.0.1.zip`, docs/OPTIMISING.md) checks
   correctness and times every path on your GPU in about ten minutes. Please send the report.
 
 Known limits: no anti-cheat games; 8-bit and RGB10A2 back buffers only.

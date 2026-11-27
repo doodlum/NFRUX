@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NFRUX VERSION 1.0.0 LANGUAGES CXX RC)
+project(NFRUX VERSION 0.0.1 LANGUAGES CXX RC)
 # The version the DLL carries and logs: the release, and the commit it was built from.
 execute_process(COMMAND git rev-parse --short HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} OUTPUT_VARIABLE NFRUX_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 set(NFRUX_VERSION_STRING "${PROJECT_VERSION}")

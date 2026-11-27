@@ -504,7 +504,7 @@ A3 / A14, test_new, 4 pairs a clip, shipped D3D12 build (`tests/quality_referenc
 A3 passes: NFRUX within 0.1 dB of torch on every multiplier's mean (limit 0.2; worst single frame -1.66 dB at 3x on a 57 dB pair). A14 (LPIPS, not above Arm as released) fails at 2x and 4x for v1, passes at 3x, 5x and 6x; PSNR says the same at 4x. The v15 retrain (LPIPS 0.5, no oracle loss) beat Arm at 2x-6x in its 4k-step probe and is the candidate to close it.
 
 
-# 1.0.0 baseline (2026-11-27, a77b2c6..441bae9, shipped build, RTX 4070, idle GPU)
+# First-release baseline (2026-11-27, a77b2c6..441bae9, shipped build, RTX 4070, idle GPU)
 
 `ngx_harness --time` (each evaluate submitted and waited for; ms a rendered frame, medians), the automatic rung (CUDA kernels on both APIs):
 
