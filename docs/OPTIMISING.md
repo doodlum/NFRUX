@@ -56,6 +56,14 @@ cmake --build <build dir> --config Release --target bench_kit
 `<build dir>\bench_kit` holds the DLL, `ngx_harness`, both `ml_conformance` tests, `parity`, `run_bench.ps1`, its README and the
 licences. CI attaches it to each release as `NFRUX_bench_kit_<version>.zip`.
 
+## Releases (maintainers)
+
+`.github/workflows/ci.yml` runs `tools/ci/build.ps1` on every push and pull request to main (shipped and strict builds, `rungs_test`,
+`ngx_harness` on WARP, both zips and `SHA256SUMS.txt` as the `NFRUX-dist` artifact); the same script runs locally. To cut a release:
+bump `project(NFRUX VERSION X.Y.Z)` in `CMakeLists.txt`, add a `## X.Y.Z` section to `docs/RELEASE_NOTES.md`, commit, then
+`git tag vX.Y.Z` and `git push origin vX.Y.Z`. The tag's run publishes the GitHub Release with both zips and the sums; it fails if
+the tag is not `v` + the built version.
+
 ## Optimising a variant (optimisers)
 
 ### 1. Pick a target
