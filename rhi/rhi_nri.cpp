@@ -771,6 +771,7 @@ public:
         else dying.push_back({next, r.buf});  // the token is written before the host's list ends: not free yet
     }
     std::atomic<int> cudaState = 0;  // 0 not tried, 1 in use, -1 not
+    const void* boundPass = nullptr;  // the pass whose layout and pipeline are set on the list (PassN::Dispatch)
     uint32_t    finished = 0;
     bool        marked = false, ran = false;
     uint32_t    firstRun = 0;  // finished when the network first ran at its real size
@@ -821,6 +822,7 @@ public:
         usedConstants    = 0;
         n.ResetDescriptorPool(*pools[slot]);
         n.CmdSetDescriptorPool(*cmd, *pools[slot]);
+        boundPass = nullptr;  // the host's list: nothing of ours is bound
         return true;
     }
     void EndFrame() override
@@ -1084,6 +1086,7 @@ public:
                 x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
             }
         }
+        boundPass = nullptr;  // the networks set their own pipelines on the native list
         for (uint32_t i = 0; i < count; ++i)
             for (uint32_t k = 0; k < 2; ++k)
             {
@@ -1178,8 +1181,10 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
     DevN& d = *dev;
     nri::DescriptorSet* set = nullptr;
     if (!NRI_OK(d.n.AllocateDescriptorSets(*d.pools[d.slot], *layout, 0, &set, 1, 0))) return Log("%s: out of descriptor sets", name.c_str()), false;
-    std::vector<nri::Descriptor*>               ds(bindings.size());
-    std::vector<nri::UpdateDescriptorRangeDesc> up(bindings.size());
+    constexpr size_t kMaxBindings = 32;
+    if (bindings.size() > kMaxBindings) return Log("%s: %zu bindings", name.c_str(), bindings.size()), false;
+    nri::Descriptor*               ds[kMaxBindings];
+    nri::UpdateDescriptorRangeDesc up[kMaxBindings];
     for (size_t i = 0; i < bindings.size(); ++i)
     {
         const ShaderBinding& b = bindings[i];
@@ -1211,10 +1216,14 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
         if (!ds[i]) return Log("%s: no view for binding %u", name.c_str(), b.binding), false;
         up[i] = {set, uint32_t(i), 0, &ds[i], 1};
     }
-    d.n.UpdateDescriptorRanges(up.data(), uint32_t(up.size()));
+    d.n.UpdateDescriptorRanges(up, uint32_t(bindings.size()));
     d.Flush();
-    d.n.CmdSetPipelineLayout(*d.cmd, nri::BindPoint::COMPUTE, *layout);
-    d.n.CmdSetPipeline(*d.cmd, *pipeline);
+    if (d.boundPass != this)  // the passes of a frame repeat back to back, one a timestep
+    {
+        d.n.CmdSetPipelineLayout(*d.cmd, nri::BindPoint::COMPUTE, *layout);
+        d.n.CmdSetPipeline(*d.cmd, *pipeline);
+        d.boundPass = this;
+    }
     nri::SetDescriptorSetDesc sd = {0, set, nri::BindPoint::COMPUTE};
     d.n.CmdSetDescriptorSet(*d.cmd, sd);
     if (d.timed && !d.markCount) d.Mark("begin");
