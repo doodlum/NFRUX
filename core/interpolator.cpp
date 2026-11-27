@@ -475,7 +475,7 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         const Out& o = outs[i];
         const Bind b[] = {Bind::Tex(0, *o.qMotionTp1), Bind::Tex(1, *o.filledFlowTm1), Bind::Tex(2, prepM1), Bind::Tex(3, prepP1), Bind::Tex(4, dNext), Bind::Tex(5, dTm1),
                           Bind::Buf(8, *o.net->input), Bind::Tex(10, *o.seed), Bind::Data(9, &k, sizeof(k))};
-        if (!preprocess->Dispatch(b, 9, Groups(graph.width, 32), Groups(graph.height, 16))) return false;
+        if (!preprocess->Dispatch(b, 9, Groups(graph.width, 16), Groups(graph.height, 16))) return false;
     }
     for (uint32_t i = 0; i < count; ++i)
     {
