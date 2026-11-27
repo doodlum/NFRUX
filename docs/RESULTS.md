@@ -502,3 +502,22 @@ A3 / A14, test_new, 4 pairs a clip, shipped D3D12 build (`tests/quality_referenc
 | Arm with prior | 38.05 / .0395 | 38.94 / .0320 | 40.56 / .0368 | 33.75 / .0589 | 36.76 / .0371 |
 
 A3 passes: NFRUX within 0.1 dB of torch on every multiplier's mean (limit 0.2; worst single frame -1.66 dB at 3x on a 57 dB pair). A14 (LPIPS, not above Arm as released) fails at 2x and 4x for v1, passes at 3x, 5x and 6x; PSNR says the same at 4x. The v15 retrain (LPIPS 0.5, no oracle loss) beat Arm at 2x-6x in its 4k-step probe and is the candidate to close it.
+
+
+# 1.0.0 baseline (2026-11-27, a77b2c6..441bae9, shipped build, RTX 4070, idle GPU)
+
+`ngx_harness --time` (each evaluate submitted and waited for; ms a rendered frame, medians), the automatic rung (CUDA kernels on both APIs):
+
+| | 1280x701 | 1080p | 1440p | 4K |
+|---|---|---|---|---|
+| D3D12 2x / 4x / 6x | 0.84 / 1.97 / 2.94 | 1.15 / 2.14 / 3.40 | 1.44 / 2.48 / 3.77 | 1.61 / 3.26 / 5.04 |
+| Vulkan 2x / 4x / 6x | 0.94 / 2.13 / 3.19 | 1.15 / 2.29 / 3.58 | 1.36 / 2.71 / 4.08 | 1.86 / 3.70 / 5.66 |
+
+Other rungs, forced (the paths of other GPUs, run on this one), 1080p 2x / 4K 4x: Vulkan coopmat 1.32 / 4.89, Vulkan dot4 (tiled, now the NVIDIA
+default) 1.45 / 4.72 (untiled before: 1.94 / 6.71), D3D12 dot4 1.52 / 5.66, Vulkan scalar 3.21 / 9.65.
+GPU time at 4K 6x (Vulkan timestamps, a rendered frame): post-process 5 x 0.29 ms (near the card's bandwidth), network 1.09, preprocess 0.26,
+downsamples 0.25, flow warp 0.18; the copy into the host's output 0.12 a generated frame (kept: under the bar for a direct-write path).
+Rung timing on the first start: D3D12 cuda 0.150 / dot4 0.603 ms, Vulkan cuda 0.177 / coopmat 0.249 / dot4 0.603 (640x360): cuda cached, reused next start.
+Video memory (`--vram`, the same at 2x-6x): D3D12 cuda 393 / 469 / 651 MB at 1080p / 1440p / 4K, dot4 291 / 368 / 549; Vulkan cuda 295 / 350 / 470,
+dot4 256 / 311 / 431. Soak 3000 evaluates a API: memory and handles flat. Harness 78/78 a API (Vulkan dot4 forced too), conformance exact,
+parity worst 99.8 dB, rungs_test 15/15. Not run here: AMD and Intel GPUs (their plans are tested by rungs_test only).
