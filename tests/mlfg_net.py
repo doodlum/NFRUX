@@ -28,6 +28,9 @@ ap.add_argument('--n', default='2,4', help='multipliers: n - 1 frames at t = i /
 ap.add_argument('--sample', default='test_new:0', help='set:index of the evaluation sample (eval_mlfg_net sampling)')
 ap.add_argument('--bench', type=int, default=0)
 ap.add_argument('--reuse', action='store_true', help='keep the reference outputs of an earlier run')
+ap.add_argument('--int8', default='', help='int8 network: the export_amd int8 npz the DLL runs (tiers dot4 / int / cuda; reference mlfg_int8.py)')
+ap.add_argument('--int8-bin', default='', help='with --int8: the DLL loads this tools/mlfg_weights.py --int8 file instead of its own')
+ap.add_argument('--q8-tol', type=float, default=50.0, help='with --int8: least PSNR against the int8 reference')
 A = ap.parse_args()
 torch.set_num_threads(4)
 torch.backends.cudnn.allow_tf32 = False
@@ -46,6 +49,19 @@ def ulp16(a, b):
     ib = b.astype(np.float16).view(np.int16).astype(np.int32)
     ia = np.where(ia < 0, -32768 - ia, ia); ib = np.where(ib < 0, -32768 - ib, ib)
     return np.abs(ia - ib)
+
+
+_LP = []
+
+
+def lpips8(a, b):
+    """LPIPS (alex) of two 8-bit HxWx3 images."""
+    if not _LP:
+        import lpips
+        _LP.append(lpips.LPIPS(net='alex', verbose=False).eval())
+    t = lambda x: torch.from_numpy(x.astype(np.float32) / 127.5 - 1.0).permute(2, 0, 1)[None]
+    with torch.no_grad():
+        return float(_LP[0](t(a), t(b)))
 
 
 def psnr8(a, b):
@@ -117,11 +133,15 @@ class Double:
         torch.nn.Conv2d.forward, torch.nn.ConvTranspose2d.forward = self.c, self.t
 
 
-def reference(inputs, n, double=False):
+def reference(inputs, n, double=False, int8=''):
     if double:
         with Double():
             return reference(inputs, n)
-    net = N.AmdMlfgNet(precision='amd', sampler='point')
+    if int8:
+        import mlfg_int8
+        net = mlfg_int8.Int8MlfgNet(int8, glue='amd')
+    else:
+        net = N.AmdMlfgNet(precision='amd', sampler='point')
     net.flow_t = 'scale'
     outs, aux = [], None
     with torch.no_grad():
@@ -145,10 +165,15 @@ def main():
     Wd, H = size[0], size[1]
     print(f'sample {key}: display {Wd}x{H}, render {size[2]}x{size[3]}')
     for n in [int(x) for x in A.n.split(',')]:
-        ref, aux = reference(inputs, n)
-        ref64, _ = reference(inputs, n, double=True)
+        ref, aux = reference(inputs, n, int8=A.int8)
+        # int8: the reference is exact integer sums and an fp32 epilogue in a fixed order (no summation-order yardstick);
+        # the fp16 network (mlfg_net 'amd') is what the int8 one is compared with for quality.
+        ref64, _ = reference(inputs, n, double=not A.int8)
         base = []
         for k, (a, b) in enumerate(zip(ref, ref64)):
+            if A.int8:
+                print(f'  {n}x t={(k + 1) / n:.3f}: int8 reference vs fp16 mlfg_net: PSNR {psnr8(a, b):.2f} dB, LPIPS {lpips8(a, b):.4f}')
+                continue
             d = np.abs(a.astype(np.int32) - b.astype(np.int32))
             base.append(psnr8(a, b))
             print(f'  {n}x t={(k + 1) / n:.3f}: mlfg_net fp32 sums vs fp64 sums: PSNR {base[-1]:.2f} dB, max {d.max()} codes (the yardstick)')
@@ -159,6 +184,10 @@ def main():
                 if (tier, api) == ('coopmat', 'd3d12'):
                     continue  # coopmat is Vulkan's
                 env = dict(os.environ, NFRUX_MLFG=tier)
+                if A.int8:
+                    env = dict(os.environ, NFRUX_AMD_PRECISION='int8', **({'NFRUX_MLFG_Q8': tier} if tier in ('dot4', 'int') else {'NFRUX_MLFG': tier}))
+                    if A.int8_bin:
+                        env['NFRUX_AMD_WEIGHTS_INT8'] = A.int8_bin
                 r = subprocess.run([A.exe, api, str(W)] + (['--bench', str(A.bench)] if A.bench else []), capture_output=True, text=True, env=env)
                 print('   ', r.stdout.strip().replace('\n', '\n    '))
                 if r.returncode:
@@ -169,6 +198,10 @@ def main():
                 for k, (o, rf) in enumerate(zip(outs, ref)):
                     d = np.abs(o.astype(np.int32) - rf.astype(np.int32))
                     p, p64 = psnr8(o, rf), psnr8(o, ref64[k])
+                    if A.int8:  # pass: within the tolerance of the int8 reference
+                        report(f'{n}x t={(k + 1) / n:.3f} {tier} {api} vs mlfg_int8', f'PSNR {p:.2f} dB, max {d.max()} codes, {np.mean(d > 0) * 100:.3f}% values differ, '
+                               f'{np.mean(d > 1) * 100:.4f}% by >1; vs fp16 mlfg_net PSNR {p64:.2f} dB, LPIPS {lpips8(o, ref64[k]):.4f}', p >= A.q8_tol)
+                        continue
                     # Pass: no further from the fp64-summed reference than fp32 torch is, within 3 dB.
                     report(f'{n}x t={(k + 1) / n:.3f} {tier} {api} vs mlfg_net', f'PSNR {p:.2f} dB (vs fp64 sums {p64:.2f}), max {d.max()} codes, '
                            f'{np.mean(d > 0) * 100:.3f}% values differ, {np.mean(d > 1) * 100:.4f}% by >1', p64 > base[k] - 3)
@@ -192,7 +225,12 @@ def main():
                 # Identical bytes are the strict build's promise; the shipped build lets compilers fuse the generic convolutions.
                 strict = 'strict' in A.exe.lower()
                 report(f'{n}x {tier}: {" vs ".join(apis)}', ('bytes identical' if same else 'BYTES DIFFER') + ('' if strict else ' (shipped build: informative)'),
-                       same or tier != 'generic' or not strict)
+                       same or tier not in ('generic', 'dot4', 'int') or (not strict and tier == 'generic'))  # the int8 kernels are strict in every build
+        if A.int8 and 'dot4' in tiers and 'int' in tiers:  # packed dot products and 32-bit integer code: the same sums
+            for api in apis:
+                if ('dot4', api) in got and ('int', api) in got:
+                    same = all(np.array_equal(got[('dot4', api)][k], got[('int', api)][k]) for k in range(n - 1))
+                    report(f'{n}x dot4 vs int ({api})', 'bytes identical' if same else 'BYTES DIFFER', same)
         if 'generic' in tiers:
             for tier in tiers:
                 if tier == 'generic': continue

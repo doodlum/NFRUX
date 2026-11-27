@@ -2,6 +2,7 @@
 docs/FFX_MLFG.md) as NFRUX embeds them: one blob, layers in the order core/mlfg/mlfg_network.cpp runs them.
 
     python tools/mlfg_weights.py [NPZ] [--xz core/model/amd_mlfg_weights.xz] [--bin FILE]
+    python tools/mlfg_weights.py --int8 OUT_int8.npz [--xz core/model/amd_mlfg_int8.xz] [--bin FILE]   (blob_int8)
 
 NPZ defaults to mlfg_net's (D:\\nfrux_ffx\\work\\amd_mlfg_4k.npz). The weights are read through
 tools/ffx_extract/mlfg_net.AmdMlfgNet.load_amd, so they are in the orientation that module runs them (passes 186 / 188
@@ -79,13 +80,57 @@ def blob(npz):
     return head[:12] + struct.pack('<I', total) + table + data, names
 
 
+def blob_int8(npz):
+    """The int8 network (an export_amd OUT_int8.npz + .json, read by tools/ffx_extract/mlfg_int8.load_int8).
+
+    Blob (little endian, items 8-byte aligned):
+      header  u32 magic 'MLFQ', version 1, layer count, total bytes, act scale count, act table offset, 0, 0
+      layer   16 x u32: kind (0 conv, 1 transposed 2x2/2), k, stride, cin, cout, flags (1 fold, 2 fp16 output),
+              act (0 none, 1 leaky 0.2, 2 relu), weight offset, ws offset, bias offset, fold offset (0: none),
+              q_in, q_pre, q_out, q_res (act table indices of the per-tensor quantisers; 0xFFFFFFFF none; q_in none
+              with a fold), 0
+      weights int8, conv [cout][cin][k][k], transposed [cin][cout][2][2]; ws / bias fp32 [cout]; fold fp32 [cin]
+      act     fp32 scales of the per-tensor quantisers (value = int * scale)
+    """
+    import mlfg_int8
+    L, act = mlfg_int8.load_int8(npz)
+    names = []
+    for q in L:
+        for n in (None if q.fold is not None else q.q_in, q.q_pre, q.q_out, q.q_res):
+            if n is not None and n not in names:
+                names.append(n)
+    idx = lambda n: 0xFFFFFFFF if n is None else names.index(n)
+    base = 32 + 64 * len(L)
+    pad = lambda b: b + b'\0' * (-len(b) % 8)
+    table, data = b'', b''
+    for q in L:
+        off = lambda: base + len(data)
+        wo = off(); data = pad(data + q.wq.astype(np.int8).tobytes())
+        so = off(); data = pad(data + q.ws.astype('<f4').tobytes())
+        bo = off(); data = pad(data + q.b.astype('<f4').tobytes())
+        fo = 0
+        if q.fold is not None:
+            fo = off(); data = pad(data + q.fold.astype('<f4').tobytes())
+        flags = (1 if q.fold is not None else 0) | (2 if q.q_out is None else 0)
+        table += struct.pack('<16I', 1 if q.transposed else 0, q.k, q.stride, q.cin, q.cout, flags, q.act, wo, so, bo, fo,
+                             idx(None if q.fold is not None else q.q_in), idx(q.q_pre), idx(q.q_out), idx(q.q_res), 0)
+    ao = base + len(data)
+    data = pad(data + np.array([act[n].reshape(-1)[0] for n in names], '<f4').tobytes())
+    total = base + len(data)
+    head = struct.pack('<8I', 0x51464C4D, 1, len(L), total, len(names), ao, 0, 0)
+    return head + table + data, [q.key for q in L]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('npz', nargs='?', default=mlfg_net.DEFAULT_WEIGHTS)
-    ap.add_argument('--xz', default=os.path.join(HERE, '..', 'core', 'model', 'amd_mlfg_weights.xz'))
+    ap.add_argument('--xz', default=None)
     ap.add_argument('--bin')
+    ap.add_argument('--int8', action='store_true', help='npz is an export_amd int8 export (OUT_int8.npz): the int8 blob')
     a = ap.parse_args()
-    b, names = blob(a.npz)
+    if a.xz is None:
+        a.xz = os.path.join(HERE, '..', 'core', 'model', 'amd_mlfg_int8.xz' if a.int8 else 'amd_mlfg_weights.xz')
+    b, names = blob_int8(a.npz) if a.int8 else blob(a.npz)
     if a.bin:
         open(a.bin, 'wb').write(b)
         print(f'{a.bin}: {len(b)} bytes, {len(names)} layers')

@@ -38,7 +38,27 @@ struct Weights
     static bool Load(Weights& w, std::string* error);  // nfrux.ini [General] AmdWeights / NFRUX_AMD_WEIGHTS, else embedded
 };
 
-// A tensor buffer and the view of it a layer reads or writes: size, channel pitch (halves), first channel.
+// The int8 network (AmdPrecision=int8): tools/mlfg_weights.py --int8 from an export_amd int8 export (blob_int8's layout);
+// semantics tools/ffx_extract/mlfg_int8.py. Embedded, or nfrux.ini [General] AmdWeightsInt8 / NFRUX_AMD_WEIGHTS_INT8.
+struct QLayerWeights
+{
+    uint32_t kind, k, stride, cin, cout, flags, act, wq, ws, bias, fold, qin, qpre, qout, qres, pad;  // byte offsets; q*: act indices
+    static constexpr uint32_t kFold = 1, kF16Out = 2, kNone = 0xFFFFFFFFu;
+};
+struct QWeights
+{
+    std::vector<uint8_t>       file;
+    const uint8_t*             data = nullptr;
+    size_t                     size = 0;
+    std::vector<QLayerWeights> layers;
+    std::vector<float>         act;  // per-tensor scales
+    float F(size_t byteOffset) const;
+    int   W(uint32_t layer, size_t i) const { return int(int8_t(data[layers[layer].wq + i])); }  // the blob's layout
+    float S(uint32_t index) const { return index == QLayerWeights::kNone ? 0.0f : act[index]; }
+    static bool Load(QWeights& w, std::string* error);
+};
+
+// A tensor buffer and the view of it a layer reads or writes: size, channel pitch (halves; int8 tensors: bytes), first channel.
 struct View
 {
     const Buffer* buf = nullptr;
@@ -61,6 +81,7 @@ public:
     static std::unique_ptr<Network> Create(Device& dev, uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error);
     ~Network();
     Tier tier() const { return m_tier; }
+    bool int8() const { return m_int8; }
     std::string Describe() const;
 
     bool Prepare();  // the weights' upload, recorded into the first frame
@@ -82,11 +103,32 @@ public:
         uint32_t writeEnd = 0;  // channels written (zeros beyond cout); 0: cout rounded up to even
     };
     bool Run(const Conv& c);
+    // One int8 layer: src int8 (or fp16 quantised per channel: srcF16, block entries), res int8, out int8 / fp16 (the
+    // layer's fp16 flag, or outF16: dequantised); output channels from copyFrom on copy src requantised (FasterNet).
+    struct QConv
+    {
+        uint32_t layer = 0;
+        View     src, res, out;
+        bool     srcF16 = false, outF16 = false;
+        uint32_t copyFrom = ~0u, writeEnd = 0;
+    };
+    bool RunQ(const QConv& c);
 
 private:
     Network(Device& d) : m_dev(d) {}
     bool Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error);
     bool SelectTier(std::string* error);
+    bool SelectPrecision(std::string* error);
+    bool MakeInt8(std::string* error);
+    bool EncodersQ(const View& netIn);
+    bool FlowBlockQ(uint32_t block, const View& in, const View& out13);
+    bool Stage2Q(const View& in, const View& logits);
+    bool FasterNetQ(uint32_t first, uint32_t C, const View& x, const View& y, const View& hin, const View& h, const View* skip, const View* upOut);
+    bool                    m_int8 = false, m_dot4 = false;
+    QWeights                m_q;
+    std::vector<uint32_t>   m_qOffset;           // per layer: weight words, then m / b / rf
+    std::unique_ptr<Pass>   m_q8[4][2];          // int8: 3x3, 2x2/2, 1x1, transposed; large / small tile
+    Tensor                  m_hin48, m_hin64;    // int8: the FasterNet expand inputs
     bool FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, const View& y, const View& pc, const View& h, const View* skip, const View* upOut);
     Device&                 m_dev;
     Tier                    m_tier = Tier::Generic;

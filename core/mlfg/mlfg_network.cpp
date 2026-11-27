@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "mlfg_network.h"
 
+#include "amd_mlfg_int8.h"
 #include "amd_mlfg_weights.h"
 #include "log.h"
 #include "marker.h"
@@ -146,6 +147,110 @@ bool Weights::Load(Weights& w, std::string* error)
     return true;
 }
 
+float QWeights::F(size_t o) const
+{
+    float f;
+    memcpy(&f, data + o, 4);
+    return f;
+}
+
+namespace
+{
+bool ReadFile(const char* path, std::vector<uint8_t>& out)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    out.resize(size_t(ftell(f)));
+    fseek(f, 0, SEEK_SET);
+    const size_t got = fread(out.data(), 1, out.size(), f);
+    fclose(f);
+    return got == out.size();
+}
+
+// The int8 layers' quantiser chain as the runtime wires the tensors (mlfg_int8.Int8MlfgNet, export_amd's qat_points):
+// a file whose chain differs would be run with wrong scales.
+bool QChainOk(const QWeights& w, std::string* why)
+{
+    const auto& L = w.layers;
+    using QL = QLayerWeights;
+    auto in = [&](uint32_t l) { return L[l].qin; };
+    auto out = [&](uint32_t l) { return L[l].qout; };
+    uint32_t bad = ~0u;
+    auto need = [&](bool ok, uint32_t l) { if (!ok && bad == ~0u) bad = l; };
+    for (uint32_t l = 0; l < L.size(); ++l)
+    {
+        const bool fp16 = (L[l].flags & QL::kF16Out) != 0, fold = (L[l].flags & QL::kFold) != 0;
+        need((L[l].qpre != QL::kNone) == (L[l].act != 0) && L[l].act <= 2 && fp16 == (L[l].qout == QL::kNone) && fold == (L[l].qin == QL::kNone), l);
+        need(!fold || L[l].fold != 0, l);
+    }
+    for (uint32_t e : {kEncA, kEncB})
+    {
+        need((L[e].flags & QL::kFold) != 0, e);
+        for (uint32_t j = 1; j < 4; ++j) need(in(e + j) == out(e + j - 1), e + j);
+        need(out(e + 3) != QL::kNone, e + 3);
+    }
+    for (uint32_t b = 0; b < 4; ++b)
+    {
+        const uint32_t f = kBlock0 + 13 * b;
+        need((L[f].flags & QL::kFold) != 0, f);
+        for (uint32_t j = 1; j < 13; ++j) need(in(f + j) == out(f + j - 1), f + j);
+        for (uint32_t r = 0; r < 8; ++r) need(L[f + 3 + r].qres == in(f + 3 + r), f + 3 + r);
+        need((L[f + 12].flags & QL::kF16Out) != 0, f + 12);
+    }
+    need((L[kS2Inp].flags & QL::kFold) != 0 && in(kS2D1) == out(kS2Inp), kS2D1);
+    uint32_t prev = out(kS2D1), skip = 0;
+    auto fn = [&](uint32_t p) {
+        need(in(p) == prev && in(p + 1) == out(p) && in(p + 2) == out(p + 1) && L[p + 2].qres == prev && L[p].cin == L[p].cout, p);
+        prev = out(p + 2);
+    };
+    for (uint32_t j = 0; j < 4; ++j) fn(kS2B1 + 3 * j);
+    skip = prev;
+    need(in(kS2D2) == prev, kS2D2), prev = out(kS2D2);
+    for (uint32_t j = 0; j < 5; ++j) fn(kS2B2 + 3 * j);
+    const uint32_t up = kS2B2 + 15;
+    need(in(up) == prev && L[up].qres == skip, up), prev = out(up);
+    for (uint32_t j = 0; j < 4; ++j) fn(kS2B3 + 3 * j);
+    need(in(kS2Up) == prev && in(kS2Head) == out(kS2Up) && (L[kS2Head].flags & QL::kF16Out) != 0, kS2Head);
+    if (bad != ~0u && why) *why = "int8 weights: layer " + std::to_string(bad) + "'s quantisers do not chain as the runtime runs them";
+    return bad == ~0u;
+}
+}  // namespace
+
+bool QWeights::Load(QWeights& w, std::string* error)
+{
+    auto fail = [&](const std::string& m) { if (error) *error = m; return false; };
+    w.data = reinterpret_cast<const uint8_t*>(kInt8Weights), w.size = kInt8WeightBytes;
+    if (const char* path = Env("NFRUX_AMD_WEIGHTS_INT8"))
+    {
+        if (!ReadFile(path, w.file)) return fail(std::string("cannot read the int8 weights file ") + path);
+        w.data = w.file.data(), w.size = w.file.size();
+        Log("FSR FG4 network: int8 weights from %s", path);
+    }
+    uint32_t head[8];
+    const auto want = Expected();
+    if (w.size < 32) return fail("int8 weights: too short");
+    memcpy(head, w.data, 32);
+    if (head[0] != 0x51464C4Du || head[1] != 1 || head[2] != want.size() || head[3] != w.size || w.size < 32 + 64 * want.size() ||
+        uint64_t(head[5]) + 4ull * head[4] > w.size)
+        return fail("int8 weights: not a tools/mlfg_weights.py --int8 blob of this network");
+    w.layers.resize(want.size());
+    memcpy(w.layers.data(), w.data + 32, 64 * want.size());
+    w.act.resize(head[4]);
+    memcpy(w.act.data(), w.data + head[5], 4 * w.act.size());
+    for (size_t i = 0; i < want.size(); ++i)
+    {
+        const QLayerWeights& L = w.layers[i];
+        const uint64_t n = uint64_t(L.k) * L.k * L.cin * L.cout;
+        auto idx = [&](uint32_t q) { return q == QLayerWeights::kNone || q < w.act.size(); };
+        if (L.kind != want[i][0] || L.k != want[i][1] || L.stride != want[i][2] || L.cin != want[i][3] || L.cout != want[i][4] ||
+            L.wq + n > w.size || L.ws + 4ull * L.cout > w.size || L.bias + 4ull * L.cout > w.size || L.fold + 4ull * L.cin > w.size ||
+            !idx(L.qin) || !idx(L.qpre) || !idx(L.qout) || !idx(L.qres))
+            return fail("int8 weights: layer " + std::to_string(i) + " is not the expected one");
+    }
+    return QChainOk(w, error);
+}
+
 std::unique_ptr<Network> Network::Create(Device& dev, uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::string* error)
 {
     std::unique_ptr<Network> n(new Network(dev));
@@ -160,6 +265,9 @@ Network::~Network()
 
 std::string Network::Describe() const
 {
+    if (m_int8)
+        return std::string("int8, generic HLSL kernels, ") + (m_dot4 ? (m_dev.caps().vulkan ? "integer dot product" : "SM 6.4 packed dot product") : "32-bit integers") +
+               (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)");
     if (m_tier == Tier::CoopMat)
         return "cooperative matrices fp16, fragments " + std::to_string(m_matSet->m) + "x" + std::to_string(m_matSet->n) + "x16, subgroup " + std::to_string(m_matSet->sg) + " (Vulkan)";
     return m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
@@ -253,6 +361,45 @@ bool Network::SelectTier(std::string* error)
     return true;
 }
 
+// fp16 (AMD's network as AMD runs it) or int8 (an int8 export; mlfg_int8.py): nfrux.ini [General] AmdPrecision /
+// NFRUX_AMD_PRECISION = auto | fp16 | int8. auto: int8 where the fp16 network would have no matrix units (its generic
+// tier); on RTX (CUDA) and cooperative-matrix GPUs fp16, which is faster there (docs/FFX_MLFG.md, int8 tier).
+bool Network::SelectPrecision(std::string* error)
+{
+    const char* want = Env("NFRUX_AMD_PRECISION");
+    const bool  env  = getenv("NFRUX_AMD_PRECISION") != nullptr;
+    if (want && strcmp(want, "fp16") && strcmp(want, "int8"))
+    {
+        if (env) { if (error) *error = std::string("NFRUX_AMD_PRECISION=") + want + ": not auto, fp16 or int8"; return false; }
+        Log("nfrux.ini: AmdPrecision=%s is not auto, fp16 or int8: the automatic choice", want);
+        want = nullptr;
+    }
+    // (a forced fp16 tier, NFRUX_MLFG / AmdNetwork, keeps auto at fp16)
+    const bool forced = Env("NFRUX_MLFG") || Option(m_dev.caps().vulkan ? "vulkan" : "d3d12", "amdnetwork");
+    m_int8 = want ? !strcmp(want, "int8") : (m_tier == Tier::Generic && !forced);
+    if (!m_int8) return true;
+    if (m_tier != Tier::Generic)  // the fp16 tier chosen first is not used: its crash marker and kernels go
+    {
+        if (!m_marker.empty()) MarkerOk(m_marker), m_marker.clear();
+        m_cuda.reset(), m_tier = Tier::Generic;
+    }
+    // Packed dot products where the device has them (D3D12 SM 6.4, Vulkan integer dot product); off NVIDIA behind a crash
+    // marker of their own (the 32-bit integer kernels as the fallback). NFRUX_MLFG_Q8=dot4 | int (tests): forced, strict.
+    const Caps& caps = m_dev.caps();
+    const char* q8   = Env("NFRUX_MLFG_Q8");
+    if (q8 && strcmp(q8, "dot4") && strcmp(q8, "int")) { if (error) *error = std::string("NFRUX_MLFG_Q8=") + q8 + ": not dot4 or int"; return false; }
+    if (q8 && !strcmp(q8, "dot4") && !caps.dot4) { if (error) *error = "NFRUX_MLFG_Q8=dot4: no packed dot product on this device"; return false; }
+    m_dot4 = q8 ? !strcmp(q8, "dot4") : caps.dot4;
+    if (m_dot4 && !q8 && !caps.nvidia)
+    {
+        char b[64];
+        snprintf(b, sizeof(b), "%s_mlfg_q8dot4_%04x_%04x", caps.vulkan ? "vulkan" : "d3d12", caps.vendorId, caps.deviceId);
+        if (MarkerBegin(b)) m_marker = b;
+        else m_dot4 = false;
+    }
+    return true;
+}
+
 void Network::FrameDone()
 {
     if (!m_marker.empty() && ++m_frames >= 120) MarkerOk(m_marker), m_marker.clear();
@@ -262,12 +409,16 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
 {
     auto fail = [&](const char* m) { if (error) *error = m; return false; };
     if (l0w % 32 || l0h % 32 || s2w % 4 || s2h % 4) return fail("network sizes");
-    if (!SelectTier(error)) return false;
+    if (!SelectTier(error) || !SelectPrecision(error)) return false;
     m_fused = !EnvFlag("NFRUX_MLFG_UNFUSED", false);
     m_m2 = !EnvFlag("NFRUX_MLFG_NO_M2", false);
     // CUDA (NFRUX_MLFG_UNFUSED=1, tests: the FasterNet layers one by one); coopmat and generic run the layers.
     m_offset.resize(kLayers), m_biasOffset.resize(kLayers), m_nb.resize(kLayers), m_off8.resize(kLayers);
-    if (m_tier == Tier::Cuda)
+    if (m_int8)
+    {
+        if (!MakeInt8(error)) return false;
+    }
+    else if (m_tier == Tier::Cuda)
     {
         // mma fragments: per layer [kc][tap][ntp][lane] words, word = (W[k = 8 kc + 2q][n], W[k + 1][n]), n = 8 nt + g, lane = 4g + q;
         // ntp = the n tiles rounded up to the kernel's 8 (transposed: 4). Biases fp32 [coPad64].
@@ -407,6 +558,8 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     tensor(m_t32, s2w, s2h, 32);
     tensor(m_x48, s2w / 2, s2h / 2, 48), tensor(m_y48, s2w / 2, s2h / 2, 48), tensor(m_pc16, s2w / 2, s2h / 2, 16), tensor(m_h96, s2w / 2, s2h / 2, 96);
     tensor(m_x64, s2w / 4, s2h / 4, 64), tensor(m_y64, s2w / 4, s2h / 4, 64), tensor(m_pc32, s2w / 4, s2h / 4, 32), tensor(m_h128, s2w / 4, s2h / 4, 128);
+    if (m_int8)  // int8 views use the fp16 tensors above (half their bytes); the expand inputs need their own
+        tensor(m_hin48, s2w / 2, s2h / 2, 24), tensor(m_hin64, s2w / 4, s2h / 4, 32);
     return ok || fail("out of memory");
 }
 
@@ -518,6 +671,7 @@ View Sized(const Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) { return {t.
 
 bool Network::Encoders(const View& netIn)
 {
+    if (m_int8) return EncodersQ(netIn);
     const uint32_t w = netIn.w / 2, h = netIn.h / 2;
     const View a = Sized(m_a, w, h, 32), b = Sized(m_b, w, h, 32);
     for (uint32_t e = 0; e < 2; ++e)
@@ -538,6 +692,7 @@ bool Network::Encoders(const View& netIn)
 
 bool Network::FlowBlock(uint32_t block, const View& in, const View& out13)
 {
+    if (m_int8) return FlowBlockQ(block, in, out13);
     const uint32_t c1 = kBlocks[block][1], c2 = kBlocks[block][2], first = kBlock0 + 13 * block;
     const View a = Sized(m_a, in.w / 2, in.h / 2, c1), b = Sized(m_b, in.w / 2, in.h / 2, c1);
     const View x = Sized(m_c, in.w / 4, in.h / 4, c2), y = Sized(m_d, in.w / 4, in.h / 4, c2);
@@ -594,6 +749,7 @@ bool Network::FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, c
 
 bool Network::Stage2(const View& in, const View& logits)
 {
+    if (m_int8) return Stage2Q(in, logits);
     const uint32_t W = in.w, H = in.h;
     const View t32 = Sized(m_t32, W, H, 32);
     const View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), pc16 = Sized(m_pc16, W / 2, H / 2, 16), h96 = Sized(m_h96, W / 2, H / 2, 96);
@@ -616,5 +772,176 @@ bool Network::Stage2(const View& in, const View& logits)
     if (!Run(c)) return false;
     c = {}, c.layer = kS2Head, c.src = t32, c.out = logits;  // fp16 logits (the softmax pass follows)
     return Run(c);
+}
+
+// ---------------------------------------------------------------------------------------------------------------- int8
+// Generic int8 tier (mlfg_conv_q8.hlsl): per layer, from word m_qOffset[l]: weights [tap][ceil(cin / 4)][coPad8] words
+// (input channels 4i .. 4i + 3 of one output), then fp32 m[coPad] (ws * s_in, or ws with a fold), b[coPad], rf[cin4 * 4]
+// (1 / fold). The products / reciprocals are fp32 as mlfg_int8.py computes them (numpy float32).
+bool Network::MakeInt8(std::string* error)
+{
+    auto fail = [&](const std::string& m) { if (error) *error = m; return false; };
+    if (!QWeights::Load(m_q, error)) return false;
+    std::vector<uint32_t> w;
+    m_qOffset.resize(kLayers);
+    for (uint32_t l = 0; l < kLayers; ++l)
+    {
+        const QLayerWeights& L = m_q.layers[l];
+        const uint32_t taps = L.k * L.k, cin4 = (L.cin + 3) / 4, coP = (L.cout + 7) & ~7u;
+        w.resize((w.size() + 3) & ~size_t(3), 0);
+        m_qOffset[l] = uint32_t(w.size());
+        w.resize(w.size() + size_t(taps) * cin4 * coP + 2 * coP + cin4 * 4, 0);
+        uint32_t* p = w.data() + m_qOffset[l];
+        for (uint32_t t = 0; t < taps; ++t)
+            for (uint32_t i4 = 0; i4 < cin4; ++i4)
+                for (uint32_t o = 0; o < L.cout; ++o)
+                {
+                    uint32_t word = 0;
+                    for (uint32_t k = 0; k < 4; ++k)
+                    {
+                        const uint32_t i = 4 * i4 + k;
+                        if (i >= L.cin) continue;
+                        const size_t src = L.kind == 0 ? (size_t(o) * L.cin + i) * taps + t : (size_t(i) * L.cout + o) * taps + t;
+                        word |= (uint32_t(m_q.W(l, src)) & 0xFFu) << (8 * k);
+                    }
+                    p[(size_t(t) * cin4 + i4) * coP + o] = word;
+                }
+        float* f = reinterpret_cast<float*>(p + size_t(taps) * cin4 * coP);
+        const bool fold = (L.flags & QLayerWeights::kFold) != 0;
+        for (uint32_t o = 0; o < L.cout; ++o)
+        {
+            const float ws = m_q.F(L.ws + 4 * size_t(o));
+            f[o] = fold ? ws : ws * m_q.S(L.qin), f[coP + o] = m_q.F(L.bias + 4 * size_t(o));
+        }
+        for (uint32_t i = 0; fold && i < L.cin; ++i) f[2 * coP + i] = 1.0f / m_q.F(L.fold + 4 * size_t(i));
+    }
+    w.resize(w.size() + 16, 0);
+    m_blob.resize(w.size() * 4), memcpy(m_blob.data(), w.data(), m_blob.size());
+    if (!(m_gpuWeights = m_dev.CreateBuffer(m_blob.size()))) return fail("int8 weights buffer");
+    using S = const Shader*;
+    const S d4[4][2] = {{&shaders::kMlfgQ8Conv3_d4, &shaders::kMlfgQ8Conv3s_d4}, {&shaders::kMlfgQ8Conv2_d4, &shaders::kMlfgQ8Conv2s_d4},
+                        {&shaders::kMlfgQ8Conv1_d4, &shaders::kMlfgQ8Conv1s_d4}, {&shaders::kMlfgQ8ConvT_d4, &shaders::kMlfgQ8ConvTs_d4}};
+    const S in[4][2] = {{&shaders::kMlfgQ8Conv3, &shaders::kMlfgQ8Conv3s}, {&shaders::kMlfgQ8Conv2, &shaders::kMlfgQ8Conv2s},
+                        {&shaders::kMlfgQ8Conv1, &shaders::kMlfgQ8Conv1s}, {&shaders::kMlfgQ8ConvT, &shaders::kMlfgQ8ConvTs}};
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 2; ++j)
+            if (!(m_q8[i][j] = m_dev.CreatePass(*(m_dot4 ? d4 : in)[i][j]))) return fail("int8 network passes");
+    return true;
+}
+
+bool Network::RunQ(const QConv& c)
+{
+    const QLayerWeights& L = m_q.layers[c.layer];
+    char label[48] = "";
+    if (m_dev.Timing()) snprintf(label, sizeof(label), "L%03u q8 %s%ux%u %u->%u", c.layer, L.kind ? "T" : "k", L.k, L.stride, L.cin, L.cout), m_dev.Label(label);
+    const bool     f16 = (L.flags & QLayerWeights::kF16Out) != 0 || c.outF16;
+    const uint32_t copyTo = c.copyFrom != ~0u ? c.writeEnd : 0;
+    const uint32_t writeEnd = c.writeEnd ? c.writeEnd : f16 ? (L.cout + 1) & ~1u : L.cout;
+    if (!c.src || !c.out || c.srcF16 != ((L.flags & QLayerWeights::kFold) != 0) || (!f16 && (c.out.ch % 4 || c.out.pitch % 4 || L.cout % 8 || writeEnd % 8)) ||
+        (!c.srcF16 && (c.src.ch % 4 || c.src.pitch % 4)) || (f16 && ((writeEnd & 1) || (c.out.ch & 1))) || c.out.ch + writeEnd > c.out.pitch ||
+        (copyTo && (copyTo > c.src.pitch || c.src.ch)) || (L.qres != QLayerWeights::kNone) != bool(c.res))
+        return false;
+    const int32_t mode = (c.srcF16 ? 1 : 0) | ((L.flags & QLayerWeights::kF16Out) ? 2 : 0) | (c.outF16 ? 4 : 0) | (c.res ? 8 : 0);
+    const uint32_t coP = (L.cout + 7) & ~7u, taps = L.k * L.k, cin4 = (L.cin + 3) / 4;
+    auto rcp = [](float s) { return s > 0.0f ? 1.0f / s : 0.0f; };
+    const float sPre = m_q.S(L.qpre), sOut = m_q.S(L.qout);
+    struct { int32_t in[4], out[4], cfg[4], off[4], res[4]; float q[4], q2[4]; } k = {
+        {int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch)},
+        {int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch)},
+        {int32_t(L.cout), int32_t(L.cin), int32_t(L.act), mode},
+        {int32_t(m_qOffset[c.layer]), int32_t(coP), int32_t(m_qOffset[c.layer] + taps * cin4 * coP), int32_t(writeEnd)},
+        {c.res ? int32_t(c.res.pitch) : 0, int32_t(c.res.ch), copyTo ? int32_t(c.copyFrom) : 0x7FFFFFFF, 0},
+        {rcp(sPre), sPre, rcp(sOut), sOut}, {m_q.S(L.qres), m_q.S(L.qin), 0, 0}};
+    const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+    const uint32_t zs = (std::max(copyTo ? copyTo : L.cout, writeEnd) + 7) / 8, th = shape == 1 ? 8 : 16;
+    const bool     small = uint64_t((c.out.w + 15) / 16) * ((c.out.h + th - 1) / th) * zs < 768;
+    const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(4, c.res ? *c.res.buf : *c.src.buf), Bind::Buf(5, *c.out.buf)};
+    Pass* p = m_q8[shape][small ? 1 : 0].get();
+    return small ? p->Dispatch(b, 5, (c.out.w + 3) / 4, (c.out.h + 3) / 4, zs) : p->Dispatch(b, 5, (c.out.w + 15) / 16, (c.out.h + th - 1) / th, zs);
+}
+
+bool Network::EncodersQ(const View& netIn)
+{
+    const uint32_t w = netIn.w / 2, h = netIn.h / 2;
+    const View a = Sized(m_a, w, h, 32), b = Sized(m_b, w, h, 32);
+    for (uint32_t e = 0; e < 2; ++e)
+    {
+        const uint32_t first = e ? kEncB : kEncA;
+        QConv c;
+        c.layer = first, c.src = netIn.At(e ? 3 : 0), c.srcF16 = true, c.out = a;
+        if (!RunQ(c)) return false;
+        c = {}, c.layer = first + 1, c.src = a, c.out = b;
+        if (!RunQ(c)) return false;
+        c = {}, c.layer = first + 2, c.src = b, c.out = a;
+        if (!RunQ(c)) return false;
+        c = {}, c.layer = first + 3, c.src = a, c.out = netIn.At(e ? 12 : 6), c.outF16 = true, c.writeEnd = 6;
+        if (!RunQ(c)) return false;
+    }
+    return true;
+}
+
+bool Network::FlowBlockQ(uint32_t block, const View& in, const View& out13)
+{
+    const uint32_t c1 = kBlocks[block][1], c2 = kBlocks[block][2], first = kBlock0 + 13 * block;
+    const View a = Sized(m_a, in.w / 2, in.h / 2, c1), b = Sized(m_b, in.w / 2, in.h / 2, c1);
+    const View x = Sized(m_c, in.w / 4, in.h / 4, c2), y = Sized(m_d, in.w / 4, in.h / 4, c2);
+    QConv c;
+    c.layer = first, c.src = in, c.srcF16 = true, c.out = a;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = first + 1, c.src = a, c.out = b;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = first + 2, c.src = b, c.out = x;
+    if (!RunQ(c)) return false;
+    for (uint32_t r = 0; r < 8; ++r)
+    {
+        const View& s = r % 2 ? y : x;
+        c = {}, c.layer = first + 3 + r, c.src = s, c.res = s, c.out = r % 2 ? x : y;
+        if (!RunQ(c)) return false;
+    }
+    c = {}, c.layer = first + 11, c.src = x, c.out = a;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = first + 12, c.src = a, c.out = out13, c.writeEnd = 16;
+    return RunQ(c);
+}
+
+// FasterNet in int8: H = cat(Q(pconv(x[:P])), Q(x[P:] at H's scale)) by one dispatch (copy groups), expand + ReLU, project + x.
+bool Network::FasterNetQ(uint32_t first, uint32_t C, const View& x, const View& y, const View& hin, const View& h, const View* skip, const View* upOut)
+{
+    QConv c;
+    c.layer = first, c.src = x, c.out = hin, c.copyFrom = m_q.layers[first].cout, c.writeEnd = C;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = first + 1, c.src = hin, c.out = h;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = first + 2, c.src = h, c.res = x, c.out = y;
+    if (!RunQ(c)) return false;
+    if (!skip) return true;
+    c = {}, c.layer = first + 3, c.src = y, c.res = *skip, c.out = *upOut;
+    return RunQ(c);
+}
+
+bool Network::Stage2Q(const View& in, const View& logits)
+{
+    const uint32_t W = in.w, H = in.h;
+    const View t32 = Sized(m_t32, W, H, 32);
+    const View x48 = Sized(m_x48, W / 2, H / 2, 48), y48 = Sized(m_y48, W / 2, H / 2, 48), q48 = Sized(m_hin48, W / 2, H / 2, 48), h96 = Sized(m_h96, W / 2, H / 2, 96);
+    const View x64 = Sized(m_x64, W / 4, H / 4, 64), y64 = Sized(m_y64, W / 4, H / 4, 64), q64 = Sized(m_hin64, W / 4, H / 4, 64), h128 = Sized(m_h128, W / 4, H / 4, 128);
+    QConv c;
+    c.layer = kS2Inp, c.src = in, c.srcF16 = true, c.out = t32;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = kS2D1, c.src = t32, c.out = x48;
+    if (!RunQ(c)) return false;
+    for (uint32_t j = 0; j < 4; ++j)
+        if (!FasterNetQ(kS2B1 + 3 * j, 48, j % 2 ? y48 : x48, j % 2 ? x48 : y48, q48, h96, nullptr, nullptr)) return false;
+    c = {}, c.layer = kS2D2, c.src = x48, c.out = x64;
+    if (!RunQ(c)) return false;
+    for (uint32_t j = 0; j < 4; ++j)
+        if (!FasterNetQ(kS2B2 + 3 * j, 64, j % 2 ? y64 : x64, j % 2 ? x64 : y64, q64, h128, nullptr, nullptr)) return false;
+    if (!FasterNetQ(kS2B2 + 12, 64, x64, y64, q64, h128, &x48, &y48)) return false;
+    for (uint32_t j = 0; j < 4; ++j)
+        if (!FasterNetQ(kS2B3 + 3 * j, 48, j % 2 ? x48 : y48, j % 2 ? y48 : x48, q48, h96, nullptr, nullptr)) return false;
+    c = {}, c.layer = kS2Up, c.src = y48, c.out = t32;
+    if (!RunQ(c)) return false;
+    c = {}, c.layer = kS2Head, c.src = t32, c.out = logits;
+    return RunQ(c);
 }
 }  // namespace nfrux::mlfg

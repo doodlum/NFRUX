@@ -89,6 +89,14 @@ for n, k in [("kMlfgConv3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("kMlfgConv
     big = ["-DMLFG_TW=16", "-DMLFG_TH=8" if n == "kMlfgConv2" else "-DMLFG_TH=16", "-DMLFG_KS=1"]
     passes += [(n, mg_ + "conv.hlsl", k + big, "NFRUX_UNUSED", 60),
                (n + "s", mg_ + "conv.hlsl", k + ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"], "NFRUX_UNUSED", 60)]
+# The int8 tier (mlfg_conv_q8.hlsl): the same shapes and tiles, each with packed dot products (SM 6.4 / Vulkan integer dot
+# product: "_d4") and in 32-bit integer code (SM 6.0). Strict (kMlfgQ8 is not kMlfgConv): the fp32 epilogue rounds.
+for n, k in [("kMlfgQ8Conv3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("kMlfgQ8Conv2", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2"]),
+             ("kMlfgQ8Conv1", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1"]), ("kMlfgQ8ConvT", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"])]:
+    for tile, td in (("", ["-DMLFG_TW=16", "-DMLFG_TH=8" if n == "kMlfgQ8Conv2" else "-DMLFG_TH=16", "-DMLFG_KS=1"]),
+                     ("s", ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"])):
+        passes += [(n + tile, mg_ + "conv_q8.hlsl", k + td + ["-DMLFG_DOT4=0"], "NFRUX_UNUSED", 60),
+                   (n + tile + "_d4", mg_ + "conv_q8.hlsl", k + td + ["-DMLFG_DOT4=1"], "NFRUX_UNUSED", 64)]
 
 
 def run(cmd):
@@ -137,7 +145,7 @@ def build(job):
     n = name + ("Inv" if v else "")
     b = os.path.join(out, n)
     if src.endswith(".hlsl"):  # HLSL source (no 16-bit types; the checks below apply to it as to GLSL)
-        run([DXC, "-nologo", "-spirv", "-T", "cs_6_0", "-E", "main", "-O3", "-fspv-target-env=vulkan1.1", "-HV", "2021", *defs,
+        run([DXC, "-nologo", "-spirv", "-T", "cs_6_4" if sm == 64 else "cs_6_0", "-E", "main", "-O3", "-fspv-target-env=vulkan1.1", "-HV", "2021", *defs,
              f"-D{inv}={v}", "-I" + os.path.dirname(src), "-Fo", b + ".spv", src])
     else:
         run([GLSLANG, "-V", "--target-env", "vulkan1.1", "-S", "comp", *F32, *defs, f"-D{inv}={v}", "-Igpu", "-Igpu/opticalflow",
@@ -145,7 +153,7 @@ def build(job):
     run([tool("spirv-opt"), "--eliminate-dead-functions", b + ".spv", "-o", b + ".spv"])
     precise(b + ".spv", n)
     run([tool("spirv-val"), "--target-env", "vulkan1.1", b + ".spv"])
-    run([XCROSS, b + ".spv", "--hlsl", "--shader-model", "62" if sm >= 62 else "60", *(["--hlsl-enable-16bit-types"] if sm >= 62 else []),
+    run([XCROSS, b + ".spv", "--hlsl", "--shader-model", str(sm), *(["--hlsl-enable-16bit-types"] if sm == 62 else []),
          "--output", b + ".hlsl"])
     if True:  # full precision everywhere, so D3D12 matches Vulkan
         h = open(b + ".hlsl").read()
@@ -156,7 +164,7 @@ def build(job):
         open(b + ".hlsl", "w").write(h)
     run([XCROSS, b + ".spv", "--reflect", "--output", b + ".json"])
     run([DXC, "-nologo", "-T", f"cs_6_{sm - 60}", "-E", "main", "-O3", "-Wno-conversion", "-Wno-ambig-lit-shift", *([] if RELAXED and not Strict(name) else ["-Gis"]),
-         *(["-enable-16bit-types"] if sm >= 62 else []), b + ".hlsl", "-Fo", b + ".dxil"])
+         *(["-enable-16bit-types"] if sm == 62 else []), b + ".hlsl", "-Fo", b + ".dxil"])
     refl = json.load(open(b + ".json"))
     hl = open(b + ".hlsl").read()
     binds = []
