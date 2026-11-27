@@ -48,6 +48,11 @@ target_link_options(nvngx_dlssg PRIVATE /PDBALTPATH:%_PDB% /OPT:ICF /DELAYLOAD:d
 target_link_libraries(nvngx_dlssg delayimp)
 add_executable(ngx_harness tests/ngx_harness.cpp)
 target_link_libraries(ngx_harness nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
+# The tools start without a Vulkan runtime (CI runners, D3D12-only PCs running the kit) and load it when a Vulkan test runs.
+foreach(t ngx_harness rungs_test parity model_layers)
+    target_link_options(${t} PRIVATE /DELAYLOAD:vulkan-1.dll)
+    target_link_libraries(${t} delayimp)
+endforeach()
 set(NFRUX_AGILITY "" CACHE STRING "Agility SDK number (620): ngx_harness then uses .\\D3D12\\D3D12Core.dll and its debug layers")
 if(NFRUX_AGILITY)
     target_compile_definitions(ngx_harness PRIVATE NFRUX_AGILITY=${NFRUX_AGILITY})
