@@ -229,15 +229,22 @@ vkCreateDevice: Vulkan uses the floor, A4 claims only that, and the ladder text 
 M0d result (RESULTS): SM 6.9 cooperative vectors are in neither the inbox runtime (SM 6.8) nor the retail SDK; DirectML's integer convolution is
 exact but slower than dot4. Neither is a rung.
 
-CUDA: `core/ml/cuda_network.cpp` writes PTX (sm_75, `mma.sync` m8n8k16 s8, one kernel a layer). Nothing is precompiled: the user's own driver links it for
-the GPU it is, on the worker thread, with a short-lived context matched by LUID (checked: the same PTX links for sm_75, 80, 86, 89, 90, 100 and 120). m8n8k16 is as
-fast here as sm_80's m16n8k16, so there is one form. GTX 16 (and T400 to T1200, MX450) reports sm_75 without tensor cores and is told apart by name, whole words (a word that begins with RTX, or is exactly T4 or T4G; a table test in `ml_conformance_d3d12`); GTX 10 and 16 use dot4, the
+CUDA: `core/ml/cuda_network.cpp` writes PTX (`mma.sync` s8, one kernel a layer). Nothing is precompiled: the user's own driver links it for
+the GPU it is, on the worker thread, with a short-lived context matched by LUID (checked: the same PTX links for sm_75, 80, 86, 89, 90, 100 and 120). GTX 16 (and T400 to T1200, MX450) reports sm_75 without tensor cores and is told apart by name, whole words (a word that begins with RTX, or is exactly T4 or T4G; a table test in `ml_conformance_d3d12`); GTX 10 and 16 use dot4, the
 same hardware instruction CUDA would. Cubins are kept in memory only. NVAPI `CreateCuModule`, `CreateCuFunction`, `LaunchCuKernelChain` by public interface id
-launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS. Layer class of this rung (else it fails creation): square kernel up to 7, equal strides, dilation 1, weight zero point 0, single-rounding 32-bit rescale with shifts 2-62, up to 64 output channels, two sources only without resize. Layout: a warp computes 8 output pixels by 8 channels per mma tile; a layer of 20,000 output pixels or more gives a warp 2 such columns by up to 8 channel tiles, a smaller one (the low-resolution end of the U-Net) 1 by 1, so it has 8x the warps to fill the GPU (5-8% faster overall on the RTX 4070, 46 SMs; the threshold is not scaled by SM count; exact either way, RESULTS).
+launch it. UAV barriers between launches, inputs in UNORDERED_ACCESS. Layer class of this rung (else it fails creation): square kernel up to 7, equal strides, dilation 1, weight zero point 0, single-rounding 32-bit rescale with shifts 2-62, up to 64 output channels, two sources only without resize.
+Two kernel variants, the same bytes: the rung timing (above) times both beside the other rungs and caches the faster as `cuda` (variant 0) or `cuda/1`; without a
+timed choice variant 0 (`NFRUX_TEST_CUDA_VARIANT` in tests); a cached variant this build does not have goes back to the plan.
+Variant 0, tiled: a block of 4 warps stages its input tile (the zero point outside the image) and the weights of up to 16 output channels in shared memory (48 KB at most,
+else creation fails), then each warp computes 1-4 rows x 2-4 groups of 8 pixels for those channels: m8n8k16 on sm_75, from sm_80 m16n8k32 (two pixel groups by two taps or
+channel chunks; an odd last step has zero weights). Shifts of 33 or more are rescaled from the product's high word alone, (hi + 2^(s-33)) >> (s-32), exact since the low word
+is below one step. Tile shapes were chosen on the RTX 4070 (16 x 16 pixels for layers of 100k pixels or more, 4 x 32 at stride 2 and for 1 x 1 kernels, else 8 x 32).
+Variant 1, rows (the kernels before 2026-11-27): m8n8k16 on every GPU, read from global memory; a warp computes 8 output pixels by 8 channels per mma tile; a layer of 20,000 output pixels or more gives a warp 2 such columns by up to 8 channel tiles, a smaller one (the low-resolution end of the U-Net) 1 by 1, so it has 8x the warps to fill the GPU (5-8% faster overall on the RTX 4070, 46 SMs; the threshold is not scaled by SM count; exact either way, RESULTS).
+Both launch a batch's networks (up to 8, the timesteps) as one grid a layer: z is network x channel-tile group, and each network's sources and output are kernel parameters.
 
 On Vulkan the same kernels are launched by vkCmdCuLaunchKernelNVX (`core/ml/cuda_vulkan.cpp`): buffers by address, a full memory barrier where a layer reads what the last wrote. The loader enables the extension and
 bufferDeviceAddress; Streamline enables the extension itself, so on the OptiScaler route its presence is asked (the function's address) and buffer addresses are assumed with it. Same marker and self-check. A batch's networks run a
-layer at a time on both APIs (independent launches between barriers).
+layer at a time on both APIs, one launch a layer for up to 8 networks.
 
 AMD and Intel matrix hardware is reached through Vulkan cooperative matrices (behind a crash marker of their own off NVIDIA, since untested there: refused, dot4; tested on the RTX 4070 by forcing it, `NFRUX_TEST_MAT_MARKER`): any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
 the size can be required, else the driver's own. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to

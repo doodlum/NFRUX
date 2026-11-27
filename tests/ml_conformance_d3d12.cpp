@@ -55,10 +55,68 @@ int main(int argc, char** argv)
     dev->CreateQueryHeap(&qh, IID_PPV_ARGS(&heap));
 
     const auto b = nfrux::GetModelBindings();
+    if (argc > 1 && !strcmp(argv[1], "layers"))  // CUDA GPU time by layer (timestamps between layers), 1 and 5 networks interleaved
+    {
+        const uint32_t w = argc > 2 ? atoi(argv[2]) : 992, h = argc > 3 ? atoi(argv[3]) : 544;
+        static ComPtr<ID3D12QueryHeap> lh;
+        D3D12_QUERY_HEAP_DESC lq = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 64};
+        dev->CreateQueryHeap(&lq, IID_PPV_ARGS(&lh));
+        nfrux::CudaGraph::s_afterLayer = [](ID3D12GraphicsCommandList* l, size_t i) {
+            D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV};
+            l->ResourceBarrier(1, &u);
+            l->EndQuery(lh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, UINT(i + 1));
+        };
+        std::string err;
+        std::unique_ptr<nfrux::CudaGraph> gs[5];
+        for (auto& g : gs) if (!(g = nfrux::CudaGraph::Create(dev.Get(), nfrux::DescribeModel(w, h), &err, argc > 4 ? atoi(argv[4]) : 0))) return printf("CUDA: %s\n", err.c_str()), 1;
+        const uint64_t inSize = uint64_t(w) * h * nfrux::kInputChannels, outSize = uint64_t(w / 2) * (h / 2) * 4;
+        ComPtr<ID3D12Resource> in[5];  // separate inputs, as the timesteps have
+        for (auto& x : in) x = Buf(dev.Get(), inSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        auto rb = Buf(dev.Get(), 64 * 8, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComPtr<ID3D12Resource> o[10];
+        for (auto& x : o) x = Buf(dev.Get(), outSize, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        uint64_t f;
+        q->GetTimestampFrequency(&f);
+        for (uint32_t count : {1u, 5u})
+        {
+            nfrux::CudaGraph* cg[5];
+            D3D12_GPU_VIRTUAL_ADDRESS ins[5];
+            ID3D12Resource* outs[5][2];
+            ID3D12Resource* const* op[5];
+            for (int i = 0; i < 5; ++i) cg[i] = gs[i].get(), ins[i] = in[i]->GetGPUVirtualAddress(), outs[i][0] = o[2 * i].Get(), outs[i][1] = o[2 * i + 1].Get(), op[i] = outs[i];
+            const size_t n = gs[0] ? 22 : 0;
+            std::vector<std::vector<double>> t(n + 1);
+            for (int rep = 0; rep < 200; ++rep)
+            {
+                al->Reset(); cl->Reset(al.Get(), nullptr);
+                for (int k = 0; k < 4; ++k)  // the last one's stamps are kept
+                {
+                    if (k == 3) { D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV}; cl->ResourceBarrier(1, &u); cl->EndQuery(lh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0); }
+                    nfrux::CudaGraph::Record(cl.Get(), cg, ins, op, count, w / 2 * 4);
+                }
+                cl->ResolveQueryData(lh.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, UINT(n + 1), rb.Get(), 0);
+                run();
+                uint64_t* s; rb->Map(0, nullptr, reinterpret_cast<void**>(&s));
+                if (rep >= 20) for (size_t i = 0; i < n; ++i) t[i].push_back(double(s[i + 1] - s[i]) * 1000 / double(f));
+                rb->Unmap(0, nullptr);
+            }
+            double total = 0;
+            printf("%ux%u, %u network(s), ms (median of 180, a barrier before each stamp):\n", w, h, count);
+            for (size_t i = 0; i < n; ++i)
+            {
+                std::sort(t[i].begin(), t[i].end());
+                total += t[i][t[i].size() / 2];
+                printf("  layer %2zu %.4f\n", i, t[i][t[i].size() / 2]);
+            }
+            printf("  sum %.4f\n", total);
+        }
+        nfrux::CudaGraph::s_afterLayer = nullptr;
+        return 0;
+    }
     int bad = 0;
     const uint32_t sizes[][2] = {{64, 64}, {744, 464}, {960, 544}};
     for (auto& wh : sizes)
-        for (int dot4 = 2; dot4 >= 0; --dot4)  // 2: CUDA
+        for (int dot4 = 2 + nfrux::kCudaVariants - 1; dot4 >= 0; --dot4)  // 2 and up: CUDA, variant dot4 - 2
         {
             const uint32_t w = wh[0], h = wh[1];
             const int before = bad;
@@ -67,7 +125,7 @@ int main(int argc, char** argv)
             std::unique_ptr<nfrux::D3D12Graph> g;
             std::unique_ptr<nfrux::CudaGraph> cu;
             const ULONGLONG t0 = GetTickCount64();
-            if (dot4 == 2) { if (!(cu = nfrux::CudaGraph::Create(dev.Get(), desc, &err))) { printf("%ux%u CUDA: not available: %s\n", w, h, err.c_str()); continue; } printf("CUDA created in %llu ms\n", GetTickCount64() - t0); }
+            if (dot4 >= 2) { if (!(cu = nfrux::CudaGraph::Create(dev.Get(), desc, &err, dot4 - 2))) { printf("%ux%u CUDA: not available: %s\n", w, h, err.c_str()); continue; } printf("CUDA created in %llu ms\n", GetTickCount64() - t0); }
             else g = nfrux::D3D12Graph::Create(dev.Get(), desc, dot4 != 0, &err);
             if (!g && !cu) { printf("%ux%u dot4=%d: create failed: %s\n", w, h, dot4, err.c_str()); return 1; }
             const uint64_t inSize = uint64_t(w) * h * nfrux::kInputChannels, outSize = uint64_t(w / 2) * (h / 2) * 4;
@@ -129,7 +187,7 @@ int main(int argc, char** argv)
                 rb->Unmap(0, nullptr);
             }
             std::sort(ms.begin(), ms.end());
-            printf("%ux%u %s: %d cases, %s, median %.3f ms\n", w, h, dot4 == 2 ? "CUDA tensor cores" : dot4 ? "dot4" : "int32", cases, timing ? "timed" : bad > before ? "DIFFERENCES" : "exact", ms[ms.size() / 2]);
+            printf("%ux%u %s: %d cases, %s, median %.3f ms\n", w, h, dot4 == 3 ? "CUDA rows" : dot4 == 2 ? "CUDA tiled" : dot4 ? "dot4" : "int32", cases, timing ? "timed" : bad > before ? "DIFFERENCES" : "exact", ms[ms.size() / 2]);
         }
     uint64_t msgs = iq ? iq->GetNumStoredMessages() : 0;
     for (uint64_t i = 0; i < msgs && i < 8; ++i)

@@ -22,7 +22,7 @@ class CudaVulkanGraph
 {
 public:
     static bool Supported(VkDevice device, PFN_vkGetDeviceProcAddr gdpa);
-    static std::unique_ptr<CudaVulkanGraph> Create(const ffx_ml::DeviceContext& dc, const ffx_ml::GraphDesc& desc, std::string* error);
+    static std::unique_ptr<CudaVulkanGraph> Create(const ffx_ml::DeviceContext& dc, const ffx_ml::GraphDesc& desc, std::string* error, int variant = 0);
     ~CudaVulkanGraph();
     struct Buffer { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceMemory memory = VK_NULL_HANDLE; uint64_t address = 0; void* map = nullptr; };
     Buffer   MakeBuffer(uint64_t size, bool upload);

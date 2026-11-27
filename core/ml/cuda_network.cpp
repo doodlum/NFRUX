@@ -181,9 +181,28 @@ void NearestPtx(Writer& w, const char* dst, const char* v, int n, int d, int off
     w("setp.ge.s32 %%pt, %%t3, %d;", n);
     w("selp.b32 %s, %%t4, %%t2, %%pt;", dst);
 }
+// A layer's entry: weights, layer constants, the output pitch, then for each network of the launch (grid z: network x zt) its
+// two sources and output. Sets %a1, %a2 (sources), %a3 (weights), %a4 (constants), %a5 (output), %r50 (pitch), %r40 (z within the network).
+std::string EntryPtx(uint32_t index, int shared)
+{
+    char h[320];
+    snprintf(h, sizeof(h), ".visible .entry layer%u(.param .u64 pw, .param .u64 pp, .param .u32 pitch, .param .align 8 .b8 io[%d])\n{\n", index, kCudaBatch * 24);
+    std::string s = h;
+    if (shared) snprintf(h, sizeof(h), "    .shared .align 16 .b8 s[%d];\n", shared), s += h;
+    return s;
+}
+void ParamsPtx(Writer& w, int zt)
+{
+    w(".reg .u64 %%io<2>; .reg .u32 %%nz<2>;");
+    w("mov.u32 %%nz0, %%ctaid.z; div.u32 %%nz1, %%nz0, %d; mul.lo.u32 %%r40, %%nz1, %d; sub.u32 %%r40, %%nz0, %%r40;", zt, zt);
+    w("mov.u64 %%io0, io; mul.wide.u32 %%io1, %%nz1, 24; add.u64 %%io0, %%io0, %%io1;");
+    w("ld.param.u64 %%a1, [%%io0]; ld.param.u64 %%a2, [%%io0 + 8]; ld.param.u64 %%a5, [%%io0 + 16]; ld.param.u64 %%a3, [pw]; ld.param.u64 %%a4, [pp]; ld.param.u32 %%r50, [pitch];");
+}
 }  // namespace
 
-static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const ffx_ml::LoweredGraph& g, bool external, int cols, int ns)
+// The previous kernels (variant 1, timed against the tiled ones at the first start): a warp computes cols x 8 output pixels of a row,
+// ns channel tiles, reading its inputs and weights from global memory.
+static std::string RowPtx(uint32_t index, const ffx_ml::FusedConv& fc, const ffx_ml::LoweredGraph& g, bool external, int cols, int ns, int zt)
 {
     const auto& c  = *fc.conv;
     const auto& r  = *fc.rescale;
@@ -193,12 +212,10 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
     const int   chunks = (icw + 3) / 4, oc = fc.outC, nt = (oc + 7) / 8, stride = c.stride[0], k = c.kernelH;
     const int   ocPad = (oc + 3) & ~3, outStride = g.tensors[fc.output].channelStride;
     Writer w;
-    char   h[256];
-    snprintf(h, sizeof(h), ".visible .entry layer%u(.param .u64 p0, .param .u64 p1, .param .u64 p2, .param .u64 p3, .param .u64 p4, .param .u32 p5)\n{\n", index);
-    std::string head = h;
+    std::string head = EntryPtx(index, 0);
     w(".reg .u64 %%a<64>; .reg .u32 %%r<64>; .reg .s32 %%t<8>; .reg .s32 %%x<32>; .reg .s32 %%acc<64>; .reg .u32 %%f<8>; .reg .pred %%p<32>; .reg .pred %%pi<32>; .reg .pred %%pv<4>; .reg .pred %%po<4>; .reg .u64 %%ah<4>; .reg .u64 %%aj<4>; .reg .u64 %%ak<4>; .reg .u64 %%ao<4>; .reg .u32 %%fi<4>; .reg .s32 %%xo<4>; .reg .pred %%pt; .reg .s64 %%l<16>; .reg .s32 %%q<32>;");
-    w("ld.param.u64 %%a1, [p0]; ld.param.u64 %%a2, [p1]; ld.param.u64 %%a3, [p2]; ld.param.u64 %%a4, [p3]; ld.param.u64 %%a5, [p4]; ld.param.u32 %%r50, [p5];");
-    w("mov.u32 %%r1, %%tid.x; mov.u32 %%r2, %%ctaid.x; mov.u32 %%r3, %%ctaid.y; mov.u32 %%r40, %%ctaid.z;");
+    ParamsPtx(w, zt);
+    w("mov.u32 %%r1, %%tid.x; mov.u32 %%r2, %%ctaid.x; mov.u32 %%r3, %%ctaid.y;");
     w("shr.u32 %%r4, %%r1, 5; mad.lo.u32 %%r5, %%r2, 4, %%r4; mul.lo.u32 %%r5, %%r5, %d;", cols * 8);         // first output column of this warp
     w("setp.ge.u32 %%p1, %%r5, %d; setp.ge.u32 %%p2, %%r3, %d; or.pred %%p1, %%p1, %%p2;", fc.outW, fc.outH);
     w("@%%p1 ret;");
@@ -291,7 +308,140 @@ static std::string LayerPtx(uint32_t index, const ffx_ml::FusedConv& fc, const f
     return head + w.s + "}\n";
 }
 
-bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::string* error)
+// Variant 0, one layer: a block of 4 warps stages its input tile (the zero point outside the image; sources side by side, words a pixel as stored) and
+// NT channel tiles' weights in shared memory, then each warp computes R rows x P groups of 8 output pixels by 8 x 8 x 16 products.
+static std::string TiledPtx(uint32_t index, const ffx_ml::FusedConv& fc, const ffx_ml::LoweredGraph& g, bool external, const int R, const int P, const int NT, const bool k32, const int zt)
+{
+    const auto& c = *fc.conv;
+    const auto& r = *fc.rescale;
+    const int   S = c.stride[0], k = c.kernelH, taps = k * k, oc = fc.outC, ocPad = (oc + 3) & ~3, outStride = g.tensors[fc.output].channelStride;
+    int         icw[2] = {}, words = 0;
+    for (size_t s = 0; s < fc.sources.size(); ++s) words += icw[s] = g.tensors[fc.sources[s].tensor].channelStride / 4;
+    const int chunks = (words + 3) / 4, PB = words * 4, TH = 4 * R, TW = 8 * P, IH = (TH - 1) * S + k, IW = (TW - 1) * S + k, F = R * P;
+    const int inBytes = (IH * IW * PB + 16 + 15) & ~15, wBytes = NT * taps * chunks * 128;  // a fragment reads whole chunks: up to 12 bytes past the last pixel
+    if (inBytes + wBytes > 48 * 1024) return {};  // static shared memory
+    Writer    w;
+    std::string head = EntryPtx(index, inBytes + wBytes);
+    w(".reg .u64 %%a<16>; .reg .u32 %%r<64>; .reg .s32 %%t<8>; .reg .s32 %%x<16>; .reg .s32 %%acc<128>; .reg .u32 %%v<4>; .reg .u32 %%fa<32>; .reg .u32 %%fb<16>; .reg .pred %%p<8>; .reg .pred %%pt;");
+    w(".reg .s64 %%l<4>; .reg .s32 %%bi<16>; .reg .s32 %%mu<16>; .reg .u32 %%sh<16>; .reg .s64 %%rn<16>;");
+    ParamsPtx(w, zt);
+    w("mov.u32 %%r1, %%tid.x; mov.u32 %%r2, %%ctaid.x; mov.u32 %%r3, %%ctaid.y; mov.u32 %%r60, s;");
+    w("mul.lo.u32 %%r20, %%r2, %d; mul.lo.u32 %%r21, %%r3, %d;", TW, TH);  // the tile's first output column and row
+    w("mad.lo.s32 %%r22, %%r20, %d, %d; mad.lo.s32 %%r23, %%r21, %d, %d;", S, -c.pad[2], S, -c.pad[0]);  // its first input column and row
+    const uint32_t zp = uint32_t(c.inputZp & 0xff) * 0x01010101u;
+    for (size_t si = 0; si < fc.sources.size(); ++si)
+    {
+        const auto& src = fc.sources[si];
+        const auto& t = g.tensors[src.tensor];
+        const bool  vec = icw[si] % 4 == 0;
+        const int   ub = vec ? 16 : 4, U = icw[si] * 4 / ub, n = IH * IW;
+        for (int it = 0; it * 128 < n; ++it)
+        {
+            w("add.u32 %%r5, %%r1, %d; setp.lt.u32 %%p1, %%r5, %d;", it * 128, n);  // tile pixel
+            w("div.u32 %%r7, %%r5, %d; mul.lo.u32 %%r8, %%r7, %d; sub.u32 %%r8, %%r5, %%r8;", IW, IW);  // tile row, column
+            w("add.s32 %%x1, %%r7, %%r23; add.s32 %%x2, %%r8, %%r22;");
+            w("setp.ge.s32 %%p2, %%x1, 0; setp.lt.s32 %%p3, %%x1, %d; and.pred %%p2, %%p2, %%p3; setp.ge.s32 %%p3, %%x2, 0; and.pred %%p2, %%p2, %%p3; setp.lt.s32 %%p3, %%x2, %d; and.pred %%p2, %%p2, %%p3;",
+              fc.inH, fc.inW);
+            w("max.s32 %%x1, %%x1, 0; min.s32 %%x1, %%x1, %d; max.s32 %%x2, %%x2, 0; min.s32 %%x2, %%x2, %d;", fc.inH - 1, fc.inW - 1);
+            if (src.resize)
+            {
+                NearestPtx(w, "%x3", "%x1", src.scale[0], src.scale[1], src.offset[0], t.h), w("mov.s32 %%x1, %%x3;");
+                NearestPtx(w, "%x3", "%x2", src.scale[2], src.scale[3], src.offset[1], t.w), w("mov.s32 %%x2, %%x3;");
+            }
+            w("mad.lo.s32 %%x3, %%x1, %d, %%x2; mul.wide.s32 %%a6, %%x3, %d; add.u64 %%a6, %%a%d, %%a6;", t.w, icw[si] * 4, si ? 2 : 1);
+            w("mad.lo.u32 %%r9, %%r5, %d, %%r60; and.pred %%p2, %%p2, %%p1;", PB);
+            for (int u = 0; u < U; ++u)
+            {
+                const int o = (si ? icw[0] * 4 : 0) + u * ub;
+                if (vec)
+                {
+                    w("mov.b32 %%v0, 0x%08x; mov.b32 %%v1, 0x%08x; mov.b32 %%v2, 0x%08x; mov.b32 %%v3, 0x%08x;", zp, zp, zp, zp);
+                    w("@%%p2 ld.global.v4.u32 {%%v0, %%v1, %%v2, %%v3}, [%%a6 + %d]; @%%p1 st.shared.v4.u32 [%%r9 + %d], {%%v0, %%v1, %%v2, %%v3};", u * ub, o);
+                }
+                else w("mov.b32 %%v0, 0x%08x; @%%p2 ld.global.u32 %%v0, [%%a6 + %d]; @%%p1 st.shared.u32 [%%r9 + %d], %%v0;", zp, u * ub, o);
+            }
+        }
+    }
+    // This block's channel tiles of the weights, ((tile * taps + tap) * chunks + chunk) * 128 bytes, 8 output channels x 16 input channels.
+    const int wTotal = (oc + 7) / 8 * taps * chunks * 8, wv = wBytes / 16;
+    w("mul.lo.u32 %%r10, %%r40, %d;", wv);
+    for (int it = 0; it * 128 < wv; ++it)
+    {
+        w("add.u32 %%r4, %%r1, %d; add.u32 %%r5, %%r4, %%r10; setp.lt.u32 %%p1, %%r4, %d; setp.lt.u32 %%p2, %%r5, %d; and.pred %%p2, %%p2, %%p1;", it * 128, wv, wTotal);
+        w("mul.wide.u32 %%a6, %%r5, 16; add.u64 %%a6, %%a3, %%a6; @%%p2 ld.global.v4.u32 {%%v0, %%v1, %%v2, %%v3}, [%%a6];");
+        w("mad.lo.u32 %%r9, %%r4, 16, %%r60; @%%p2 st.shared.v4.u32 [%%r9 + %d], {%%v0, %%v1, %%v2, %%v3};", inBytes);
+    }
+    w("bar.sync 0;");
+    w("shr.u32 %%r11, %%r1, 5; and.b32 %%r12, %%r1, 31; shr.u32 %%r13, %%r12, 2; and.b32 %%r14, %%r12, 3;");  // warp, fragment row, fragment column
+    w("mul.lo.u32 %%r15, %%r11, %d; mad.lo.u32 %%r15, %%r13, %d, %%r15; mul.lo.u32 %%r15, %%r15, %d; mad.lo.u32 %%r15, %%r14, 4, %%r15; add.u32 %%r15, %%r15, %%r60;", R * S * IW, S, PB);  // A
+    w("mad.lo.u32 %%r16, %%r13, 16, %%r60; mad.lo.u32 %%r16, %%r14, 4, %%r16;");  // B
+    for (int i = 0; i < F * NT * 2; ++i) w("mov.s32 %%acc%d, 0;", i);
+    // K steps (tap, chunk); from sm_80 two at a time with two pixel groups (16 x 8 x 32 products), a missing second step with zero weights.
+    const int steps = taps * chunks, ks = k32 ? 2 : 1;
+    for (int s0 = 0; s0 < steps; s0 += ks)
+    {
+        for (int j = 0; j < ks; ++j)
+        {
+            const int st = std::min(s0 + j, steps - 1), tap = st / chunks, ch = st % chunks, ky = tap / k, kx = tap % k;
+            for (int f = 0; f < F; ++f) w("ld.shared.u32 %%fa%d, [%%r15 + %d];", f + j * F, ((f / P * S + ky) * IW + f % P * 8 * S + kx) * PB + ch * 16);
+            for (int n = 0; n < NT; ++n)
+                if (s0 + j < steps) w("ld.shared.u32 %%fb%d, [%%r16 + %d];", n + j * NT, inBytes + ((n * taps + tap) * chunks + ch) * 128);
+                else w("mov.b32 %%fb%d, 0;", n + j * NT);
+        }
+        for (int f = 0; f < F; f += ks)
+            for (int n = 0; n < NT; ++n)
+            {
+                const int a = (f * NT + n) * 2, b = ((f + 1) * NT + n) * 2;
+                if (k32)
+                    w("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d, %%acc%d, %%acc%d}, {%%fa%d, %%fa%d, %%fa%d, %%fa%d}, {%%fb%d, %%fb%d}, {%%acc%d, %%acc%d, %%acc%d, %%acc%d};", a, a + 1, b,
+                      b + 1, f, f + 1, f + F, f + 1 + F, n, n + NT, a, a + 1, b, b + 1);
+                else w("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%%acc%d, %%acc%d}, {%%fa%d}, {%%fb%d}, {%%acc%d, %%acc%d};", a, a + 1, f, n, a, a + 1);
+            }
+    }
+    // Each lane: channels 8 n + 2 column and + 1 of its pixel (fragment row) in every fragment. Shifts of 33 or more: from the high word
+    // of the product alone, exactly ((x m + 2^(s-1)) >> s = (hi + 2^(s-33)) >> (s-32), the low word is below one step).
+    bool high = true;
+    for (int32_t s : r.shift) high = high && s >= 33;
+    w(".reg .s32 %%ro<16>;");
+    w("mul.lo.u32 %%r17, %%r40, %d; mad.lo.u32 %%r17, %%r14, 2, %%r17;", NT * 8);  // the lane's first channel
+    for (int n = 0; n < NT; ++n)
+        for (int e = 0; e < 2; ++e)
+        {
+            const int q = n * 2 + e;
+            w("add.u32 %%r18, %%r17, %d; min.u32 %%r18, %%r18, %d; mul.wide.u32 %%a7, %%r18, 4; add.u64 %%a7, %%a4, %%a7;", n * 8 + e, oc - 1);
+            w("ld.global.s32 %%bi%d, [%%a7];", q);
+            if (r.perChannel) w("ld.global.s32 %%mu%d, [%%a7 + %d]; ld.global.u32 %%sh%d, [%%a7 + %d];", q, ocPad * 4, q, ocPad * 8);
+            else w("ld.global.s32 %%mu%d, [%%a4 + %d]; ld.global.u32 %%sh%d, [%%a4 + %d];", q, ocPad * 4, q, ocPad * 8);
+            if (high) w("sub.u32 %%sh%d, %%sh%d, 32; sub.u32 %%r18, %%sh%d, 1; shl.b32 %%ro%d, 1, %%r18;", q, q, q, q);  // the rounding term's high word
+            else w("sub.u32 %%r18, %%sh%d, 1; mov.s64 %%rn%d, 1; shl.b64 %%rn%d, %%rn%d, %%r18;", q, q, q, q);
+        }
+    w("mad.lo.u32 %%r19, %%r11, %d, %%r21; add.u32 %%r24, %%r20, %%r13;", R);  // the warp's first row, the lane's first column
+    for (int f = 0; f < F; ++f)
+    {
+        w("add.u32 %%r25, %%r19, %d; add.u32 %%r26, %%r24, %d;", f / P, f % P * 8);  // y, x
+        w("setp.lt.u32 %%p4, %%r25, %d; setp.lt.u32 %%p5, %%r26, %d; and.pred %%p4, %%p4, %%p5;", fc.outH, fc.outW);
+        if (external) w("mul.wide.u32 %%a8, %%r25, %%r50;");
+        else w("mul.wide.u32 %%a8, %%r25, %d;", fc.outW * outStride);
+        w("mul.wide.u32 %%a9, %%r26, %d; add.u64 %%a8, %%a8, %%a9; add.u64 %%a8, %%a5, %%a8; cvt.u64.u32 %%a9, %%r17; add.u64 %%a8, %%a8, %%a9;", outStride);
+        for (int n = 0; n < NT; ++n)
+            for (int e = 0; e < 2; ++e)
+            {
+                const int q = n * 2 + e;
+                const int a = (f * NT + n) * 2 + e, v = 13 + e;
+                if (high) w("add.s32 %%x12, %%acc%d, %%bi%d; mul.hi.s32 %%x%d, %%x12, %%mu%d; add.s32 %%x%d, %%x%d, %%ro%d; shr.s32 %%x%d, %%x%d, %%sh%d;", a, q, v, q, v, v, q, v, v, q);
+                else w("add.s32 %%x12, %%acc%d, %%bi%d; mul.wide.s32 %%l2, %%x12, %%mu%d; add.s64 %%l2, %%l2, %%rn%d; shr.s64 %%l2, %%l2, %%sh%d; cvt.s32.s64 %%x%d, %%l2;", a, q, q, q, q, v);
+                w("add.s32 %%x%d, %%x%d, %d; max.s32 %%x%d, %%x%d, -128; min.s32 %%x%d, %%x%d, 127;", v, v, r.rescaleOutZp, v, v, v, v);
+                if (fc.table) w("add.s32 %%x%d, %%x%d, 128; cvt.u64.s32 %%a10, %%x%d; add.u64 %%a10, %%a4, %%a10; ld.global.s8 %%x%d, [%%a10 + %d];", v, v, v, v, ocPad * 12);
+                if (oc % 2 == 0 && e == 0) continue;
+                if (oc % 2) w("add.u32 %%r27, %%r17, %d; setp.lt.u32 %%p6, %%r27, %d; and.pred %%p6, %%p6, %%p4; @%%p6 st.global.u8 [%%a8 + %d], %%x%d;", n * 8 + e, oc, n * 8 + e, v);
+                else w("prmt.b32 %%x13, %%x13, %%x14, 0x40; add.u32 %%r27, %%r17, %d; setp.lt.u32 %%p6, %%r27, %d; and.pred %%p6, %%p6, %%p4; @%%p6 st.global.u16 [%%a8 + %d], %%x13;", n * 8, oc, n * 8);  // both channels
+            }
+    }
+    w("ret;");
+    return head + w.s + "}\n";
+}
+
+bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, int variant, CudaPlan& out, std::string* error)
 {
     auto fail = [&](const std::string& m) { if (error) *error = m; return false; };
     if (!Nv().cuda) return fail("no nvcuda.dll");
@@ -313,8 +463,10 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
         slot[i] = std::find(parsed.inputBindings.begin(), parsed.inputBindings.end(), t.binding) != parsed.inputBindings.end() ? -1 : -2 - int32_t(it - parsed.outputBindings.begin());
     }
     // Without tensor cores (GTX) dot4 uses the same hardware as CUDA would.
-    if (!ComputeCapability(luid, error)) return false;
-    std::string           ptx = ".version 7.1\n.target sm_75\n.address_size 64\n";
+    const int sm = ComputeCapability(luid, error);
+    if (!sm) return false;
+    const bool  tiled = variant == 0, k32 = tiled && sm >= 80;  // 16 x 8 x 32 products from sm_80 (RTX 30)
+    std::string ptx = k32 ? ".version 7.1\n.target sm_80\n.address_size 64\n" : ".version 7.1\n.target sm_75\n.address_size 64\n";
     std::vector<uint8_t>& constants = out.constants;
     for (size_t li = 0; li < g.convs.size(); ++li)
     {
@@ -332,12 +484,18 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
         if (!ok) return fail("unsupported layer " + std::to_string(li));
         CudaPlan::Layer l;
         l.dst = slot[fc.output], l.external = l.dst < -1;
-        // A layer of fewer than 20k pixels (the low-resolution end of the U-Net) is too small to fill the GPU with 2 columns x 8
-        // channel tiles per warp: 1 x 1 there gives 8x the warps. Measured 5-8% faster overall on an RTX 40, exact either way.
+        // Tiled, two channel tiles a block: 16 x 16 pixels at 100k pixels or more, 4 x 32 at stride 2 and for 1 x 1 kernels, else 8 x 32
+        // (chosen on an RTX 4070). Rows: a layer of fewer than 20k pixels (the low-resolution end of the U-Net) is too small to fill the
+        // GPU with 2 columns x 8 channel tiles per warp: 1 x 1 there gives 8x the warps.
+        const bool big = fc.outW * fc.outH >= 100000 && c.stride[0] == 1 && c.kernelH > 1;
+        int        nt = (fc.outC + 7) / 8, NT = std::min(nt, 2), R = big ? 4 : c.stride[0] == 2 || c.kernelH == 1 ? 1 : 2, P = big ? 2 : 4;
         const bool narrow = fc.outW * fc.outH < 20000;
-        const int  lc = narrow ? 1 : 2, ln = std::min(narrow ? 1 : 8, (fc.outC + 7) / 8);
-        ptx += LayerPtx(uint32_t(li), fc, g, l.external, lc, ln);
-        const int chunks = (ic0 + ic1 + 3) / 4, nt = (fc.outC + 7) / 8, taps = c.kernelH * c.kernelW, ic = fc.inC, pad = (fc.outC + 3) & ~3;
+        const int  lc = narrow ? 1 : 2, ln = std::min(narrow ? 1 : 8, nt);
+        const int  zt = tiled ? (nt + NT - 1) / NT : (nt + ln - 1) / ln;  // grid z of one network
+        const std::string kernel = tiled ? TiledPtx(uint32_t(li), fc, g, l.external, R, P, NT, k32, zt) : RowPtx(uint32_t(li), fc, g, l.external, lc, ln, zt);
+        if (kernel.empty()) return fail("unsupported layer " + std::to_string(li) + " (shared memory)");
+        ptx += kernel;
+        const int chunks = (ic0 + ic1 + 3) / 4, taps = c.kernelH * c.kernelW, ic = fc.inC, pad = (fc.outC + 3) & ~3;
         auto align = [&] { constants.resize((constants.size() + 255) & ~size_t(255)); };
         align();
         l.weights = constants.size();
@@ -360,19 +518,21 @@ bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::
         if (fc.table) memcpy(&p[3 * pad], fc.table->table.data(), 256);
         constants.insert(constants.end(), reinterpret_cast<uint8_t*>(p.data()), reinterpret_cast<uint8_t*>(p.data() + p.size()));
         l.src[0] = slot[s0.tensor], l.src[1] = two ? slot[fc.sources[1].tensor] : l.src[0];
-        l.grid[0] = uint32_t(fc.outW + lc * 32 - 1) / (lc * 32), l.grid[1] = uint32_t(fc.outH), l.grid[2] = uint32_t(((fc.outC + 7) / 8 + ln - 1) / ln);
+        if (tiled) l.grid[0] = uint32_t(fc.outW + P * 8 - 1) / (P * 8), l.grid[1] = uint32_t(fc.outH + R * 4 - 1) / (R * 4);
+        else l.grid[0] = uint32_t(fc.outW + lc * 32 - 1) / (lc * 32), l.grid[1] = uint32_t(fc.outH);
+        l.grid[2] = uint32_t(zt);
         out.layers.push_back(l);
     }
     out.cubin = Cubin(ptx, luid, error);
     return !out.cubin.empty();
 }
 
-std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error)
+std::unique_ptr<CudaGraph> CudaGraph::Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error, int variant)
 {
     auto fail = [&](const std::string& m) -> std::unique_ptr<CudaGraph> { if (error) *error = m; return nullptr; };
     if (!Nv().ok) return fail("no NVAPI CUDA launch");
     CudaPlan plan;
-    if (!MakeCudaPlan(desc, device->GetAdapterLuid(), plan, error)) return nullptr;
+    if (!MakeCudaPlan(desc, device->GetAdapterLuid(), variant, plan, error)) return nullptr;
     auto out = std::unique_ptr<CudaGraph>(new CudaGraph());
     out->m_device = device;
     out->m_outputBindings = plan.outputBindings;
@@ -431,11 +591,10 @@ void CudaGraph::Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs
     }
     list->ResourceBarrier(UINT(b.size()), b.data());
     std::vector<bool> dirty(graphs[0]->m_tensors.size(), false);
-#pragma pack(push, 4)
-    struct Params { uint64_t s0, s1, w, p, d; uint32_t row; };
-#pragma pack(pop)
-    std::vector<Params> params(count);
-    std::vector<Launch> launches(count);
+    // The networks of a batch are one model: graph 0's constants for all.
+    const uint32_t        batches = (count + kCudaBatch - 1) / kCudaBatch;
+    std::vector<CudaParams> params(batches);
+    std::vector<Launch>     launches(batches);
     for (size_t li = 0; li < graphs[0]->m_layers.size(); ++li)
     {
         b.clear();
@@ -452,18 +611,24 @@ void CudaGraph::Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs
                 }
             }
         if (!b.empty()) list->ResourceBarrier(UINT(b.size()), b.data());
-        for (uint32_t i = 0; i < count; ++i)
+        const uint64_t base = graphs[0]->m_constants->GetGPUVirtualAddress();
+        for (uint32_t j = 0; j < batches; ++j)
         {
-            CudaGraph& g = *graphs[i];
-            const Layer& l = g.m_layers[li];
-            const uint64_t base = g.m_constants->GetGPUVirtualAddress();
-            auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? inputs[i] : outputs[i][-2 - t]->GetGPUVirtualAddress(); };
-            params[i] = {va(l.src[0]), va(l.src[1]), base + l.weights, base + l.params, va(l.dst), outputPitch};
-            launches[i] = {l.fn, {l.grid[0], l.grid[1], l.grid[2]}, {128, 1, 1}, 0, &params[i], 44};
+            const uint32_t n = std::min<uint32_t>(kCudaBatch, count - j * kCudaBatch);
+            params[j] = {base + first.weights, base + first.params, outputPitch};
+            for (uint32_t k = 0; k < n; ++k)
+            {
+                const uint32_t i = j * kCudaBatch + k;
+                CudaGraph& g = *graphs[i];
+                auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? inputs[i] : outputs[i][-2 - t]->GetGPUVirtualAddress(); };
+                params[j].io[k][0] = va(first.src[0]), params[j].io[k][1] = va(first.src[1]), params[j].io[k][2] = va(first.dst);
+            }
+            launches[j] = {first.fn, {first.grid[0], first.grid[1], first.grid[2] * n}, {128, 1, 1}, 0, &params[j], uint32_t(sizeof(CudaParams))};
         }
         // Not as one chain: the launches of a chain run one after another.
-        for (uint32_t i = 0; i < count; ++i) Nv().launch(list, &launches[i], 1);
+        for (auto& l : launches) Nv().launch(list, &l, 1);
         if (first.dst >= 0) dirty[first.dst] = true;
+        if (s_afterLayer) s_afterLayer(list, li);
     }
     b.clear();
     for (uint32_t i = 0; i < count; ++i)

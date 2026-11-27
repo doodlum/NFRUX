@@ -20,7 +20,7 @@ struct CudaPlan
     {
         uint64_t weights = 0, params = 0;
         int32_t  src[2] = {}, dst = 0;  // internal tensor; -1 the input; -(2 + i) output i
-        uint32_t grid[3] = {1, 1, 1};
+        uint32_t grid[3] = {1, 1, 1};  // of one network
         bool     external = false;
     };
     std::vector<uint8_t>  cubin, constants;
@@ -28,12 +28,18 @@ struct CudaPlan
     std::vector<Layer>    layers;   // layerN
     std::vector<uint32_t> outputBindings;
 };
-bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, CudaPlan& out, std::string* error);
+// Variants (the rung timing picks one a GPU): 0 tiled, 1 rows (the earlier kernels). Same bytes either way.
+constexpr int kCudaVariants = 2;
+constexpr int kCudaBatch = 8;  // networks in one launch (grid z): their two sources and output each
+#pragma pack(push, 4)
+struct CudaParams { uint64_t weights, constants; uint32_t pitch, unused; uint64_t io[kCudaBatch][3]; };
+#pragma pack(pop)
+bool MakeCudaPlan(const ffx_ml::GraphDesc& desc, LUID luid, int variant, CudaPlan& out, std::string* error);
 class CudaGraph
 {
 public:
     // Null (and why) when the GPU, driver or a layer does not fit.
-    static std::unique_ptr<CudaGraph> Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error);
+    static std::unique_ptr<CudaGraph> Create(ID3D12Device* device, const ffx_ml::GraphDesc& desc, std::string* error, int variant = 0);
     ~CudaGraph();
     // Input and outputs in UNORDERED_ACCESS. Outputs: four channels a pixel, outputPitch bytes a row (as given to Create's caller).
     // Several of one model, a layer at a time (independent launches between barriers).
@@ -44,6 +50,7 @@ public:
         Record(list, &self, &input, &outputs, 1, outputPitch);
     }
     uint32_t outputBinding(uint32_t i) const { return m_outputBindings[i]; }
+    static inline void (*s_afterLayer)(ID3D12GraphicsCommandList*, size_t layer) = nullptr;  // tests: a timestamp after each layer
 
 private:
     struct Layer : CudaPlan::Layer { void* fn = nullptr; };

@@ -13,7 +13,7 @@ bool CudaVulkanGraph::Supported(VkDevice device, PFN_vkGetDeviceProcAddr gdpa)
     return gdpa(device, "vkCreateCuModuleNVX") && gdpa(device, "vkCmdCuLaunchKernelNVX");
 }
 
-std::unique_ptr<CudaVulkanGraph> CudaVulkanGraph::Create(const ffx_ml::DeviceContext& dc, const ffx_ml::GraphDesc& desc, std::string* error)
+std::unique_ptr<CudaVulkanGraph> CudaVulkanGraph::Create(const ffx_ml::DeviceContext& dc, const ffx_ml::GraphDesc& desc, std::string* error, int variant)
 {
     auto fail = [&](const std::string& m) -> std::unique_ptr<CudaVulkanGraph> { if (error) *error = m; return nullptr; };
     if (!Supported(dc.device, dc.getDeviceProcAddr)) return fail("VK_NVX_binary_import is not enabled");
@@ -24,7 +24,7 @@ std::unique_ptr<CudaVulkanGraph> CudaVulkanGraph::Create(const ffx_ml::DeviceCon
     LUID luid;
     memcpy(&luid, id.deviceLUID, sizeof(luid));
     auto out = std::unique_ptr<CudaVulkanGraph>(new CudaVulkanGraph());
-    if (!MakeCudaPlan(desc, luid, out->m_plan, error)) return nullptr;
+    if (!MakeCudaPlan(desc, luid, variant, out->m_plan, error)) return nullptr;
     auto& f = out->m_fn;
     auto  get = [&](auto& fn, const char* n) { fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dc.getDeviceProcAddr(dc.device, n)); };
     get(f.createModule, "vkCreateCuModuleNVX"), get(f.createFunction, "vkCreateCuFunctionNVX"), get(f.destroyModule, "vkDestroyCuModuleNVX"), get(f.destroyFunction, "vkDestroyCuFunctionNVX"),
@@ -117,13 +117,19 @@ void CudaVulkanGraph::Record(VkCommandBuffer cmd, CudaVulkanGraph* const* graphs
         bool wait = false;
         for (int32_t t : {l.src[0], l.src[1], l.dst}) wait = wait || (t >= 0 && dirty[t]);
         if (wait) barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT), std::fill(dirty.begin(), dirty.end(), false);
-        for (uint32_t i = 0; i < count; ++i)
+        // The networks of a batch are one model: graph 0's constants for all.
+        for (uint32_t b = 0; b < count; b += kCudaBatch)
         {
-            CudaVulkanGraph& g = *graphs[i];
-            auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t].address : t == -1 ? inputs[i] : outputs[i][-2 - t]; };
-            const uint64_t a[5] = {va(l.src[0]), va(l.src[1]), g.m_constants.address + l.weights, g.m_constants.address + l.params, va(l.dst)};
-            const void*    p[6] = {&a[0], &a[1], &a[2], &a[3], &a[4], &pitch};
-            VkCuLaunchInfoNVX k = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX, nullptr, g.m_functions[li], l.grid[0], l.grid[1], l.grid[2], 128, 1, 1, 0, 6, p, 0, nullptr};
+            const uint32_t n = std::min<uint32_t>(kCudaBatch, count - b);
+            CudaParams     cp = {graphs[0]->m_constants.address + l.weights, graphs[0]->m_constants.address + l.params, pitch};
+            for (uint32_t k = 0; k < n; ++k)
+            {
+                CudaVulkanGraph& g = *graphs[b + k];
+                auto va = [&](int32_t t) { return t >= 0 ? g.m_tensors[t].address : t == -1 ? inputs[b + k] : outputs[b + k][-2 - t]; };
+                cp.io[k][0] = va(l.src[0]), cp.io[k][1] = va(l.src[1]), cp.io[k][2] = va(l.dst);
+            }
+            const void*       p[4] = {&cp.weights, &cp.constants, &cp.pitch, cp.io};
+            VkCuLaunchInfoNVX k = {VK_STRUCTURE_TYPE_CU_LAUNCH_INFO_NVX, nullptr, graphs[0]->m_functions[li], l.grid[0], l.grid[1], l.grid[2] * n, 128, 1, 1, 0, 4, p, 0, nullptr};
             f.launch(cmd, &k);
         }
         if (l.dst >= 0) dirty[l.dst] = true;

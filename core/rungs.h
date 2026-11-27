@@ -14,7 +14,9 @@ struct Caps;
 // CUDA kernels, cooperative matrices, dot4, 32-bit integers (the floor).
 enum class Rung : uint8_t { Cuda, CoopMat, Dot4, Scalar };
 const char* RungName(Rung r);  // cuda, coopmat, dot4, scalar
-bool        RungFromName(const char* s, Rung* r);
+// A rung may have kernel variants, timed like rungs: "cuda/1" is variant 1 of cuda, "cuda" variant 0.
+bool        RungFromName(const char* s, Rung* r, int* variant = nullptr);
+std::string RungLabel(Rung r, int variant);
 
 struct Gpu
 {
@@ -38,14 +40,15 @@ bool     Before(const RungPlan& p, Rung a, Rung b);  // a is listed and comes be
 // first sample skipped: pipeline warm-up); false in *usable when timers are unavailable. text: "cuda 0.41, dot4 0.60 ms".
 struct RungTimes
 {
-    std::vector<std::pair<Rung, std::vector<int>>> tickets;
-    void Add(Rung r, int ticket);
-    bool Result(Device& dev, Rung* best, bool* usable, std::string* text) const;
+    struct Entry { Rung rung; int variant; std::vector<int> tickets; };
+    std::vector<Entry> tickets;
+    void Add(Rung r, int ticket, int variant = 0);
+    bool Result(Device& dev, Rung* best, bool* usable, std::string* text, int* bestVariant = nullptr) const;
 };
 
 // The cache. prefix: what, API, GPU, driver version, NFRUX build; cls: ResolutionClass, or -1 for the latest entry of the prefix.
 uint32_t    ResolutionClass(uint32_t w, uint32_t h);  // 0 up to 0.25 MP, 1 up to 1 MP, 2 up to 4 MP, 3 above
 std::string CachePrefix(const char* what, const Gpu& gpu, uint64_t driverVersion);
-bool        CachedRung(const std::string& prefix, int cls, Rung* r);
-void        CacheRung(const std::string& prefix, uint32_t cls, Rung r);
+bool        CachedRung(const std::string& prefix, int cls, Rung* r, int* variant = nullptr);
+void        CacheRung(const std::string& prefix, uint32_t cls, Rung r, int variant = 0);
 }  // namespace nfrux

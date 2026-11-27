@@ -88,11 +88,17 @@ const char* RungName(Rung r)
     static const char* const names[] = {"cuda", "coopmat", "dot4", "scalar"};
     return names[uint32_t(r)];
 }
-bool RungFromName(const char* s, Rung* r)
+bool RungFromName(const char* s, Rung* r, int* variant)
 {
-    for (uint32_t i = 0; i < 4; ++i) if (s && !strcmp(s, RungName(Rung(i)))) return *r = Rung(i), true;
+    const char* slash = s ? strchr(s, '/') : nullptr;
+    const size_t n = slash ? size_t(slash - s) : s ? strlen(s) : 0;
+    int v = 0;
+    if (slash && (!variant || sscanf(slash + 1, "%d", &v) != 1 || v < 0)) return false;
+    for (uint32_t i = 0; i < 4; ++i)
+        if (s && strlen(RungName(Rung(i))) == n && !strncmp(s, RungName(Rung(i)), n)) { *r = Rung(i); if (variant) *variant = v; return true; }
     return false;
 }
+std::string RungLabel(Rung r, int variant) { return variant ? std::string(RungName(r)) + "/" + std::to_string(variant) : RungName(r); }
 
 Gpu GpuOf(const Caps& c, bool vulkan)
 {
@@ -126,17 +132,17 @@ bool Before(const RungPlan& p, Rung a, Rung b)
     return ia != p.order.end() && ia < ib;
 }
 
-void RungTimes::Add(Rung r, int ticket)
+void RungTimes::Add(Rung r, int ticket, int variant)
 {
-    for (auto& t : tickets) if (t.first == r) return t.second.push_back(ticket);
-    tickets.push_back({r, {ticket}});
+    for (auto& t : tickets) if (t.rung == r && t.variant == variant) return t.tickets.push_back(ticket);
+    tickets.push_back({r, variant, {ticket}});
 }
-bool RungTimes::Result(Device& dev, Rung* best, bool* usable, std::string* text) const
+bool RungTimes::Result(Device& dev, Rung* best, bool* usable, std::string* text, int* bestVariant) const
 {
     *usable = !tickets.empty();
     double bestMs = 1e30;
     std::string s;
-    for (const auto& [r, v] : tickets)
+    for (const auto& [r, variant, v] : tickets)
     {
         std::vector<double> ms;
         for (size_t i = 0; i < v.size(); ++i)
@@ -149,9 +155,9 @@ bool RungTimes::Result(Device& dev, Rung* best, bool* usable, std::string* text)
         if (ms.empty()) { *usable = false; continue; }
         std::sort(ms.begin(), ms.end());
         const double med = ms[ms.size() / 2];
-        if (med < bestMs) bestMs = med, *best = r;
+        if (med < bestMs) { bestMs = med, *best = r; if (bestVariant) *bestVariant = variant; }
         char b[48];
-        snprintf(b, sizeof(b), "%s%s %.3f", s.empty() ? "" : ", ", RungName(r), med);
+        snprintf(b, sizeof(b), "%s%s %.3f", s.empty() ? "" : ", ", RungLabel(r, variant).c_str(), med);
         s += b;
     }
     if (text) *text = s + " ms";
@@ -169,7 +175,7 @@ std::string CachePrefix(const char* what, const Gpu& g, uint64_t driverVersion)
     snprintf(b, sizeof(b), "%s_%s_%04x_%04x_%llx_%08x", what, g.vulkan ? "vulkan" : "d3d12", g.vendorId, g.deviceId, (unsigned long long)driverVersion, Build());
     return b;
 }
-bool CachedRung(const std::string& prefix, int cls, Rung* r)
+bool CachedRung(const std::string& prefix, int cls, Rung* r, int* variant)
 {
     std::lock_guard<std::mutex> lock(g_cache);
     const std::wstring path = CachePath();
@@ -177,10 +183,10 @@ bool CachedRung(const std::string& prefix, int cls, Rung* r)
     const std::string want = prefix + "_r" + (cls >= 0 ? std::to_string(cls) : "");
     bool found = false;
     for (const auto& [k, v] : ReadCache(path))
-        if ((cls >= 0 ? k == want : k.compare(0, want.size(), want) == 0) && RungFromName(v.c_str(), r)) found = true;  // the last: the latest
+        if ((cls >= 0 ? k == want : k.compare(0, want.size(), want) == 0) && RungFromName(v.c_str(), r, variant)) found = true;  // the last: the latest
     return found;
 }
-void CacheRung(const std::string& prefix, uint32_t cls, Rung r)
+void CacheRung(const std::string& prefix, uint32_t cls, Rung r, int variant)
 {
     std::lock_guard<std::mutex> lock(g_cache);
     const std::wstring path = CachePath();
@@ -189,7 +195,7 @@ void CacheRung(const std::string& prefix, uint32_t cls, Rung r)
     auto v = ReadCache(path);
     v.erase(std::remove_if(v.begin(), v.end(), [&](const auto& e) { return e.first == key; }), v.end());
     if (v.size() > 63) v.erase(v.begin());  // old drivers and builds go
-    v.push_back({key, RungName(r)});
+    v.push_back({key, RungLabel(r, variant)});
     if (FILE* f = _wfopen(path.c_str(), L"w"))
     {
         for (const auto& [k, x] : v) fprintf(f, "%s %s\n", k.c_str(), x.c_str());

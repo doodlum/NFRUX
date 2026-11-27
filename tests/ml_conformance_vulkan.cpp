@@ -551,11 +551,11 @@ namespace
         return pass;
     }
     // CUDA kernels on Vulkan against the reference, and their time (64 in a submission, best of the last few).
-    bool RunCuda(Context& ctx, const Model& model, const std::map<uint32_t, std::vector<int8_t>>& inputs, const std::map<uint32_t, std::vector<int8_t>>& reference, bool time)
+    bool RunCuda(Context& ctx, const Model& model, const std::map<uint32_t, std::vector<int8_t>>& inputs, const std::map<uint32_t, std::vector<int8_t>>& reference, bool time, int variant)
     {
         const ffx_ml::DeviceContext dc = {ctx.instance, ctx.physical, ctx.device, vkGetInstanceProcAddr, vkGetDeviceProcAddr, ctx.features};
         std::string error;
-        auto g = nfrux::CudaVulkanGraph::Create(dc, model.desc, &error);
+        auto g = nfrux::CudaVulkanGraph::Create(dc, model.desc, &error, variant);
         if (!g) return printf("  CUDA on Vulkan: not available (%s)\n", error.c_str()), true;
         std::vector<std::unique_ptr<nfrux::CudaVulkanGraph>> three;
         auto in = g->MakeBuffer(inputs.begin()->second.size(), false);
@@ -601,7 +601,7 @@ namespace
             std::vector<Buffer> ups;
             for (int k = 0; k < 3; ++k)
             {
-                g3.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error));
+                g3.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error, variant));
                 if (!g3.back()) return printf("  CUDA on Vulkan, three: %s\n", error.c_str()), false;
                 p3[k] = g3.back().get();
                 auto ins = inputs;
@@ -632,7 +632,7 @@ namespace
         double ms1 = 0, ms3 = 0;
         if (time)
         {
-            for (int i = 0; i < 2; ++i) three.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error)), gp[i + 1] = three.back().get();
+            for (int i = 0; i < 2; ++i) three.push_back(nfrux::CudaVulkanGraph::Create(dc, model.desc, &error, variant)), gp[i + 1] = three.back().get();
             for (int which = 0; which < 2; ++which)
             {
                 double best = 1e30;
@@ -651,7 +651,7 @@ namespace
                 (which ? ms3 : ms1) = best;
             }
         }
-        printf("  CUDA kernels on Vulkan%32s %s  mismatches %zu/%zu  %.3f ms batched, three interleaved %.3f ms each\n", "", bad ? "FAIL  " : "EXACT ", bad, total, ms1, ms3 / 3);
+        printf("  CUDA kernels on Vulkan, %s%25s %s  mismatches %zu/%zu  %.3f ms batched, three interleaved %.3f ms each\n", variant ? "rows " : "tiled", "", bad ? "FAIL  " : "EXACT ", bad, total, ms1, ms3 / 3);
         g->Destroy(in), g->Destroy(o[0]), g->Destroy(o[1]);
         ctx.Destroy(up);
         vkFreeCommandBuffers(ctx.device, ctx.pool, 1, &cmd);
@@ -750,7 +750,7 @@ int main(int argc, char** argv)
                 printf("%s: reference failed: %s\n", model.name, error.c_str());
                 return 1;
             }
-            allPass &= RunCuda(ctx, model, inputs, reference, pattern == 0);
+            for (int v = 0; v < nfrux::kCudaVariants; ++v) allPass &= RunCuda(ctx, model, inputs, reference, pattern == 0, v);
             for (const Config& config : configs)
             {
                 // FFX_ML_TEST_PATHS=dot4,scalar,... limits the paths run (faster tuning loops).

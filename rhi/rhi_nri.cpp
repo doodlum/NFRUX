@@ -458,6 +458,8 @@ public:
     }
     bool iniRefused = false;  // what nfrux.ini asks for cannot be made here
     bool cacheRefused = false;  // the cached rung could not be made, or a self-check failed: the plan's ladder from here on
+    const int cudaDefault = Env("NFRUX_TEST_CUDA_VARIANT") ? atoi(Env("NFRUX_TEST_CUDA_VARIANT")) : 0;  // kernel variant without a timed choice
+    int       cudaVariant = cudaDefault;  // the CUDA kernels' variant (cuda_network.h) for the networks made next
     std::unique_ptr<Network> CreateNetwork(uint32_t w, uint32_t h, std::string* error) override
     {
         std::lock_guard<std::mutex> lock(making);  // worker threads
@@ -474,12 +476,18 @@ public:
         const bool check = w < 128 && h < 128;
         if (topRung || noFloats) cacheRefused = true;
         Rung r;
-        if (!cacheRefused && CachedRung(cachePrefix, check ? -1 : int(ResolutionClass(w, h)), &r))
+        int  v = 0;
+        cudaVariant = cudaDefault;
+        if (!cacheRefused && CachedRung(cachePrefix, check ? -1 : int(ResolutionClass(w, h)), &r, &v))
         {
-            std::string why;
-            if (auto net = MakeNetwork(w, h, &why, RungName(r), true)) return net;
-            Log("cached rung %s cannot be used (%s): the automatic choice", RungName(r), why.c_str());
-            cacheRefused = true;
+            std::string why = "unknown variant";
+            if (v < (r == Rung::Cuda ? kCudaVariants : 1))
+            {
+                cudaVariant = v;
+                if (auto net = MakeNetwork(w, h, &why, RungName(r), true)) return net;
+            }
+            Log("cached rung %s cannot be used (%s): the automatic choice", RungLabel(r, v).c_str(), why.c_str());
+            cudaVariant = cudaDefault, cacheRefused = true;
         }
         auto net = MakeNetwork(w, h, error, nullptr, false);
         if (net && !check && !trialTried && !cacheRefused) StartTrial(w, h);
@@ -492,7 +500,8 @@ public:
     struct Trial
     {
         uint32_t w = 0, frames = 0, value = 0, cls = 0;
-        std::vector<std::pair<Rung, std::unique_ptr<Network>>> nets;
+        struct Candidate { Rung rung; int variant; std::unique_ptr<Network> net; };
+        std::vector<Candidate>   nets;
         RungTimes                times;
         std::vector<std::string> markers;  // crash markers the candidates began: cleared when their runs have come back
     };
@@ -506,6 +515,7 @@ public:
         auto t = std::make_unique<Trial>();
         t->w = w, t->cls = ResolutionClass(w, h);
         for (Rung r : plan.order)
+        for (int variant = 0; variant < (r == Rung::Cuda ? kCudaVariants : 1); ++variant)  // CUDA: each kernel variant
         {
             // The floor is not timed: never faster than dot4, and many times slower at 4K.
             if (r == Rung::Scalar || (r == Rung::Cuda && cudaState != 1) || (r == Rung::CoopMat && !c.cooperativeMatrix) || (r == Rung::Dot4 && !c.dot4)) continue;
@@ -514,11 +524,12 @@ public:
             const bool lf = lastFloat, vc = vkCuda;
             const std::string mm = matMarker;
             std::string why;
-            matMarker.clear(), quiet = true;
+            matMarker.clear(), quiet = true, cudaVariant = variant;
             auto net = MakeNetwork(w, h, &why, RungName(r), true);
+            cudaVariant = cudaDefault;
             if (!matMarker.empty() && matMarker != mm) { if (net) t->markers.push_back(matMarker); else MarkerOk(matMarker); }
             rung = sr, topRung = st, cudaState = cs, lastFloat = lf, vkCuda = vc, matMarker = mm, quiet = false;
-            if (net && static_cast<NetN&>(*net).rung == r) t->nets.push_back({r, std::move(net)});
+            if (net && static_cast<NetN&>(*net).rung == r) t->nets.push_back({r, variant, std::move(net)});
         }
         if (t->nets.size() < 2) { for (auto& m : t->markers) MarkerOk(m); return; }  // nothing to choose from
         Log("rung timing at %ux%u: %zu rungs, %u recordings", w, h, t->nets.size(), kTrialFrames);
@@ -531,14 +542,14 @@ public:
         std::lock_guard<std::mutex> lock(trialLock);
         if (!trial || !count || trial->frames >= kTrialFrames || trial->value == slotValue[slot] || static_cast<NetN&>(*nets[0]).width != trial->w) return;
         trial->value = slotValue[slot];  // once a recording
-        for (auto& [r, net] : trial->nets)
+        for (auto& [r, variant, net] : trial->nets)
         {
             if (!trial->frames) Fill(*static_cast<NetN&>(*net).in, 0);  // defined input
             Network* p = net.get();
             const int t = TimerBegin();
             Run(&p, 1);
             TimerEnd(t);
-            trial->times.Add(r, t);
+            trial->times.Add(r, t, variant);
         }
         ++trial->frames;
     }
@@ -548,13 +559,14 @@ public:
         std::lock_guard<std::mutex> lock(trialLock);
         if (!trial || trial->frames < kTrialFrames) return;
         Rung best = Rung::Scalar;
+        int bestVariant = 0;
         bool usable = false;
         std::string text;
-        if (!trial->times.Result(*this, &best, &usable, &text)) return;
-        if (usable) CacheRung(cachePrefix, trial->cls, best);
-        Log("rung timing: %s: %s%s", text.c_str(), usable ? RungName(best) : "timers unavailable, nothing", " cached for the next start");
+        if (!trial->times.Result(*this, &best, &usable, &text, &bestVariant)) return;
+        if (usable) CacheRung(cachePrefix, trial->cls, best, bestVariant);
+        Log("rung timing: %s: %s%s", text.c_str(), usable ? RungLabel(best, bestVariant).c_str() : "timers unavailable, nothing", " cached for the next start");
         for (auto& m : trial->markers) MarkerOk(m);
-        for (auto& x : trial->nets) trialOld.push_back({next, std::move(x.second)});
+        for (auto& x : trial->nets) trialOld.push_back({next, std::move(x.net)});
         trial.reset();
     }
     // Timestamp pairs for the rung timing: one pool, tickets never reused (a trial takes a few dozen).
@@ -650,7 +662,7 @@ public:
                     snprintf(b, sizeof(b), "vulkan_cuda_%04x", c.deviceId);
                     cudaMarker = b, cudaState = (forced && !guarded) || MarkerBegin(cudaMarker) ? 1 : -1;
                 }
-                if (cudaState > 0) net->cudaVk = CudaVulkanGraph::Create(dc, DescribeModel(w, h), &why);
+                if (cudaState > 0) net->cudaVk = CudaVulkanGraph::Create(dc, DescribeModel(w, h), &why, cudaVariant);
                 if (!net->cudaVk && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(cudaMarker), cudaState = -1;
                 if (forced && !net->cudaVk) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
             }
@@ -710,7 +722,7 @@ public:
             {
                 std::string why;
                 if (cudaState == 0) cudaState = (forced && !guarded) || MarkerBegin(CudaRung()) ? 1 : -1;
-                if (cudaState > 0) net->cuda = CudaGraph::Create(d3d, DescribeModel(w, h), &why);
+                if (cudaState > 0) net->cuda = CudaGraph::Create(d3d, DescribeModel(w, h), &why, cudaVariant);
                 if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(CudaRung()), cudaState = -1;
                 if (forced && !net->cuda) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
             }
@@ -743,6 +755,7 @@ public:
         static std::mutex logMutex;
         static std::string logged;
         std::lock_guard<std::mutex> logLock(logMutex);
+        if (net->rung == Rung::Cuda) what += cudaVariant ? ", row kernels" : ", tiled kernels";
         if (logged != what && !quiet) Log("network %ux%u: %s", w, h, what.c_str()), logged = what;
         return net;
     }
