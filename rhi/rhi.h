@@ -42,6 +42,7 @@ public:
     uint32_t width = 0, height = 0;
     Format   format   = Format::Unknown;
     bool     uintView = false;
+    Format   storeFormat = Format::Unknown;  // a host output (Device::Wrap) a pass can write directly: the format it is written as
 };
 class Buffer
 {

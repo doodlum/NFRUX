@@ -507,7 +507,8 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     {
         set(i);
         const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *o.net->params), Bind::Tex(2, *o.filledFlowTm1), Bind::Tex(4, prev), Bind::Tex(5, color), Bind::Tex(6, *o.output),
+        const Texture& target = i == 0 && in.output0 ? *in.output0 : *o.output;
+        const Bind b[] = {Bind::Tex(0, *o.net->params), Bind::Tex(2, *o.filledFlowTm1), Bind::Tex(4, prev), Bind::Tex(5, color), Bind::Tex(6, target),
                           Bind::Data(7, &k, sizeof(k)), Bind::Tex(9, *o.net->gate), Bind::Tex(10, *o.inpaint), Bind::Tex(11, *o.qMotionTp1), Bind::Tex(12, uiSource),
                           Bind::Tex(13, uiAlpha), Bind::Tex(14, noWarp)};
         if (!post->Dispatch(b, 12, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup))) return false;

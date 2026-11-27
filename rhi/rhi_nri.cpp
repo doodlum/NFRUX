@@ -912,7 +912,13 @@ public:
             if (!NRI_OK(nd3.CreateTextureD3D12(*dev, d, t->tex))) return nullptr;
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
-        if (!IsSrgb(e) && !Views(*t, f, false)) return nullptr;
+        // A D3D12 output with unordered access in one of the composite's formats: the composite can write it (Texture::storeFormat).
+        const Format store = f == nri::Format::RGBA8_UNORM ? Format::RGBA8Unorm : f == nri::Format::BGRA8_UNORM ? Format::BGRA8Unorm : f == nri::Format::R10_G10_B10_A2_UNORM ? Format::RGB10A2Unorm
+                           : f == nri::Format::RGBA16_SFLOAT ? Format::RGBA16Float : Format::Unknown;
+        const bool storage = output && !isVk && !IsSrgb(e) && store != Format::Unknown && (static_cast<ID3D12Resource*>(e.handle)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                             (uint32_t(n.GetFormatSupport(*dev, f)) & uint32_t(nri::FormatSupportBits::STORAGE_TEXTURE)) != 0;
+        if (!IsSrgb(e) && !Views(*t, f, storage)) return nullptr;
+        if (storage) t->storeFormat = store;
         const nri::AccessLayoutStage& home = isVk ? (!output && e.state == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ? kHostVkRead : kHostVk) : output ? kUav : e.state == D3D12_RESOURCE_STATE_COPY_DEST ? kDst : kSrv;
         if (!isVk && !output && e.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE && e.state != D3D12_RESOURCE_STATE_COPY_DEST)
         {

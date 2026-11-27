@@ -436,6 +436,12 @@ bool FrameGenerator::Generate(const EvalInputs& in)
         if (uiAlpha || uiLayer) f.uiAlpha = uiAlpha ? in.uiAlpha : in.ui;
     }
     if (!staged && l.hasNoWarp) f.noWarp = in.noWarp;
+    // Frame 1 straight into the host's output where it would be copied there whole (an output the composite can write): one copy less.
+    m_direct = false;
+    if (!staged && Whole(in.backRect, in.back) && !in.onlyInside && !(in.outRect.w && (in.outRect.x || in.outRect.y)) && in.output.handle != color.handle && in.output.handle != in.back.handle &&
+        !e->ip->settings().swapRB)
+        if (Texture* out = m_dev.Wrap(in.output, true); out && out->storeFormat == e->ip->settings().outputFormat && out->width == in.back.width && out->height == in.back.height)
+            f.output0 = out, m_direct = true;
     const uint32_t kind = (hudless ? 1u : 0u) | (staged ? 2u : 0u) | (in.distortion ? 4u : 0u);
     if (kind != m_kind) m_kind = kind, m_restart = true;  // the history is another kind of image
     f.reset = in.reset || m_restart;
@@ -501,7 +507,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
     ++m_evaluations;  // recordings: 32 at most are in flight, so what is 256 old is free
     if (in.index <= 1)
     {
-        m_ready = 0;
+        m_ready = 0, m_direct = false;
         if (in.notRendering != m_menu)
             Log("%s", in.notRendering ? "not rendering game frames: no interpolation" : "game frames again"), m_menu = in.notRendering;
         const bool menu = InMenu(in);
@@ -540,7 +546,7 @@ bool FrameGenerator::Evaluate(void* commands, const EvalInputs& in)
         if (in.onlyInside || elsewhere) m_dev.CopyRect(from, region.x, region.y, to, at.w ? at.x : region.x, at.w ? at.y : region.y, region.w, region.h);
         else m_dev.CopyTexture(from, to);
     };
-    put(made, out, in.outRect);
+    if (!(generated && k == 0 && m_direct)) put(made, out, in.outRect);  // frame 1 may be there already (Generate)
     if (in.outputReal && in.outputReal.handle != in.back.handle)
         if (Texture* real = m_dev.Wrap(in.outputReal, true))
             put(back, *real, in.realRect);

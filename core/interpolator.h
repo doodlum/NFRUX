@@ -20,6 +20,7 @@ struct FrameInputs
     float         viewProjection[16] = {};
     float         cameraNear = 0.1f, cameraFar = 1000.0f, fovY = 1.0f;
     bool          orthographic = false;
+    const Texture* output0 = nullptr;  // where output 0 is written instead of Output(0): a host output of Settings::outputFormat (Texture::storeFormat)
 };
 struct Settings
 {

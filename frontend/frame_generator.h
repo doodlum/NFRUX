@@ -73,6 +73,7 @@ private:
     std::unique_ptr<Pass>    m_prepare, m_compose, m_menuPass;
     std::unique_ptr<Texture> m_prepared, m_composed[kMaxGenerated], m_menuCounts;
     Format   m_composeFormat = Format::Unknown;
+    bool     m_direct = false;  // frame 1 of the batch was written into the host's output itself
     bool     m_staged = false, m_inMenu = false, m_hudlessLogged = false, m_formatLogged = false;
     int      m_uiInput = -1;  // the UI input last logged: 0 none, 1 HUD-less difference, 2 alpha, 3 layer
     uint32_t m_menuStep = 0;
