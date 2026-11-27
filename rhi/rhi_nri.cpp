@@ -1221,7 +1221,9 @@ public:
                     const double hz = TimestampHz(), ms = hz > 0 ? 1000.0 / hz : 0;  // (a wrapped D3D12 device: asked of a compute queue made for it)
                     if (markNames[slot].size() > 8 && ++timedFrames > 60)
                     {
-                        for (size_t i = 1; i < markNames[slot].size(); ++i) times[markNames[slot][i]].push_back(float(double(q[i] - q[i - 1]) * ms));
+                        static const bool byPlace = Env("NFRUX_TEST_TIMES") && atoi(Env("NFRUX_TEST_TIMES")) == 2;  // each pass by its place in the recording
+                        for (size_t i = 1; i < markNames[slot].size(); ++i)
+                            times[byPlace ? (i < 10 ? "0" : "") + std::to_string(i) + " " + markNames[slot][i] : markNames[slot][i]].push_back(float(double(q[i] - q[i - 1]) * ms));
                         times["(recording)"].push_back(float(double(q[markNames[slot].size() - 1] - q[0]) * ms));  // first mark to last
                     }
                     n.UnmapBuffer(*markBack);
