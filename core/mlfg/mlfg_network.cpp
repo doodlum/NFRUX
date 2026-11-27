@@ -377,6 +377,7 @@ bool Network::SelectPrecision(std::string* error)
     // (a forced fp16 tier, NFRUX_MLFG / AmdNetwork, keeps auto at fp16)
     const bool forced = Env("NFRUX_MLFG") || Option(m_dev.caps().vulkan ? "vulkan" : "d3d12", "amdnetwork");
     m_int8 = want ? !strcmp(want, "int8") : (m_tier == Tier::Generic && !forced);
+    Log("FSR FG4 network: precision %s (%s)", m_int8 ? "int8" : "fp16", want ? "AmdPrecision" : m_int8 ? "auto: no fp16 matrix tier here" : forced ? "auto: an fp16 tier is forced" : "auto: fp16 matrix tier");
     if (!m_int8) return true;
     if (m_tier != Tier::Generic)  // the fp16 tier chosen first is not used: its crash marker and kernels go
     {

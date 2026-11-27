@@ -548,6 +548,20 @@ kernels, fused coopmat / generic FasterNet). Not done: the stage-2 input pass fu
 47.4-49.3 / 44.0-45.0 dB vs the fp64-summed net); parity --strict 0 differing bytes; ngx_harness Model=amd 77/78 per API
 (RGB10A2 PQ quality), Model=nfru 158/158; build-ship and build-strict green.
 
+## FSR FG4 int8 tier (AmdPrecision=int8, 2026-11-27, commits 689570b..)
+
+Details in docs/FFX_MLFG.md "The int8 tier". Built-in int8 network: PTQ of AMD's weights (48 calibration samples) until the
+QAT exports exist. Spec tools/ffx_extract/mlfg_int8.py: layer by layer against QAT's fake-quant forward 0.0008% of
+integers differ (worst layer 0.033%, max 2 steps). tests/mlfg_net.py --int8 (tiers dot4, int, cuda, both APIs, 2x and 4x):
+82/82 on each sample, 55.7-94.8 dB against mlfg_int8 (pass 50), stage 1 bit-exact, dot4 == int == cuda bytes, D3D12 ==
+Vulkan bytes. int8 against fp16 (the runtime vs mlfg_net 'amd'): test_new 38.8-39.8 dB, LPIPS 0.004-0.006; test_bal
+32.2-33.9 dB, LPIPS 0.027-0.031. parity --strict (strict build, the six Model=amd configurations): 0 differing bytes for
+fp16 generic and for int8 dot4 / int / cuda. ngx_harness Model=amd with int8: 77/78 per API (RGB10A2 PQ 38.7 dB < 40, as
+fp16's 38.3). Existing gates unchanged: mlfg_passes 74/74, mlfg_net 76/76 on each sample (generic, coopmat, cuda), ngx_harness
+Model=amd fp16 77/78 per API, Model=nfru 158/158, build-ship and build-strict green. Cost (shared GPU, 18-20%), ms a
+rendered frame 1080p / 4K 2x: int8 cuda 3.80 / 8.76 (D3D12), int8 dot4 5.16 / 13.45 (Vulkan), int8 32-bit integers 7.35 /
+20.46 (Vulkan); fp16 cuda 2.81 / 7.17 and fp16 generic 15.2 / 45.0 (Vulkan) in the same session.
+
 ## FSR FG4, AMD / Intel matrix paths (2026-11-26, commit ca68a8e)
 
 Coopmat fragment shapes from the device: the RTX 4070 reports fp16 16x16x16, 16x8x16, 16x8x8 at subgroup 32 (logged).

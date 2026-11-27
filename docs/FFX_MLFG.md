@@ -1,6 +1,6 @@
 # AMD FSR Frame Generation 4 (ML) — extraction notes and NFRUX's port
 
-Status: extraction done; ported as NFRUX's second interpolator (`Model=amd`), section "The port" (2026-11-26).
+Status: extraction done; ported as NFRUX's second interpolator (`Model=amd`), section "The port" (2026-11-26); int8 tier (`AmdPrecision`), section "The int8 tier" (2026-11-27).
 
 ## Source and licence
 
@@ -354,3 +354,90 @@ here, and a DLL loaded into games cannot rely on either. Revisit when cooperativ
 matrices) reach a retail Agility SDK.
 
 **Intel D3D12 extensions:** see docs/DESIGN.md ("Vendor matrix units").
+
+### The int8 tier (AmdPrecision=int8, 2026-11-27)
+
+For GPUs without fp16 / fp8 matrix units (RDNA2 including the Steam Deck, GTX and older NVIDIA, Intel iGPUs), where the fp16
+network only has the generic tier: AMD's network quantised to int8 with ng_model_gym's QAT scheme
+(`usecases/amd_mlfg/qat.py`, exported by `export_amd.py`), run with integer sums.
+
+**Choice.** nfrux.ini `[General] AmdPrecision = auto | fp16 | int8` (`NFRUX_AMD_PRECISION`). auto: int8 where the fp16 tier
+choice ends at generic (no CUDA, no coopmat shape, no forced AmdNetwork), else fp16. The log says
+`FSR FG4 network: precision int8 (auto: no fp16 matrix tier here)` and the tier in the interpolator line, e.g.
+`network: int8, generic HLSL kernels, integer dot product (Vulkan)`. On the RTX 4070 auto stays fp16: the fp16 CUDA tier
+is faster than the int8 one there (Cost below) and closer to AMD's frames.
+
+**Model and weights.** Semantics (export_amd docstring, confirmed in qat.py): symmetric int8 [-127, 127], value = int x
+scale; weights per output channel (`_wq` int8, `_ws` fp32); activation scales per tensor; the layers fed by glue passes
+(encoders L2 / L10, block entries L20 / L57 / L86 / L115, stage-2 input L154) quantise their input per channel (`_fold`);
+pre-activation requantisation after bias + residual / skip, then leaky 0.2 / ReLU and the output quantiser; flow heads
+(L52 / 81 / 110 / 147) and the logits (L188) leave in fp16; the FasterNet expand input is one tensor at one scale (pconv
+output and x[P:] requantised to it). Until the QAT runs (`amd_mlfg_v1` qatft / qatsp) finish, the built-in int8 network is
+a post-training quantisation of AMD's own weights: `tools/ffx_extract/mlfg_ptq.py` (enable_qat, EMA calibration of the
+activation scales on 48 training samples of the amd_mlfg_v1 data, crop 432x768, flow_t 'scale', export_amd), output in
+D:\nfrux_ffx\work\int8\ptq. `tools/mlfg_weights.py --int8 OUT_int8.npz` writes the blob (`blob_int8`: layer table with
+kinds / shapes / flags / activation, quantiser indices into a per-tensor scale table, int8 weights in torch layout, fp32
+ws / bias / fold): 5.48 MB, `core/model/amd_mlfg_int8.xz` 4.42 MB in the repository, expanded at build time like the fp16
+blob (`tools/embed_weights.py ... Int8`). `[General] AmdWeightsInt8` (`NFRUX_AMD_WEIGHTS_INT8`) loads such a file instead;
+the load checks the layer list (kinds, shapes) and that the quantisers chain as the runtime wires the tensors (each layer's
+input = the previous output, residual = the block input, FasterNet skip, fp16 flags).
+
+**Specification: `tools/ffx_extract/mlfg_int8.py`** (`Int8MlfgNet`, glue 'amd' = the runtime's fp16 glue, 'train' = QAT's
+fp32): exact integer sums; epilogue y = fp32(fp32(fp32(acc) * m) + b) [+ fp32(R * s_res)], m = fp32(ws * s_in) (ws with a
+fold); Q(v) = clamp(round-to-nearest-even(fp32(v * r)), -127, 127) with r the fp32 reciprocal of the scale. That last
+point differs from the export's x / s only where x / s lies within an fp32 rounding of a half integer; the runtime then
+needs no correctly rounded division (an FDiv per element would dominate the 1x1 layers). Self-check against the PTQ
+checkpoint's fake-quant forward (`python tools/ffx_extract/mlfg_int8.py ptq.pt amd_mlfg_ptq_int8.npz`): layer by layer
+(QAT's integers fed to each int8 layer) 100 int8-output layers, 0.0008% of the integers differ on average, worst layer
+0.033%, at most 2 steps; fp16-output layers within 1.1e-5. The whole networks differ more (47.3 / 45.6 dB at t = 0.5 /
+0.25 on export_amd's synthetic inputs) because those rare one-step flips (fp32 summation order inside QAT's float
+convolutions) cascade; the flow heads are unquantised, so every flip shows downstream.
+
+**Runtime (`core/mlfg/mlfg_network.cpp`, `RunQ`).** int8 tensors NHWC, 4 channels a 32-bit word, pitches in bytes; they
+reuse the fp16 tensors' buffers (half their size) plus the two FasterNet expand-input tensors. Glue passes unchanged:
+block entries quantise the fp16 glue tensors per channel while staging (fold reciprocals), encoder outputs are written
+dequantised into net_in's fp16 channels 6-17, flow heads / logits are written fp16.
+
+| Tier | Kernels | Chosen |
+|---|---|---|
+| generic int8 | `mlfg_conv_q8.hlsl` (kMlfgQ8Conv{3,2,1,T}{,s,o}{,_d4}): the generic tier's tiling (16x16 / 16x8 pixels by 8 channels; 4x4 with 4 input-channel slices for small layers) plus 8x8 pixels by 32 channels (four output groups share one staged input; layers with 32+ outputs: 4K network 11.4 -> 8.9 ms on Vulkan); `_d4` = `dot4add_i8packed` (SM 6.4; SPV_KHR_integer_dot_product on Vulkan, through the usual DXC -> SPIR-V -> SPIRV-Cross -> DXIL route), else the same sums in 32-bit integer code (SM 6.0). The FasterNet pconv dispatch also writes the requantised x[P:] (output groups at and above P copy) | any GPU; dot4 where `Caps.dot4` (crash marker `<api>_mlfg_q8dot4_<vendor>_<device>` off NVIDIA, 32-bit integers as the fallback) |
+| cuda int8 | `KernelQ8` in `mlfg_cuda.cpp`: mma.sync m16n8k32 s8 x s8 -> s32 (sm_80+), a warp makes 16 pixels by 8-64 channels, A fragments straight from the packed tensors, B in fragment order; epilogue mul.rn / add.rn in the HLSL order, cvt.rni after the clamp. Block entries and pconv layers stay on the HLSL kernels | NVIDIA RTX 30+ with AmdPrecision=int8, both APIs (crash marker `<api>_mlfg_q8cuda_<device>`) |
+
+Integer sums are exact and the epilogue is strict (kMlfgQ8 passes are strict in every build), so dot4, 32-bit integer and
+CUDA give the same bytes, on both APIs. `NFRUX_MLFG_Q8 = cuda | dot4 | int` (tests) forces one.
+
+**Accuracy** (tests/mlfg_net.py `--int8 amd_mlfg_ptq_int8.npz --tiers dot4,int,cuda`, both samples, 2x and 4x, both APIs:
+82/82 each). The pass line is 50 dB against mlfg_int8 (glue 'amd'). Stage 1 is bit-exact (net_in, f54 .. f149, flowout: 0
+differing values on every tier and API); stage 2 run in mlfg_int8 on the runtime's own s2in gives the runtime's softmax
+weights to 4.8e-7 (FExp against torch's exp). What remains comes from the stage-2 input pass (s2in differs from mlfg_net's
+at 0.004% of values, as it does for the fp16 tiers at 0.2-0.4%), whose few differences flip int8 steps downstream:
+frames 68.8 / 94.8 / 61.7 dB (test_new, t = 0.5 / 0.25 / 0.75) and 55.7 / 59.6 / 57.3 dB (test_bal) against mlfg_int8.
+dot4, int and cuda give identical bytes, D3D12 and Vulkan identical bytes (shipped and strict builds; parity --strict 0
+differing bytes for each in the strict build).
+
+**Quality, int8 (PTQ) against fp16** (the runtime's frames against mlfg_net 'amd'): test_new PSNR 38.8 / 39.8 / 38.9 dB,
+LPIPS 0.0056 / 0.0040 / 0.0047 (t = 0.5 / 0.25 / 0.75); test_bal 32.8 / 32.2 / 33.9 dB, LPIPS 0.028 / 0.031 / 0.027.
+Post-training quantisation costs visible quality on test_bal (AMD's fp16 network is at LPIPS 0.049 against the truth
+there, so int8 adds roughly half of that again); the QAT models (amd_mlfg_v1 qatft / qatsp) are what should close it:
+`mlfg_weights.py --int8` on their OUT_int8.npz, then the gates above.
+
+**Cost** (RTX 4070 shared with the amd_mlfg_v1 training run, 18-20% utilisation sampled; `parity --bench`, ms a rendered
+frame, 2 repetitions):
+
+| | 1080p 2x | 4K 2x |
+|---|---|---|
+| int8 cuda (D3D12 / Vulkan) | 3.80 / 4.02 | 8.76 / 8.96 |
+| int8 generic dot4 (D3D12 / Vulkan) | 5.99 / 5.16 | 14.45 / 13.45 |
+| int8 generic 32-bit integers (D3D12 / Vulkan) | 7.55 / 7.35 | 20.53 / 20.46 |
+| fp16 cuda (D3D12 / Vulkan), same session | 2.81 / 3.14 | 7.17 / 7.48 |
+| fp16 generic (D3D12 / Vulkan), same session | 21.0 / 15.2 | 66.7 / 45.0 |
+
+int8 dot4 is 3.1-4.6x faster than the fp16 generic tier it replaces; the int8 CUDA tier beats generic int8 by 4.5-5.7 ms
+at 4K (kept under the 0.2-0.3 ms rule) but stays 1.5 ms behind fp16 CUDA, hence auto = fp16 on RTX. Where 4K int8 dot4
+goes (Vulkan, NFRUX_TEST_TIMES): network layers 8.9 ms (the 24->32 stage-2 input layer with its fp16 staging 0.49, eight
+96-channel 3x3 residual layers 0.2 each, the 1x1 FasterNet layers 0.08-0.10 each), glue 2.0 ms.
+
+Not done: a Vulkan cooperative-matrix int8 tier. The GPUs it would serve (AMD RX 7000+, Intel Arc) run the fp16 coopmat
+tier under auto, so it would only matter with AmdPrecision=int8 forced, and none of them is here to measure it (on NVIDIA
+Vulkan the CUDA int8 kernels run). CUDA kernels for the block entries / pconv and a fused int8 FasterNet kernel (what the
+fp16 CUDA tier has) were not written: the int8 CUDA tier only runs when int8 is forced on RTX.
