@@ -4,6 +4,7 @@
 #include "vulkan_network.h"
 #include "tosa_graph.h"
 #include "../log.h"
+#include "../rungs.h"
 
 #include <algorithm>
 #include <climits>
@@ -509,10 +510,10 @@ namespace ffx_ml
         auto allowed = [&](Path p) { return forcedPath == Path::Auto || forcedPath == p; };
 
         // Is the coop-matrix kernel buildable on this device? Needs the extension plus at least one matrix type.
-        if ((allowed(Path::CoopMat) || forcedPath == Path::Auto) && (features & FEATURE_COOPERATIVE_MATRIX) &&
-            (features & FEATURE_VULKAN_MEMORY_MODEL) && fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR && forcedPath != Path::Dot4 &&
-            forcedPath != Path::Scalar)
-        {
+        auto coopMat = [&]() -> bool {
+            if (!(allowed(Path::CoopMat) && (features & FEATURE_COOPERATIVE_MATRIX) && (features & FEATURE_VULKAN_MEMORY_MODEL) &&
+                  fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR))
+                return false;
             uint32_t count = 0;
             fn.GetPhysicalDeviceCooperativeMatrixPropertiesKHR(context.physicalDevice, &count, nullptr);
             std::vector<VkCooperativeMatrixPropertiesKHR> shapes(count, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
@@ -565,12 +566,14 @@ namespace ffx_ml
                 if (sel.vendor == Vendor::Intel && (features & FEATURE_SUBGROUP_SIZE_CONTROL) && best->NSize >= sizeControl.minSubgroupSize && best->NSize <= sizeControl.maxSubgroupSize)
                     sel.subgroupSize = best->NSize, sel.requireSubgroupSize = true;
                 sel.workgroupSize = sel.numSubgroups * sel.subgroupSize;
-                return sel;
+                return true;
             }
-        }
+            return false;
+        };
 
-        if (allowed(Path::Dot4) && (features & FEATURE_INTEGER_DOT_PRODUCT))
-        {
+        auto dot4 = [&]() -> bool {
+            if (!(allowed(Path::Dot4) && (features & FEATURE_INTEGER_DOT_PRODUCT)))
+                return false;
             sel.path          = Path::Dot4;
             sel.workgroupSize = tuning.vectorWorkgroup;
             sel.dot4Tiled     = tuning.dot4Tiled != 0;
@@ -586,8 +589,21 @@ namespace ffx_ml
                 sel.subgroupSize        = sgSize;
                 sel.requireSubgroupSize = true;
             }
-            return sel;
+            return true;
+        };
+
+        // Automatic: the architecture's order with its quirks (core/rungs.h); forced: that path, else down the ladder.
+        std::vector<nfrux::Rung> order = {nfrux::Rung::CoopMat, nfrux::Rung::Dot4};
+        if (forcedPath == Path::Auto)
+        {
+            nfrux::Gpu gpu;
+            gpu.vendorId = props.properties.vendorID, gpu.deviceId = props.properties.deviceID, gpu.driverId = uint32_t(driver.driverID);
+            gpu.name = props.properties.deviceName, gpu.vulkan = true;
+            order = nfrux::PlanFor(gpu).order;
         }
+        for (nfrux::Rung r : order)
+            if ((r == nfrux::Rung::CoopMat && coopMat()) || (r == nfrux::Rung::Dot4 && dot4()))
+                return sel;
 
         sel.path          = Path::Scalar;
         sel.workgroupSize = tuning.vectorWorkgroup;

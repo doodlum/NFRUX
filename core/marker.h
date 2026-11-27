@@ -8,4 +8,6 @@ namespace nfrux
 bool MarkerBegin(const std::string& rung);
 // The rung got through its first frames (or an orderly end): the count goes back to zero.
 void MarkerOk(const std::string& rung);
+// %LOCALAPPDATA%\NFRUX (made if missing); empty when there is none. The markers and the rung cache (rungs.h) live there.
+std::wstring NfruxFolder();
 }

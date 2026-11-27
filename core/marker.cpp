@@ -12,7 +12,7 @@
 namespace nfrux
 {
 // Wide paths: a user name outside the system code page must not lose CUDA.
-static std::wstring Path(const std::string& rung)
+std::wstring NfruxFolder()
 {
     std::wstring p(32768, 0);
     const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", p.data(), DWORD(p.size()));
@@ -20,6 +20,12 @@ static std::wstring Path(const std::string& rung)
     p.resize(n);
     std::wstring s = p + L"\\NFRUX";
     CreateDirectoryW(s.c_str(), nullptr);
+    return s;
+}
+static std::wstring Path(const std::string& rung)
+{
+    const std::wstring s = NfruxFolder();
+    if (s.empty()) return {};
     // A new driver is a new chance: its file's time is in the name.
     wchar_t dll[MAX_PATH] = {};
     GetSystemDirectoryW(dll, MAX_PATH - 20), wcscat_s(dll, L"\\nvcuda.dll");

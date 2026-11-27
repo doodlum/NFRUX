@@ -382,6 +382,9 @@ bool FrameGenerator::Generate(const EvalInputs& in)
     const Rect alphaRect = RegionOf(in.uiAlpha, in.uiAlphaRect, in.back, l.back), layerRect = RegionOf(in.ui, in.uiRect, in.back, l.back);
     l.uiAlpha = Fits(alphaRect, in.uiAlpha, l.back), l.uiLayer = !l.uiAlpha && Fits(layerRect, in.ui, l.back);
     l.ui = l.uiAlpha ? alphaRect : layerRect;
+    if (const int ui = l.uiAlpha ? 2 : l.uiLayer ? 3 : l.hasHudless ? 1 : 0; ui != m_uiInput)
+        Log("UI from %s (frame %llu)", ui == 2 ? "the UI alpha" : ui == 3 ? "the UI layer" : ui == 1 ? "the HUD-less difference" : "nowhere: none kept",
+            (unsigned long long)m_evaluations), m_uiInput = ui;
     l.noWarp = RegionOf(in.noWarp, in.noWarpRect, in.back, l.back), l.hasNoWarp = Fits(l.noWarp, in.noWarp, l.back);
     l.whole = Whole(l.back, in.back) && (!l.hasHudless || (Whole(l.hudless, in.hudless) && in.hudless.format == in.back.format)) &&
               (!l.uiAlpha || Whole(l.ui, in.uiAlpha)) && (!l.uiLayer || Whole(l.ui, in.ui)) && (!l.hasNoWarp || Whole(l.noWarp, in.noWarp));

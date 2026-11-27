@@ -7,8 +7,10 @@
 #include "log.h"
 #include "marker.h"
 #include "model.h"
+#include "rungs.h"
 
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <vulkan/vulkan.h>
 
 #include <NRI.h>
@@ -116,6 +118,7 @@ struct NetN : Network
     std::unique_ptr<TexN>          tex[2];
     uint32_t                       width = 0;  // the input's; the self-check's is 64
     uint32_t                       pitch = 0, order[2] = {0, 1};  // D3D12: which of out[] the graph's output i is
+    Rung                           rung = Rung::Scalar;           // what it runs on
 };
 
 class DevN : public Device
@@ -162,7 +165,11 @@ public:
         if (markBack) n.DestroyBuffer(markBack);
         for (auto& r : retired) if (r.cmd) n.DestroyCommandBuffer(r.cmd);
         wrapped.clear(), retired.clear(), scratch.clear();
-        if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : Rung());
+        if (trial && !Lost()) for (auto& m : trial->markers) MarkerOk(m);
+        trial.reset(), trialOld.clear();
+        if (timerPool) n.DestroyQueryPool(timerPool);
+        if (timerBack) n.DestroyBuffer(timerBack);
+        if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : CudaRung());
         if (vkMarked && !vk.marker.empty()) MarkerOk(vk.marker);
         if (!matMarker.empty() && !Lost()) MarkerOk(matMarker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
@@ -243,7 +250,18 @@ public:
         LogD3D12Messages(device);
         c.dot4 = c.shaderModel >= 0x64;
         c.cuda  = c.vendorId == uint32_t(nri::Vendor::NVIDIA) && GetModuleHandleA("nvapi64.dll");
+        IDXGIFactory4* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory))))
+        {
+            IDXGIAdapter* adapter = nullptr;
+            LARGE_INTEGER umd = {};
+            if (SUCCEEDED(factory->EnumAdapterByLuid(device->GetAdapterLuid(), __uuidof(IDXGIAdapter), reinterpret_cast<void**>(&adapter))))
+                adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd), adapter->Release();
+            factory->Release();
+            c.driverVersion = uint64_t(umd.QuadPart);
+        }
         Log("D3D12 (NRI): %s, shader model %x, dot4 %d", c.name.c_str(), c.shaderModel, c.dot4);
+        MakePlan();
         return c.shaderModel >= 0x60;
     }
     bool InitVulkan(const VulkanHost& h)
@@ -259,8 +277,26 @@ public:
         if (!NRI_OK(nri::nriCreateDeviceFromVKDevice(d, dev)) || !Init()) return false;
         
         c.dot4 = (h.mlFeatures & ffx_ml::FEATURE_INTEGER_DOT_PRODUCT) != 0, c.cooperativeMatrix = (h.mlFeatures & ffx_ml::FEATURE_COOPERATIVE_MATRIX) != 0;
+        {
+            VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2      p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+            if (auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(h.gipa(h.instance, "vkGetPhysicalDeviceProperties2"))) get(h.physicalDevice, &p2);
+            c.driverId = uint32_t(dp.driverID), c.driverVersion = p2.properties.driverVersion;
+        }
         Log("Vulkan (NRI): %s, dot4 %d, cooperative matrix %d", c.name.c_str(), c.dot4, c.cooperativeMatrix);
+        MakePlan();
         return true;
+    }
+    // The rung order for this GPU (rungs.h) and its key in the rung cache.
+    RungPlan    plan;
+    std::string cachePrefix;
+    void MakePlan()
+    {
+        const Gpu g = GpuOf(c, isVk);
+        plan = PlanFor(g), cachePrefix = CachePrefix("nfru", g, c.driverVersion);
+        std::string o;
+        for (Rung r : plan.order) o += std::string(o.empty() ? "" : ", ") + RungName(r);
+        Log("rungs: %s, order %s%s%s", plan.arch, o.c_str(), plan.quirk ? "; quirk: " : "", plan.quirk ? plan.quirk : "");
     }
 
     std::unique_ptr<TexN> MakeTex(nri::Format f, uint32_t w, uint32_t h, bool storage)
@@ -421,17 +457,163 @@ public:
         return true;
     }
     bool iniRefused = false;  // what nfrux.ini asks for cannot be made here
+    bool cacheRefused = false;  // the cached rung could not be made, or a self-check failed: the plan's ladder from here on
     std::unique_ptr<Network> CreateNetwork(uint32_t w, uint32_t h, std::string* error) override
     {
         std::lock_guard<std::mutex> lock(making);  // worker threads
         if (const char* ml = Env("NFRUX_ML")) return MakeNetwork(w, h, error, ml, false);  // tests: strict
-        const char* ml = iniRefused ? nullptr : Option(isVk ? "vulkan" : "d3d12", "network");
-        if (!ml) return MakeNetwork(w, h, error, nullptr, false);
-        std::string why;
-        if (auto net = MakeNetwork(w, h, &why, ml, true)) return net;
-        Log("nfrux.ini: network=%s cannot be used (%s): the automatic choice instead", ml, why.c_str());
-        iniRefused = true;
-        return MakeNetwork(w, h, error, nullptr, false);
+        if (const char* ml = iniRefused ? nullptr : Option(isVk ? "vulkan" : "d3d12", "network"))
+        {
+            std::string why;
+            if (auto net = MakeNetwork(w, h, &why, ml, true)) return net;
+            Log("nfrux.ini: network=%s cannot be used (%s): the automatic choice instead", ml, why.c_str());
+            iniRefused = true;
+        }
+        // Automatic: the rung timed for this size class (the self-check's small network: the latest timed), with crash markers;
+        // else the plan, and the rungs are timed at this size if nothing is cached for it.
+        const bool check = w < 128 && h < 128;
+        if (topRung || noFloats) cacheRefused = true;
+        Rung r;
+        if (!cacheRefused && CachedRung(cachePrefix, check ? -1 : int(ResolutionClass(w, h)), &r))
+        {
+            std::string why;
+            if (auto net = MakeNetwork(w, h, &why, RungName(r), true)) return net;
+            Log("cached rung %s cannot be used (%s): the automatic choice", RungName(r), why.c_str());
+            cacheRefused = true;
+        }
+        auto net = MakeNetwork(w, h, error, nullptr, false);
+        if (net && !check && !trialTried && !cacheRefused) StartTrial(w, h);
+        return net;
+    }
+
+    // Rung timing (rungs.h): every rung valid here, made at the real size, run beside the frames' own network for kTrialFrames
+    // recordings, each run between timestamps; the fastest median is cached. Outputs are not used (all rungs give the same bytes, D2).
+    static constexpr uint32_t kTrialFrames = 6;
+    struct Trial
+    {
+        uint32_t w = 0, frames = 0, value = 0, cls = 0;
+        std::vector<std::pair<Rung, std::unique_ptr<Network>>> nets;
+        RungTimes                times;
+        std::vector<std::string> markers;  // crash markers the candidates began: cleared when their runs have come back
+    };
+    std::mutex             trialLock;  // the worker makes it, the recording thread runs it
+    std::unique_ptr<Trial> trial;
+    std::vector<std::pair<uint32_t, std::unique_ptr<Network>>> trialOld;  // freed 16 recordings after the trial
+    bool trialTried = false, quiet = false;
+    void StartTrial(uint32_t w, uint32_t h)
+    {
+        trialTried = true;
+        auto t = std::make_unique<Trial>();
+        t->w = w, t->cls = ResolutionClass(w, h);
+        for (Rung r : plan.order)
+        {
+            // The floor is not timed: never faster than dot4, and many times slower at 4K.
+            if (r == Rung::Scalar || (r == Rung::Cuda && cudaState != 1) || (r == Rung::CoopMat && !c.cooperativeMatrix) || (r == Rung::Dot4 && !c.dot4)) continue;
+            // MakeNetwork keeps the ladder's state: the candidate's is put back, only its new crash marker is kept.
+            const int sr = rung, st = topRung, cs = cudaState;
+            const bool lf = lastFloat, vc = vkCuda;
+            const std::string mm = matMarker;
+            std::string why;
+            matMarker.clear(), quiet = true;
+            auto net = MakeNetwork(w, h, &why, RungName(r), true);
+            if (!matMarker.empty() && matMarker != mm) { if (net) t->markers.push_back(matMarker); else MarkerOk(matMarker); }
+            rung = sr, topRung = st, cudaState = cs, lastFloat = lf, vkCuda = vc, matMarker = mm, quiet = false;
+            if (net && static_cast<NetN&>(*net).rung == r) t->nets.push_back({r, std::move(net)});
+        }
+        if (t->nets.size() < 2) { for (auto& m : t->markers) MarkerOk(m); return; }  // nothing to choose from
+        Log("rung timing at %ux%u: %zu rungs, %u recordings", w, h, t->nets.size(), kTrialFrames);
+        std::lock_guard<std::mutex> lock(trialLock);
+        trial = std::move(t);
+    }
+    void RunNetworks(Network* const* nets, uint32_t count) override
+    {
+        Run(nets, count);
+        std::lock_guard<std::mutex> lock(trialLock);
+        if (!trial || !count || trial->frames >= kTrialFrames || trial->value == slotValue[slot] || static_cast<NetN&>(*nets[0]).width != trial->w) return;
+        trial->value = slotValue[slot];  // once a recording
+        for (auto& [r, net] : trial->nets)
+        {
+            if (!trial->frames) Fill(*static_cast<NetN&>(*net).in, 0);  // defined input
+            Network* p = net.get();
+            const int t = TimerBegin();
+            Run(&p, 1);
+            TimerEnd(t);
+            trial->times.Add(r, t);
+        }
+        ++trial->frames;
+    }
+    void FinishTrial()  // at BeginFrame
+    {
+        for (auto it = trialOld.begin(); it != trialOld.end();) if (next - it->first >= 16) it = trialOld.erase(it); else ++it;
+        std::lock_guard<std::mutex> lock(trialLock);
+        if (!trial || trial->frames < kTrialFrames) return;
+        Rung best = Rung::Scalar;
+        bool usable = false;
+        std::string text;
+        if (!trial->times.Result(*this, &best, &usable, &text)) return;
+        if (usable) CacheRung(cachePrefix, trial->cls, best);
+        Log("rung timing: %s: %s%s", text.c_str(), usable ? RungName(best) : "timers unavailable, nothing", " cached for the next start");
+        for (auto& m : trial->markers) MarkerOk(m);
+        for (auto& x : trial->nets) trialOld.push_back({next, std::move(x.second)});
+        trial.reset();
+    }
+    // Timestamp pairs for the rung timing: one pool, tickets never reused (a trial takes a few dozen).
+    static constexpr int kTimers = 64;
+    nri::QueryPool* timerPool = nullptr;
+    nri::Buffer*    timerBack = nullptr;
+    int             timerNext = 0;
+    std::pair<uint32_t, uint32_t> timerAt[kTimers] = {};  // the recording's slot and value
+    // Ticks a second of this device's timestamps (a wrapped D3D12 device has no queue NRI can ask: a compute queue made for it).
+    double timestampHz = 0;
+    double TimestampHz()
+    {
+        if (timestampHz == 0) timestampHz = double(n.GetDeviceDesc(*dev).other.timestampFrequencyHz);
+        if (timestampHz == 0 && d3d)
+        {
+            ID3D12CommandQueue*      q  = nullptr;
+            D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_COMPUTE};
+            uint64_t                 f  = 0;
+            if (SUCCEEDED(d3d->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&q)))) q->GetTimestampFrequency(&f), q->Release();
+            timestampHz = double(f);
+        }
+        return timestampHz;
+    }
+    int TimerBegin() override
+    {
+        if (!cmd || timerNext >= kTimers) return -1;
+        if (!timerPool)
+        {
+            nri::QueryPoolDesc q = {};
+            q.queryType = nri::QueryType::TIMESTAMP, q.capacity = kTimers * 2;
+            if (!NRI_OK(n.CreateQueryPool(*dev, q, timerPool)) || !(timerBack = Committed(kTimers * 16, nri::MemoryLocation::HOST_READBACK, nri::BufferUsageBits::NONE)))
+                return timerNext = kTimers, -1;
+        }
+        const int t = timerNext++;
+        Flush();
+        n.CmdResetQueries(*cmd, *timerPool, 2 * t, 2);
+        n.CmdEndQuery(*cmd, *timerPool, 2 * t);
+        return t;
+    }
+    void TimerEnd(int t) override
+    {
+        if (t < 0 || !cmd) return;
+        Flush();
+        n.CmdEndQuery(*cmd, *timerPool, 2 * t + 1);
+        n.CmdCopyQueries(*cmd, *timerPool, 2 * t, 2, *timerBack, uint64_t(t) * 16);
+        timerAt[t] = {slot, slotValue[slot]};
+    }
+    double TimerMs(int t) override
+    {
+        if (t < 0 || t >= timerNext || !timerAt[t].second) return -2;
+        if (!Done(timerAt[t].first, timerAt[t].second)) return -1;
+        double ms = -2;
+        if (const auto* q = static_cast<const uint64_t*>(n.MapBuffer(*timerBack, 0, nri::WHOLE_SIZE)))
+        {
+            const double hz = TimestampHz();
+            if (hz > 0 && q[2 * t + 1] >= q[2 * t]) ms = double(q[2 * t + 1] - q[2 * t]) * 1000.0 / hz;
+            n.UnmapBuffer(*timerBack);
+        }
+        return ms;
     }
     std::unique_ptr<Network> MakeNetwork(uint32_t w, uint32_t h, std::string* error, const char* ml, bool guarded)  // guarded: crash markers count for a forced CUDA too
     {
@@ -459,7 +641,7 @@ public:
             }
             // CUDA kernels first where they can be launched (NVIDIA tensor cores): the same as on D3D12.
             const bool forced = ml && !strcmp(ml, "cuda") && !topRung && cudaState >= 0;
-            if (forced || (!ml && !topRung && !noFloats && cudaState >= 0 && c.vendorId == uint32_t(nri::Vendor::NVIDIA) && (vk.mlFeatures & kFeatureCudaLaunch)))
+            if (forced || (!ml && !topRung && !noFloats && cudaState >= 0 && Has(plan, Rung::Cuda) && (vk.mlFeatures & kFeatureCudaLaunch)))
             {
                 std::string why;
                 if (cudaState == 0)
@@ -487,7 +669,7 @@ public:
             if (path != ffx_ml::Path::Auto && !topRung && sel.path != path) { if (error) *error = "forced network path unavailable"; return nullptr; }
             if (net->cudaVk)
             {
-                lastFloat = false, rung = 0, what = "CUDA kernels, int8 tensor cores (Vulkan)";
+                lastFloat = false, rung = 0, net->rung = Rung::Cuda, what = "CUDA kernels, int8 tensor cores (Vulkan)";
                 for (uint32_t i = 0; i < 2; ++i) net->order[i] = net->cudaVk->outputBinding(i) == mb.params ? 0 : 1;
             }
             else
@@ -516,6 +698,7 @@ public:
                 net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
                 if (!net->vk) return nullptr;
                 what = sel.Describe();
+                net->rung = sel.path == ffx_ml::Path::CoopMat ? Rung::CoopMat : sel.path == ffx_ml::Path::Dot4 ? Rung::Dot4 : Rung::Scalar;
             }
             vkCuda = net->cudaVk != nullptr;
         }
@@ -523,18 +706,19 @@ public:
         {
             if (ml && strcmp(ml, "scalar") && strcmp(ml, "cuda") && (strcmp(ml, "dot4") || !c.dot4)) { if (error) *error = "NFRUX_ML: path unavailable on D3D12"; return nullptr; }
             const bool forced = ml && !strcmp(ml, "cuda") && !topRung;
-            if (forced || (!ml && !topRung && c.vendorId == uint32_t(nri::Vendor::NVIDIA)))
+            if (forced || (!ml && !topRung && Has(plan, Rung::Cuda)))
             {
                 std::string why;
-                if (cudaState == 0) cudaState = (forced && !guarded) || MarkerBegin(Rung()) ? 1 : -1;
+                if (cudaState == 0) cudaState = (forced && !guarded) || MarkerBegin(CudaRung()) ? 1 : -1;
                 if (cudaState > 0) net->cuda = CudaGraph::Create(d3d, DescribeModel(w, h), &why);
-                if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(Rung()), cudaState = -1;
+                if (!net->cuda && cudaState > 0) Log("CUDA network not used: %s", why.c_str()), MarkerOk(CudaRung()), cudaState = -1;
                 if (forced && !net->cuda) { if (error) *error = "NFRUX_ML=cuda: " + why; return nullptr; }
             }
             const bool dot4 = c.dot4 && topRung < 2 && !(ml && !strcmp(ml, "scalar"));
             if (!net->cuda) net->d3d = D3D12Graph::Create(d3d, DescribeModel(w, h), dot4, error);
             if (!net->d3d && !net->cuda) return nullptr;
             rung = net->cuda ? 0 : dot4 ? 1 : 2;
+            net->rung = net->cuda ? Rung::Cuda : dot4 ? Rung::Dot4 : Rung::Scalar;
             what = net->cuda ? "CUDA kernels, int8 tensor cores" : dot4 ? "shader model 6.4 packed dot product" : "shader model 6.0 integers";
             for (uint32_t i = 0; i < 2; ++i) net->order[i] = (net->cuda ? net->cuda->outputBinding(i) : net->d3d->outputBinding(i)) == mb.params ? 0 : 1;
         }
@@ -559,7 +743,7 @@ public:
         static std::mutex logMutex;
         static std::string logged;
         std::lock_guard<std::mutex> logLock(logMutex);
-        if (logged != what) Log("network %ux%u: %s", w, h, what.c_str()), logged = what;
+        if (logged != what && !quiet) Log("network %ux%u: %s", w, h, what.c_str()), logged = what;
         return net;
     }
 
@@ -590,7 +774,7 @@ public:
     uint32_t    finished = 0;
     bool        marked = false, ran = false;
     uint32_t    firstRun = 0;  // finished when the network first ran at its real size
-    std::string Rung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
+    std::string CudaRung() const { char b[64]; snprintf(b, sizeof(b), "cuda_%04x_%08lx%08lx", c.deviceId, (unsigned long)d3d->GetAdapterLuid().HighPart, (unsigned long)d3d->GetAdapterLuid().LowPart); return b; }
     bool Lost() const { return d3d && FAILED(d3d->GetDeviceRemovedReason()); }
     // A slot whose last recording has finished (its own value in its own token). Full of unfinished ones: wait once, 2 s, for any.
     bool TakeSlot()
@@ -614,8 +798,9 @@ public:
     bool BeginFrame(void* commands) override
     {
         Poll();
+        FinishTrial();
         // Recordings from well after the network first ran have completed (those before it say nothing).
-        if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : Rung());
+        if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : CudaRung());
         if (vkMarked && !vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
         if (!matMarker.empty() && ran && finished >= firstRun + 40) MarkerOk(matMarker), matMarker.clear();
         nativeCmd = commands, t_recording = true;
@@ -823,7 +1008,7 @@ public:
         To(a, nri::AccessBits::COPY_DESTINATION, nri::StageBits::COPY), Flush();
         n.CmdCopyBuffer(*cmd, *a.buf, 0, *ones, 0, a.size);
     }
-    void RunNetworks(Network* const* nets, uint32_t count) override
+    void Run(Network* const* nets, uint32_t count)
     {
         // The markers wait for the real size: the self-check's network is 64 wide, and a driver may take that and not the other.
         bool real = false;

@@ -74,6 +74,7 @@ private:
     std::unique_ptr<Texture> m_prepared, m_composed[kMaxGenerated], m_menuCounts;
     Format   m_composeFormat = Format::Unknown;
     bool     m_staged = false, m_inMenu = false, m_hudlessLogged = false, m_formatLogged = false;
+    int      m_uiInput = -1;  // the UI input last logged: 0 none, 1 HUD-less difference, 2 alpha, 3 layer
     uint32_t m_menuStep = 0;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> m_menuReads;
     const Texture* Crop(const EvalInputs& in, bool depth, const Rect& r, uint32_t w, uint32_t h);

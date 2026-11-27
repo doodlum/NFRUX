@@ -192,6 +192,14 @@ params / gate textures on every path (paths that write images directly are an op
 
 `Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
 
+Automatic choice (`core/rungs.cpp`): a prior order per architecture family by PCI device ID (NVIDIA with / without tensor cores, AMD RDNA3/4
+with matrix units / older, Intel Arc Alchemist / Battlemage / integrated), then a quirk list (NVIDIA without tensor cores: no cooperative
+matrices, the driver emulates them; AMDVLK and Arc A-series: cooperative matrices ranked below dot4). On the first start for a GPU, driver,
+NFRUX build and resolution class (up to 0.25 / 1 / 4 MP, above), every valid rung but the floor is made at the real size and timed beside
+the frames for six recordings (GPU timestamps, medians; the outputs are identical, D2); the fastest is cached in
+`%LOCALAPPDATA%\NFRUX\rungs.txt` and used from the next start. The ini and crash markers still win; a cached rung that cannot be made, or
+a crash-marked ladder, goes back to the plan. `tests/rungs_test.cpp` checks the plan for GPUs not on the test machine.
+
 | | 1st | 2nd | floor |
 |---|---|---|---|
 | Vulkan (NVIDIA tensor cores, Intel XMX, AMD WMMA) | NVIDIA: CUDA kernels (VK_NVX_binary_import, the same as D3D12's), then cooperative matrix fp16, int8; elsewhere int8, fp16 (exact, D2) | dot4 (`shaderIntegerDotProduct`) | 32-bit integer |

@@ -81,6 +81,8 @@ struct Caps
 {
     std::string name;
     uint32_t    vendorId = 0, deviceId = 0;
+    uint32_t    driverId = 0;       // Vulkan: VkDriverId; D3D12: 0
+    uint64_t    driverVersion = 0;  // Vulkan: driverVersion; D3D12: the user-mode driver's version
     bool        native16Bit = false, dot4 = false, cooperativeMatrix = false, cuda = false, opticalFlow = false;
     uint32_t    shaderModel = 0;  // D3D12: 60, 62, 64, 66, ...
     std::string Describe() const;
@@ -133,6 +135,11 @@ public:
     // GPU time (microseconds) per label of the last profiled frame, when profiling is on.
     virtual std::vector<std::pair<std::string, float>> Profile() { return {}; }
     virtual bool WaitIdle() = 0;  // before destroying what the GPU may still use; false: still busy after 2 s
+    // Rung timing (core/rungs.h): GPU timestamps around what is recorded between Begin and End. A ticket (-1: none left);
+    // its milliseconds once that recording has finished: -1 not yet, -2 unavailable.
+    virtual int    TimerBegin() { return -1; }
+    virtual void   TimerEnd(int ticket) {}
+    virtual double TimerMs(int ticket) { return -2; }
 };
 
 uint32_t TexelSize(Format f);
