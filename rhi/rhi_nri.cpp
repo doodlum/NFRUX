@@ -311,25 +311,28 @@ public:
         Log("rungs: %s, order %s%s%s", plan.arch, o.c_str(), plan.quirk ? "; quirk: " : "", plan.quirk ? plan.quirk : "");
     }
 
-    std::unique_ptr<TexN> MakeTex(nri::Format f, uint32_t w, uint32_t h, bool storage)
+    // storeAs: the storage view's format, one of f's size (Vulkan images are made format-mutable by NRI); f when unknown.
+    std::unique_ptr<TexN> MakeTex(nri::Format f, uint32_t w, uint32_t h, bool storage, nri::Format storeAs = nri::Format::UNKNOWN)
     {
+        if (storeAs == nri::Format::UNKNOWN) storeAs = f;
         auto t = std::make_unique<TexN>();
         t->dev = this, t->width = w, t->height = h;
         nri::TextureDesc d = {};
         d.type = nri::TextureType::TEXTURE_2D, d.format = f, d.width = nri::Dim_t(w), d.height = nri::Dim_t(h), d.depth = d.mipNum = d.layerNum = 1, d.sampleNum = 1;
         d.usage = nri::TextureUsageBits::SHADER_RESOURCE;
-        const bool uav = storage && (uint32_t(n.GetFormatSupport(*dev, f)) & uint32_t(nri::FormatSupportBits::STORAGE_TEXTURE)) != 0;
+        const bool uav = storage && (uint32_t(n.GetFormatSupport(*dev, storeAs)) & uint32_t(nri::FormatSupportBits::STORAGE_TEXTURE)) != 0;
         if (uav) d.usage |= nri::TextureUsageBits::SHADER_RESOURCE_STORAGE;
         if (!NRI_OK(n.CreateCommittedTexture(*dev, nri::MemoryLocation::DEVICE, 0.0f, d, t->tex))) return nullptr;
         if (Env("NFRUX_TEST_NAMES")) n.SetDebugName(t->tex, "NFRUX texture");
-        return Views(*t, f, uav) ? std::move(t) : nullptr;
+        return Views(*t, f, uav, storeAs) ? std::move(t) : nullptr;
     }
-    bool Views(TexN& t, nri::Format f, bool storage)
+    bool Views(TexN& t, nri::Format f, bool storage, nri::Format storeAs = nri::Format::UNKNOWN)
     {
         nri::TextureViewDesc v = {};
         v.texture = t.tex, v.type = nri::TextureView::TEXTURE, v.format = f, v.mipNum = v.layerNum = 1, v.planes = t.planes;
         if (!NRI_OK(n.CreateTextureView(v, t.srv))) return false;
         v.type = nri::TextureView::STORAGE_TEXTURE;
+        if (storeAs != nri::Format::UNKNOWN) v.format = storeAs;
         return !storage || NRI_OK(n.CreateTextureView(v, t.uav));
     }
     std::unique_ptr<BufN> MakeBuf(uint64_t size)
@@ -416,8 +419,10 @@ public:
     std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& e, uint32_t w, uint32_t h, bool storage) override
     {
         const nri::Format f = HostFormat(e);
-        auto t = MakeTex(f, w, h, storage && StoreClass(f) != Format::Unknown);
-        if (t) t->format = Format::Native, t->storeFormat = t->uav ? StoreClass(f) : Format::Unknown;
+        // Vulkan BGRA8: written through an RGBA8 view (the composite stores blue first there, as for its BGRA8 outputs).
+        const nri::Format as = isVk && f == nri::Format::BGRA8_UNORM ? nri::Format::RGBA8_UNORM : f;
+        auto t = MakeTex(f, w, h, storage && StoreClass(as) != Format::Unknown, as);
+        if (t) t->format = Format::Native, t->storeFormat = t->uav ? StoreClass(as) : Format::Unknown;
         return t;
     }
     std::unique_ptr<Buffer> CreateBuffer(uint64_t size) override { return MakeBuf(size); }

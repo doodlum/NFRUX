@@ -903,7 +903,7 @@ layout(set     = 0,
        OUTPUT_IMG_FORMAT) uniform image2D rw_previous_interpolation_source;
 void StorePreviousInterpolationSource(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FFX_MIN16_F4 val)
 {
-    imageStore(rw_previous_interpolation_source, iPxPos, val);
+    imageStore(rw_previous_interpolation_source, iPxPos, (cbFI._Options & 0x1000u) != 0u ? val.bgra : val);  // NFRUX: blue first (a BGRA8 history through an RGBA8 view)
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_PREVIOUS_INTERPOLATION_SOURCE)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_PREVIOUS_INTERPOLATION_SOURCE) out mediump FfxFloat32x4 rw_previous_interpolation_source;
