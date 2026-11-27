@@ -12,7 +12,7 @@
 #include "tosa_graph.h"
 #include "vulkan_network.h"
 
-#include <nfru_mfg_v1_int8.h>
+#include <nfru_mfg_v15_int8.h>
 
 #include <algorithm>
 #include <cinttypes>
@@ -684,7 +684,7 @@ int main(int argc, char** argv)
     std::vector<Model> models;
     // NFRU's graph takes the motion lane (the render size, 540 rows at most; 744x464 for a 742x464 render) and outputs at
     // half that.
-    models.push_back(MakeModel("nfru_mfg_v1_int8", g_nfru_mfg_v1_int8_Info, getenv("FFX_ML_NFRU_H") ? atoi(getenv("FFX_ML_NFRU_H")) : 464,
+    models.push_back(MakeModel("nfru_mfg_v15_int8", g_nfru_mfg_v15_int8_Info, getenv("FFX_ML_NFRU_H") ? atoi(getenv("FFX_ML_NFRU_H")) : 464,
                                getenv("FFX_ML_NFRU_W") ? atoi(getenv("FFX_ML_NFRU_W")) : 744));
     for (Model& m : models)
         m.desc.spirv = m.words.data();  // re-point after the copies into the vector

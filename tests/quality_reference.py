@@ -14,7 +14,7 @@ from ng_model_gym.usecases.nfru_mfg.train_mfg import PairDataset, build_state, l
 
 PARITY = os.environ.get("PARITY", r"C:\dev\NFRUX\build\Release\parity.exe")
 API = os.environ.get("API", "d3d12")
-CKPT = {"torch": r"C:\dev\modelgym\output\nfru_mfg\qat1\last.pt", "arm+prior": "arm", "arm": "arm"}  # arm: as released, no prior
+CKPT = {"torch": r"C:\dev\modelgym\output\nfru_mfg_v15\qatf\last.pt", "arm+prior": "arm", "arm": "arm"}  # arm: as released, no prior
 PAIRS = int(os.environ.get("PAIRS", "4"))
 out = Path(sys.argv[1]); tmp = out.parent / "rec"; gen = out.parent / "gen"
 for d in (tmp, gen): d.mkdir(parents=True, exist_ok=True)

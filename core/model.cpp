@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: MIT
 #include "model.h"
-#include "nfru_mfg_v1_int8.h"
+#include "nfru_mfg_v15_int8.h"
 namespace nfrux
 {
 ModelBindings GetModelBindings()
 {
-    const auto& b = g_nfru_mfg_v1_int8_Info;
+    const auto& b = g_nfru_mfg_v15_int8_Info;
     return {b.inputTensorBindings[0], b.outputTensorBindings[0], b.outputTensorBindings[1]};
 }
 ffx_ml::GraphDesc DescribeModel(uint32_t width, uint32_t height)
 {
-    const auto&       b = g_nfru_mfg_v1_int8_Info;
+    const auto&       b = g_nfru_mfg_v15_int8_Info;
     ffx_ml::GraphDesc d;
     d.spirv      = reinterpret_cast<const uint32_t*>(b.graphData);
     d.spirvWords = b.graphDataSize / 4;

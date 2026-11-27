@@ -42,7 +42,7 @@ experiments/ measured and not used: DirectML, optical flow hardware; the CUDA la
 | NGX ABI | earlier NGX work | MIT |
 | Loader | ours | MIT |
 | Tests | `tests/` (A1 from the SDK's runtime test; the rest ours); the sample's scripting patch is kept outside the repository (A4) | MIT |
-| Weights | `nfru_mfg_v1_int8` (the early fine-tune; v14 was softer at 2x by LPIPS and by eye, 2026-11-25, RESULTS.md), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
+| Weights | `nfru_mfg_v15_int8` (2026-11-27: v15 QAT replaces the early v1 fine-tune; better LPIPS and sharper at 2x-6x on held-out sets and the sample recording, ~0.3 dB lower PSNR; RESULTS.md), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
 | NVAPI, CUDA functions | declared by us for the few entry points used, loaded dynamically | checked in M0, in THIRD_PARTY.md |
 | OptiScaler, dlssg-to-fsr3 | GPL-3.0: interface facts only | - |
 
@@ -61,7 +61,7 @@ scattered game vectors: measured no gain), optical flow once, reduction to the m
 tensor, network, inpainting, composite. A batch runs stage by stage.
 
 The graph is v1 (v14's inputs): channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0; 17-18 are clamped to 0..1 (saturate). All quantisation constants are
-`nfru_mfg_v1_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).
+`nfru_mfg_v15_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v15: input 0.003921569 / -128 (SNORM 0.4980392 / -1.00787), params 0.3125911 / 86 (SNORM 39.699 / 0.67717), gate 0.003921557 / -128; earlier v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).
 
 Flow at more than 1080 display rows: the SDK's colour reduction pass (01) gets an entry point and the flow, hints, flow scale
 and `_OfInputSizeRcp` use the reduced size (aspect kept, 1080 rows), as the SDK does. Sizes to 8K.
