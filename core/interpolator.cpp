@@ -403,7 +403,8 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     const bool down = allInput || colourDown;
     // The history written by the first composite where the colour's format is the composite's (else copied at the end).
     const bool storeHistory = backup.storeFormat == s.outputFormat;
-    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u);
+    const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u) |
+                           (in.uiSource ? 0u : 0x2000u);  // no UI source: the composite skips its UI test (the colour against itself)
 
     if (ofColour)
     {

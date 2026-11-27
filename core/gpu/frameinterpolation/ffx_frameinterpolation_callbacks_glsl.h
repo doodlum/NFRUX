@@ -249,6 +249,12 @@ FfxBoolean HasNoWarpMask()
     return (cbFI._Options & 0x100u) != 0u;
 }
 
+// No UI source: the UI test would compare the colour with itself (never UI), so it is skipped.
+FfxBoolean HasUiSource()
+{
+    return (cbFI._Options & 0x2000u) == 0u;
+}
+
 // An orthographic camera: view depth is linear in device depth (DeviceToViewSpaceTransformFactors .x + .y x depth).
 FfxBoolean IsOrthographic()
 {

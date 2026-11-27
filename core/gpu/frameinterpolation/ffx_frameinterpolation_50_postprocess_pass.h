@@ -72,7 +72,7 @@ bool QuadAny(bool b)
 shared uint32_t s_ui[FFX_FRAMEINTERPOLATION_THREAD_GROUP_WIDTH * FFX_FRAMEINTERPOLATION_THREAD_GROUP_HEIGHT];
 bool UiPixel(int32_t2 p)
 {
-    if (any(greaterThanEqual(p, DisplaySize())) || UiKind() == 2u || UiKind() == 3u)
+    if (any(greaterThanEqual(p, DisplaySize())) || UiKind() == 2u || UiKind() == 3u || !HasUiSource())
         return false;
     if (UiKind() == 4u || UiKind() == 5u)
         return LoadUiAlpha(p, UiKind() == 5u) > FFX_MIN16_F(0.4f);
@@ -170,6 +170,7 @@ void postprocess(int32_t2 output_pixel)
 
     // Write alpha composited output
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_SOURCE
+    if (HasUiSource())
     {
         const FFX_MIN16_F4 ui = LoadUiSource(output_pixel);
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_UI_ALPHA
