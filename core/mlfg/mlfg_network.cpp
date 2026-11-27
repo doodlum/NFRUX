@@ -787,7 +787,7 @@ bool Network::MakeInt8(std::string* error)
     for (uint32_t l = 0; l < kLayers; ++l)
     {
         const QLayerWeights& L = m_q.layers[l];
-        const uint32_t taps = L.k * L.k, cin4 = (L.cin + 3) / 4, coP = (L.cout + 7) & ~7u;
+        const uint32_t taps = L.k * L.k, cin4 = (L.cin + 3) / 4, coP = (L.cout + 31) & ~31u;
         w.resize((w.size() + 3) & ~size_t(3), 0);
         m_qOffset[l] = uint32_t(w.size());
         w.resize(w.size() + size_t(taps) * cin4 * coP + 2 * coP + cin4 * 4, 0);
@@ -823,6 +823,10 @@ bool Network::MakeInt8(std::string* error)
                         {&shaders::kMlfgQ8Conv1_d4, &shaders::kMlfgQ8Conv1s_d4}, {&shaders::kMlfgQ8ConvT_d4, &shaders::kMlfgQ8ConvTs_d4}};
     const S in[4][2] = {{&shaders::kMlfgQ8Conv3, &shaders::kMlfgQ8Conv3s}, {&shaders::kMlfgQ8Conv2, &shaders::kMlfgQ8Conv2s},
                         {&shaders::kMlfgQ8Conv1, &shaders::kMlfgQ8Conv1s}, {&shaders::kMlfgQ8ConvT, &shaders::kMlfgQ8ConvTs}};
+    const S o4[2][4] = {{&shaders::kMlfgQ8Conv3o, &shaders::kMlfgQ8Conv2o, &shaders::kMlfgQ8Conv1o, &shaders::kMlfgQ8ConvTo},
+                        {&shaders::kMlfgQ8Conv3o_d4, &shaders::kMlfgQ8Conv2o_d4, &shaders::kMlfgQ8Conv1o_d4, &shaders::kMlfgQ8ConvTo_d4}};
+    for (int i = 0; i < 4; ++i)
+        if (!(m_q8[i][2] = m_dev.CreatePass(*o4[m_dot4][i]))) return fail("int8 network passes");
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j)
             if (!(m_q8[i][j] = m_dev.CreatePass(*(m_dot4 ? d4 : in)[i][j]))) return fail("int8 network passes");
@@ -842,7 +846,7 @@ bool Network::RunQ(const QConv& c)
         (copyTo && (copyTo > c.src.pitch || c.src.ch)) || (L.qres != QLayerWeights::kNone) != bool(c.res))
         return false;
     const int32_t mode = (c.srcF16 ? 1 : 0) | ((L.flags & QLayerWeights::kF16Out) ? 2 : 0) | (c.outF16 ? 4 : 0) | (c.res ? 8 : 0);
-    const uint32_t coP = (L.cout + 7) & ~7u, taps = L.k * L.k, cin4 = (L.cin + 3) / 4;
+    const uint32_t coP = (L.cout + 31) & ~31u, taps = L.k * L.k, cin4 = (L.cin + 3) / 4;
     auto rcp = [](float s) { return s > 0.0f ? 1.0f / s : 0.0f; };
     const float sPre = m_q.S(L.qpre), sOut = m_q.S(L.qout);
     struct { int32_t in[4], out[4], cfg[4], off[4], res[4]; float q[4], q2[4]; } k = {
@@ -856,6 +860,11 @@ bool Network::RunQ(const QConv& c)
     const uint32_t zs = (std::max(copyTo ? copyTo : L.cout, writeEnd) + 7) / 8, th = shape == 1 ? 8 : 16;
     const bool     small = uint64_t((c.out.w + 15) / 16) * ((c.out.h + th - 1) / th) * zs < 768;
     const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(4, c.res ? *c.res.buf : *c.src.buf), Bind::Buf(5, *c.out.buf)};
+    // 8 x 8 pixels by 32 channels where the large tile would be used and the layer has 32 outputs or more: the input is
+    // staged once for 4 output groups (4K: network 11.4 -> 9.2 ms on Vulkan; the 5-output head got slower: not there).
+    // Not with copy groups (FasterNet pconv).
+    if (!small && !copyTo && L.cout >= 32)
+        return m_q8[shape][2]->Dispatch(b, 5, (c.out.w + 7) / 8, (c.out.h + 7) / 8, (zs + 3) / 4);
     Pass* p = m_q8[shape][small ? 1 : 0].get();
     return small ? p->Dispatch(b, 5, (c.out.w + 3) / 4, (c.out.h + 3) / 4, zs) : p->Dispatch(b, 5, (c.out.w + 15) / 16, (c.out.h + th - 1) / th, zs);
 }

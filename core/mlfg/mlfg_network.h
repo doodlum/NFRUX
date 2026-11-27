@@ -127,7 +127,7 @@ private:
     bool                    m_int8 = false, m_dot4 = false;
     QWeights                m_q;
     std::vector<uint32_t>   m_qOffset;           // per layer: weight words, then m / b / rf
-    std::unique_ptr<Pass>   m_q8[4][2];          // int8: 3x3, 2x2/2, 1x1, transposed; large / small tile
+    std::unique_ptr<Pass>   m_q8[4][3];          // int8: 3x3, 2x2/2, 1x1, transposed; large / small tile / 8x8 by 32 channels
     Tensor                  m_hin48, m_hin64;    // int8: the FasterNet expand inputs
     bool FasterNet(uint32_t first, uint32_t C, uint32_t P, const View& x, const View& y, const View& pc, const View& h, const View* skip, const View* upOut);
     Device&                 m_dev;

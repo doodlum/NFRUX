@@ -89,12 +89,12 @@ for n, k in [("kMlfgConv3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("kMlfgConv
     big = ["-DMLFG_TW=16", "-DMLFG_TH=8" if n == "kMlfgConv2" else "-DMLFG_TH=16", "-DMLFG_KS=1"]
     passes += [(n, mg_ + "conv.hlsl", k + big, "NFRUX_UNUSED", 60),
                (n + "s", mg_ + "conv.hlsl", k + ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"], "NFRUX_UNUSED", 60)]
-# The int8 tier (mlfg_conv_q8.hlsl): the same shapes and tiles, each with packed dot products (SM 6.4 / Vulkan integer dot
+# The int8 tier (mlfg_conv_q8.hlsl): the same shapes and tiles, plus 8 x 8 pixels by 32 channels (o), each with packed dot products (SM 6.4 / Vulkan integer dot
 # product: "_d4") and in 32-bit integer code (SM 6.0). Strict (kMlfgQ8 is not kMlfgConv): the fp32 epilogue rounds.
 for n, k in [("kMlfgQ8Conv3", ["-DMLFG_CONV_K=3", "-DMLFG_CONV_S=1"]), ("kMlfgQ8Conv2", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2"]),
              ("kMlfgQ8Conv1", ["-DMLFG_CONV_K=1", "-DMLFG_CONV_S=1"]), ("kMlfgQ8ConvT", ["-DMLFG_CONV_K=2", "-DMLFG_CONV_S=2", "-DMLFG_CONV_T=1"])]:
     for tile, td in (("", ["-DMLFG_TW=16", "-DMLFG_TH=8" if n == "kMlfgQ8Conv2" else "-DMLFG_TH=16", "-DMLFG_KS=1"]),
-                     ("s", ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"])):
+                     ("s", ["-DMLFG_TW=4", "-DMLFG_TH=4", "-DMLFG_KS=4"]), ("o", ["-DMLFG_TW=8", "-DMLFG_TH=8", "-DMLFG_KS=1", "-DMLFG_OG=4"])):
         passes += [(n + tile, mg_ + "conv_q8.hlsl", k + td + ["-DMLFG_DOT4=0"], "NFRUX_UNUSED", 60),
                    (n + tile + "_d4", mg_ + "conv_q8.hlsl", k + td + ["-DMLFG_DOT4=1"], "NFRUX_UNUSED", 64)]
 

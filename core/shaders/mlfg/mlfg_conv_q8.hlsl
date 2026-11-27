@@ -61,7 +61,14 @@ float Wf(uint i) { return asfloat(t_w.Load(i << 2)); }
 #define TW MLFG_TW
 #define TH MLFG_TH
 #define KS MLFG_KS
-#define TPS (64 / KS)
+#ifndef MLFG_OG
+#define MLFG_OG 1
+#endif
+#define OG MLFG_OG  // output groups (8 channels each) a workgroup, the threads split by group (then KS = 1, no copy)
+#if OG > 1 && KS > 1
+#error output groups need KS = 1
+#endif
+#define TPS (64 / (KS * OG))
 #define PX (TW * TH / TPS)
 #ifdef MLFG_CONV_T
 #define TINW (TW / 2)
@@ -88,12 +95,22 @@ uint LoadWord(int2 p, int c)
     const uint pix = uint(p.y) * uint(c_in.x) + uint(p.x);
     if ((c_cfg.w & 1) == 0)
         return t_src.Load(((pix * uint(c_in.z) + uint(c_in.w + c)) >> 2) << 2);
+    // fp16: four channels (two 32-bit loads where pitch and first channel are even), quantised with rf (0 past cin).
+    const uint h = pix * uint(c_in.z) + uint(c_in.w + c);
+    float v[4];
+    if (((c_in.z | c_in.w) & 1) == 0)
+    {
+        const float2 a = LoadHalf2(t_src, h), b = c + 2 < c_cfg.y ? LoadHalf2(t_src, h + 2u) : float2(0.0, 0.0);
+        v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y;
+    }
+    else
+    {
+        [unroll] for (uint k = 0u; k < 4u; ++k)
+            v[k] = c + int(k) < c_cfg.y ? LoadHalf(t_src, h + k) : 0.0;
+    }
     int q[4];
     [unroll] for (uint k = 0u; k < 4u; ++k)
-    {
-        const int ck = c + int(k);
-        q[k] = ck < c_cfg.y ? Q8(LoadHalf(t_src, pix * uint(c_in.z) + uint(c_in.w + ck)) * Wf(uint(c_off.z + 2 * c_off.y + ck))) : 0;
-    }
+        q[k] = c + int(k) < c_cfg.y ? Q8(v[k] * Wf(uint(c_off.z + 2 * c_off.y + c) + k)) : 0;
     return Pack8(q[0], q[1], q[2], q[3]);
 }
 
@@ -117,11 +134,12 @@ void StoreOut(uint pix, int co0, int o[8], float y[8])
 
 [numthreads(64, 1, 1)] void main(uint3 gid : SV_GroupID, uint li : SV_GroupIndex)
 {
-    const uint slice = li / uint(TPS), lt = li % uint(TPS);
+    const uint slice = (li / uint(TPS)) % uint(KS), lt = li % uint(TPS), og = li / uint(TPS * KS);
     const int2 tile  = int2(gid.xy) * int2(TW, TH);
     const int2 first = int2(lt % uint(TW), lt / uint(TW));
 #define PIX(q) (first + int2(0, int(q) * (TPS / TW)))
-    const int co0 = int(gid.z) * 8;
+    const int co0 = (int(gid.z) * OG + int(og)) * 8;
+#if OG == 1
     if (co0 >= c_res.z)
     {
         // Copy: the source's channels co0 .. co0 + 7 requantised to the output's scale (one thread a pixel).
@@ -147,6 +165,7 @@ void StoreOut(uint pix, int co0, int o[8], float y[8])
         }
         return;
     }
+#endif
 #ifdef MLFG_CONV_T
     const int2 origin = tile / 2;
 #else
@@ -231,6 +250,8 @@ void StoreOut(uint pix, int co0, int o[8], float y[8])
             [unroll] for (uint j = 0u; j < 8u; ++j)
                 acc[q][j] += s_red[(((s - 1u) * uint(TPS) + lt) * uint(PX) + q) * 8u + j];
 #endif
+    if (co0 >= max(c_cfg.x, c_off.w))  // an output group past the layer's channels (OG > 1)
+        return;
     float mo[8], bo[8];
     [unroll] for (uint k = 0u; k < 8u; ++k)
     {
