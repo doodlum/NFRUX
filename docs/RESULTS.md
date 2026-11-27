@@ -524,3 +524,28 @@ parity worst 99.8 dB, rungs_test 15/15. Not run here: AMD and Intel GPUs (their 
 DLSS-G for comparison (`ngx_harness _nvngx.dll --time`, the driver's NGX core with the Streamline SDK's nvngx_dlssg 310.9, its default preset;
 2x only on this card), D3D12, ms a rendered frame: 1280x701 1.47, 1080p 1.76, 1440p 2.83, 4K 3.63; NFRUX 0.84 / 1.15 / 1.44 / 1.61. `--time` now
 also prints the CPU time of the evaluate calls a rendered frame (NFRUX 1080p: 0.18 ms at 2x, 0.54-0.66 at 6x).
+
+# CUDA network: tiled kernels, one launch a layer (2026-11-27, RTX 4070 idle; e8ed750 against 373db67)
+
+GPU time by layer (`ml_conformance_d3d12 layers`: a barrier and a timestamp after each layer, 992x544, separate inputs, medians; ms), the row kernels before / tiled after:
+
+| layer | 0 | 1 | 2 | 3-8 | 9-13 (7x7, each) | 14-18 | 19 | 20 | 21 | sum |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 network | .021 / .021 | .028 / .014 | .015 / .009 | .029 / .024 | .009 / .005 | .027 / .020 | .017 / .008 | .012 / .007 | .022 / .008 | .215 / .135 |
+| 5 networks | .177 / .156 | .129 / .054 | .060 / .031 | .091 / .052 | .046 / .010 | .099 / .048 | .073 / .031 | .048 / .021 | .092 / .029 | 1.000 / .472 |
+
+Layer 0 (20-byte pixels, 10.8 MB of input a network) stays memory-bound. Network pass, Vulkan timestamps (NFRUX_TEST_TIMES): 1080p 2x 0.284 -> 0.166 ms, 6x 1.090 -> 0.561.
+`ngx_harness --time`, ms a rendered frame (submitted and waited for, medians; both builds run alternately):
+
+| | D3D12 before / after | Vulkan before / after |
+|---|---|---|
+| 1080p 2x | 1.03 / 0.94 | 1.13 / 1.05 |
+| 1080p 6x | 3.32 / 2.69 | 3.58 / 3.00 |
+| 4K 6x | 5.07 / 4.42 | 5.62 / 5.02 |
+
+CPU of the evaluate calls at 6x: 0.57 -> 0.48 ms (D3D12), 0.52 -> 0.48 (Vulkan), from one launch a layer for all timesteps instead of one a timestep.
+The rung trial now times both variants (first start here: cuda 0.104, cuda/1 0.152, dot4 0.603 ms at 640x360). What did not help: ldmatrix for the input
+fragments (no change, layer 0 slower with its pixels padded to 32 bytes), coalesced word-by-word staging for layer 0 (0.156 -> 0.176), larger tiles at
+stride 2 (layer 0 0.30). Fusing layers 20 and 21 was not tried: without the timing barriers they already run side by side. Exact: ml_conformance on both
+APIs and both variants, parity worst 99.82 dB, ngx_harness 78 / 78 on each API with each variant as the default, rungs_test passes.
+Tuned on the RTX 4070 only (sm_89): the tile shapes and the 100k-pixel threshold. sm_75 gets the tiled kernels with m8n8k16 and the earlier kernels as the alternative; the trial picks per GPU.
