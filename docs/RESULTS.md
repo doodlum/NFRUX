@@ -425,7 +425,7 @@ Streamline's present semaphore, device destruction (five live objects, as with N
 shader work NFRUX records, and the copies name only those images. (NFRUX's own objects were given names for this run; that the names took effect is not shown.) NVIDIA's DLSS-G (2x) gives every class of
 message NFRUX's earlier runs did.
 
-NFRUX and NVIDIA's DLSS-G (Streamline SDK's DLL through the driver's NGX core, on a DIRECT list; the others on COMPUTE), 2x, the same inputs (`ngx_harness --replay`): a 60-frame sample recording with every
+NFRUX and NVIDIA's DLSS-G (Streamline SDK's DLL through the driver's NGX core, on a DIRECT list; NFRUX on COMPUTE), 2x, the same inputs (`ngx_harness --replay`): a 60-frame sample recording with every
 second frame removed (vectors chained by nearest pixel, matrices multiplied; `halve_recording.py`), the removed frames the truth; 28 frames, right of the UI, 1280x701. `compare_providers.py`:
 
 | | dB | SSIM | worst frame dB | opaque UI, mean difference from the frame (codes) |
@@ -440,12 +440,12 @@ Re-run on 93cff40: GPU-based validation CUDA and dot4, scalar (D3D12), int8 / do
 BGRA8 4x: strict 0 bytes, shipped 98.8 dB or better. On the commit after the agreement: harness strict and shipped, 2000-evaluate soak, sample 4x on both APIs (D3D12 under the debug layer).
 
 An OptiScaler build with FGNvngxReplacement (FGInput=nvngxfg), sample 1280x701: on D3D12 it ends with an access violation in ntdll with another provider selected, as with NFRUX and
-with none: not NFRUX's. Vulkan, 2x / 4x: NFRUX selected by name ("NFRUX"), integer network 229 / 226; with NFRUX_VK_ASSUME_FEATURES=1: 2x 375, 4x 419, 6x 510.
+with none: not NFRUX's. Vulkan, 2x / 4x: NFRUX selected by name ("NFRUX"), integer network 229 / 226 fps; with NFRUX_VK_ASSUME_FEATURES=1: 2x 375, 4x 419, 6x 510.
 
 Fast Vulkan network by default on NVIDIA where the host's features are unknown: OptiScaler 0.9.5 2x 380 fps (fp16 cooperative matrix), with NFRUX_VK_ASSUME_FEATURES=0 287 (integers). A marker at two unfinished starts: integers, said in the log.
 A start killed early leaves the count at one; the next full run clears it. Harness 158 checks, strict 63 of 63 identical; minimal host with nothing assumed, under validation, 78 of 78; with assumption 78 of 78.
 
-D3D12 with that OptiScaler build (d6b02459), sample 1280x701, 4x, 500 frames, 4 starts each: with LogLevel=0 (trace, LogToFile=true) all run: NFRUX 664-679 fps. With LogLevel=5 all 8 starts end
+D3D12 with that OptiScaler build (d6b02459), sample 1280x701, 4x, 500 frames, 4 starts each, NFRUX and another provider: with LogLevel=0 (trace, LogToFile=true) all run: NFRUX 664-679 fps. With LogLevel=5 all 8 starts end
 in the access violation; with LogLevel=2 and no file NFRUX's four do, and the other provider's four fail too (two of them may be this session's kills). So the crash depends on OptiScaler's own timing or logging, whichever provider is
 selected; the cause is not found. 2x and 6x with LogLevel=0, one start each, 700 frames (a87945a's build): 427 and 805 fps, exit 0.
 

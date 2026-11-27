@@ -269,7 +269,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
 1. OptiScaler, two routes:
    a. Releases (0.9.5 the newest): the dlssg-to-fsr3 slot. The DLL as `dlssg_to_fsr3_amd_is_better.dll` beside OptiScaler, `FGInput=nukems`, `FGOutput=nukems`.
       That slot offers 2x only. This is the route R2 is judged by.
-   b. Builds with `FGNvngxReplacement`: `OptiScaler/custom/NFRUX/dlssg/nvngx_dlssg.dll`, `FGNvngxReplacement=NFRUX`; up to
+   b. Builds with `FGNvngxReplacement` (e.g. built from OptiScaler's source at a1e0e19): `OptiScaler/custom/NFRUX/dlssg/nvngx_dlssg.dll`, `FGNvngxReplacement=NFRUX`; up to
       what it asks for. On D3D12 that build crashes the sample by itself (control: `FGInput=nofg`), so it is judged on Vulkan only.
    OptiScaler loads the DLL directly and supplies parameters and presentation. Vulkan features are unknown there (D3). Whether it calls Shutdown is
    not known: NFRUX does not depend on it.
