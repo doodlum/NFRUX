@@ -473,6 +473,12 @@ CUDA on Vulkan in the sample (789ba49, 1280x701, 2500 rendered frames, window fo
 
 Weights changed from v14 to the early v1 fine-tune (2026-11-25). On the halved sample recording at 2x (28 frames, shipped build, D3D12 replay, LPIPS lower is better): v1 27.12 dB, LPIPS 0.0972; v14 27.33 dB, 0.1092; Arm v2 27.04 dB, 0.0929.
 PyTorch, test_new, few pairs, LPIPS v1 / v14 / Arm: 2x .0553 / .0598 / .0544; 3x .0400 / .0436 / .0410; 4x .0482 / .0506 / .0473; 6x .0414 / .0446 / .0433. PSNR preferred v14 because it rewards mixing candidates.
+
+Weights changed from v1 to v15 (QAT of the LPIPS-weighted full run, `output\nfru_mfg_v15\qatf`; 2026-11-27). Each model built into the DLL (e348314) and replayed on the
+sample recording at 2x, frames 3-29 against the true frames with the UI (PSNR / LPIPS): blend 23.64 / .137, v1 27.45 / .0835, v15 27.18 / .0744, v16 (shrink-and-perturb)
+27.11 / .0751, AMD FSR FG4 26.82 / .0608. v1 rebuilt by the same route gave the shipped DLL's bytes (29/29 frames). Held-out PyTorch scorecard, LPIPS v1 / v15 / v16:
+test_new 2x .0491 / .0463 / .0488, 3x .0363 / .0349 / .0363, 4x .0468 / .0459 / .0460, 6x .0407 / .0390 / .0411; test_bal 2x .0529 / .0499 / .0535, 3x .0442 / .0418 / .0433,
+4x .0309 / .0305 / .0306, 6x .0592 / .0554 / .0579; v15 ~0.3 dB below v1 in PSNR, v16 up to 1 dB below at 3x/6x and streaky on fast foliage.
 With v1: parity D3D12 against Vulkan 102 dB worst of 14 frames, ML conformance exact on both APIs, NGX harness 158 checks, A3 D3D12 within 0.1 dB of PyTorch on average at 2x-6x (2 pairs a clip). Earlier A3/A14 figures in this file are v14's.
 nfrux.ini (2026-11-25, headless harness, RTX 4070): every Network value on both APIs, 78 checks and 0 failed each; what cannot be made (coopmat on D3D12, CUDA without nvcuda.dll, an unknown word) falls back and says so; an environment variable wins; two crashes stop a CUDA forced by the file until IgnoreCrashMarkers=1; MaxMultiplier 2 to 6 through NFRUX_MaxFrames.
 

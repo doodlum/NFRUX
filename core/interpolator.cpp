@@ -255,11 +255,11 @@ bool NfruImpl::Create(std::string* error)
     k._OfInputSizeRcp[0] = 1.0f / ofInput.width, k._OfInputSizeRcp[1] = 1.0f / ofInput.height;
     k._InputTensorSize[0] = int32_t(graph.width), k._InputTensorSize[1] = int32_t(graph.height);
     k._ParamsLaneSizeRcp[0] = 2.0f / graph.width, k._ParamsLaneSizeRcp[1] = 2.0f / graph.height;
-    // The model's quantisation (nfru_mfg_v1_int8_metadata.json).
-    k._QuantParamsSINT[0] = float(1 / 0.003921556752175093), k._QuantParamsSINT[1] = -128;
-    k._QuantParamsSINT[2] = float(0.264070600271225), k._QuantParamsSINT[3] = 89;
-    k._QuantParamsSNORM[0] = float(1 / 0.4980377075262368), k._QuantParamsSNORM[1] = float(-1.0078740157480315);
-    k._QuantParamsSNORM[2] = float(33.53696623444557), k._QuantParamsSNORM[3] = float(0.7007874015748031);
+    // The model's quantisation (nfru_mfg_v15_int8_metadata.json: inputs.x, outputs.getitem; the gate is outputs.getitem_1).
+    k._QuantParamsSINT[0] = float(1 / 0.003921568859368563), k._QuantParamsSINT[1] = -128;
+    k._QuantParamsSINT[2] = float(0.3125910758972168), k._QuantParamsSINT[3] = 86;
+    k._QuantParamsSNORM[0] = float(1 / 0.49803924513980746), k._QuantParamsSNORM[1] = float(-1.0078740157480315);
+    k._QuantParamsSNORM[2] = float(39.69906663894653), k._QuantParamsSNORM[3] = float(0.6771653543307087);
     k._QuantParamsGateSNORM[0] = float(1 / 0.4980377075262368), k._QuantParamsGateSNORM[1] = float(-1.0078740157480315);
     k._QuantParamsGateSNORM[2] = float(0.4980377075262368), k._QuantParamsGateSNORM[3] = float(-1.0078740157480315);
     k._MvSimilarityThresholds[0] = 0.25f, k._MvSimilarityThresholds[1] = 0.125f, k._MvSimilarityThresholds[2] = 0.002f;

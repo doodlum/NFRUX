@@ -43,7 +43,7 @@ experiments/ measured and not used: DirectML, optical flow hardware; the CUDA la
 | NGX ABI | earlier NGX work | MIT |
 | Loader | ours | MIT |
 | Tests | `tests/` (A1 from the SDK's runtime test; the rest ours); the sample's scripting patch is kept outside the repository (A4) | MIT |
-| Weights | `nfru_mfg_v1_int8` (the early fine-tune; v14 was softer at 2x by LPIPS and by eye, 2026-11-25, RESULTS.md), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
+| Weights | `nfru_mfg_v15_int8` (2026-11-27: v15 QAT replaces the early v1 fine-tune; better LPIPS and sharper at 2x-6x on held-out sets and the sample recording, ~0.3 dB lower PSNR; RESULTS.md), derived from Arm's NFRU v2 | Arm AI Model Community License 1.0 (PRE-1154) |
 | NVAPI, CUDA functions | declared by us for the few entry points used, loaded dynamically | checked in M0, in THIRD_PARTY.md |
 | OptiScaler, dlssg-to-fsr3 | GPL-3.0: interface facts only | - |
 
@@ -62,7 +62,7 @@ scattered game vectors: measured no gain), optical flow once, reduction to the m
 tensor, network, inpainting, composite. A batch runs stage by stage.
 
 The graph is v1 (v14's inputs): channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0; 17-18 are clamped to 0..1 (saturate). All quantisation constants are
-`nfru_mfg_v1_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).
+`nfru_mfg_v15_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v15: input 0.003921569 / -128 (SNORM 0.4980392 / -1.00787), params 0.3125911 / 86 (SNORM 39.699 / 0.67717), gate 0.003921557 / -128; earlier v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).
 
 Flow at more than 1080 display rows: the SDK's colour reduction pass (01) gets an entry point and the flow, hints, flow scale
 and `_OfInputSizeRcp` use the reduced size (aspect kept, 1080 rows), as the SDK does. Sizes to 8K.
@@ -193,6 +193,9 @@ params / gate textures on every path (paths that write images directly are an op
 | General Model | `NFRUX_MODEL` | nfru (default), amd (FSR FG4, docs/FFX_MLFG.md) |
 | General AmdWeights | `NFRUX_AMD_WEIGHTS` | a `tools/mlfg_weights.py --bin` file |
 | D3D12 / Vulkan AmdNetwork | `NFRUX_MLFG` (tests: strict, no markers) | generic, cuda (D3D12) / generic, coopmat, cuda (Vulkan) |
+| General AmdPrecision | `NFRUX_AMD_PRECISION` | auto, fp16, int8 (auto: int8 where fp16 would run generic; a forced AmdNetwork keeps fp16) |
+| General AmdWeightsInt8 | `NFRUX_AMD_WEIGHTS_INT8` | a `tools/mlfg_weights.py --int8` file |
+| (tests) | `NFRUX_MLFG_Q8` | int8 tier forced, strict: cuda, dot4, int |
 
 `Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
 
@@ -203,6 +206,7 @@ params / gate textures on every path (paths that write images directly are an op
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 | FSR FG4 (Model=amd), D3D12 | NVIDIA RTX: CUDA fp16 tensor cores, FP8 for stage 2's FasterNet blocks on RTX 40+ (NVAPI, crash marker) | - | generic (strict HLSL) |
 | FSR FG4 (Model=amd), Vulkan | NVIDIA RTX: the same CUDA kernels (VK_NVX_binary_import, crash marker; identical bytes to D3D12) | fp16 16x16x16 cooperative matrices (crash marker off NVIDIA) | generic (strict HLSL) |
+| FSR FG4 int8 (AmdPrecision=int8; auto where the fp16 rows above end at generic), both APIs | NVIDIA RTX 30+: CUDA int8 tensor cores (mma m16n8k32 s8) for the int8-source layers, crash marker | packed int8 dot products (SM 6.4 / `shaderIntegerDotProduct`; crash marker off NVIDIA) | 32-bit integers (strict HLSL, SM 6.0) |
 
 Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
 rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of
