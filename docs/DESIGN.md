@@ -177,7 +177,7 @@ checks each layer and the rung fails if any is outside it. The shape list is wri
 The `[flatten]` two-source load is split so no out-of-range address is formed. Outputs go to buffers and are copied to the
 params / gate textures on every path (paths that write images directly are an optimisation, checked by the same test).
 
-**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML` (tests: strict, no crash markers); a forced rung that is unavailable fails creation. For users, `nfrux.ini` beside the DLL (`core/log.cpp`; read once; `;` `#` and inline ` ;` comments; unknown keys logged; `auto` or a missing line is NFRUX's choice; flags take 0/1/true/false/on/off/yes/no). An environment variable wins over its key:
+**D3. Ladders.** Chosen at creation, logged in one line, forced by `NFRUX_ML` (tests: strict, no crash markers); a forced rung that is unavailable fails creation. For users, `nfrux.ini` beside the DLL (`core/log.cpp`; read once; `;` `#` and inline ` ;` comments; unknown keys logged; `auto` or a missing line is NFRUX's choice; flags take 0/1/true/false/on/off/yes/no). The shipped nfrux.ini lists only MaxMultiplier, Log, Network and FullBarriers; the other keys work when added (support and testing). An environment variable wins over its key:
 
 | Section, key | Environment | Values |
 |---|---|---|
@@ -264,7 +264,7 @@ buffer, and the first real batch counts as a reset. Two interpolators per featur
 
 0. One file (2026-11-25): `nvngx_dlssg.dll` holds everything (shaders, weights, NRI, the loader, the C++ runtime statically). Its role is its file name:
    `nvngx_dlssg.dll` or `dlssg_to_fsr3_amd_is_better.dll` the feature; `dbghelp.dll` or `version.dll` the feature and the loader (their exports are
-   forwarded to Windows' own). Uninstalling is deleting it. The `package` target holds the DLL, INSTALL.txt, THIRD_PARTY.md, the optional nfrux.ini (all auto) and the license texts, nothing else. The DLL pins
+   forwarded to Windows' own). Uninstalling is deleting it. The `package` target holds the DLL, INSTALL.txt, THIRD_PARTY.md, the optional nfrux.ini (defaults) and the license texts, nothing else. The DLL pins
    itself when it hooks (patched imports point into it).
 1. OptiScaler, two routes:
    a. Releases (0.9.5 the newest): the dlssg-to-fsr3 slot. The DLL as `dlssg_to_fsr3_amd_is_better.dll` beside OptiScaler, `FGInput=nukems`, `FGOutput=nukems`.
