@@ -30,8 +30,6 @@ add_executable(ml_conformance_d3d12 tests/ml_conformance_d3d12.cpp)
 target_link_libraries(ml_conformance_d3d12 nfrux_core d3d12 dxgi dxguid)
 add_executable(ml_conformance_vulkan tests/ml_conformance_vulkan.cpp)
 target_link_libraries(ml_conformance_vulkan nfrux_core $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
-add_executable(nfrux_caps tools/gpu_caps.cpp)
-target_link_libraries(nfrux_caps d3d12 dxgi dxguid)
 
 add_executable(parity tests/parity.cpp)
 target_include_directories(parity PRIVATE rhi core)
@@ -54,13 +52,6 @@ set(NFRUX_AGILITY "" CACHE STRING "Agility SDK number (620): ngx_harness then us
 if(NFRUX_AGILITY)
     target_compile_definitions(ngx_harness PRIVATE NFRUX_AGILITY=${NFRUX_AGILITY})
 endif()
-add_executable(cuda_launch experiments/cuda_launch.cpp)
-target_link_libraries(cuda_launch d3d12 dxgi dxguid)
-add_executable(directml_convolution experiments/directml_convolution.cpp)
-target_link_libraries(directml_convolution d3d12 dxgi dxguid DirectML)
-add_executable(optical_flow_hardware experiments/optical_flow_hardware.cpp)
-target_include_directories(optical_flow_hardware PRIVATE $ENV{VULKAN_SDK}/Include)
-target_link_libraries(optical_flow_hardware $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 
 # What is handed out: the one DLL, the texts its licenses ask for, INSTALL.txt and the optional nfrux.ini. Nothing else.
 add_custom_target(package
@@ -74,3 +65,11 @@ add_custom_target(package
     COMMAND ${CMAKE_COMMAND} -E copy ${NRI_DIR}/_build/_deps/d3d12ma-src/LICENSE.txt ${CMAKE_BINARY_DIR}/package/licenses/D3D12MemoryAllocator.txt
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md ${CMAKE_SOURCE_DIR}/INSTALL.txt ${CMAKE_SOURCE_DIR}/nfrux.ini ${CMAKE_BINARY_DIR}/package
     DEPENDS nvngx_dlssg VERBATIM)
+# The benchmark kit for testers (docs/OPTIMISING.md): the DLL, the headless tests and tools/bench/run_bench.ps1, run from one folder.
+add_custom_target(bench_kit
+    COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_BINARY_DIR}/bench_kit
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bench_kit
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:nvngx_dlssg> $<TARGET_FILE:ngx_harness> $<TARGET_FILE:ml_conformance_d3d12> $<TARGET_FILE:ml_conformance_vulkan> $<TARGET_FILE:parity> ${CMAKE_BINARY_DIR}/bench_kit
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/tools/bench/run_bench.ps1 ${CMAKE_SOURCE_DIR}/tools/bench/README.txt ${CMAKE_BINARY_DIR}/bench_kit
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_BINARY_DIR}/package/licenses ${CMAKE_BINARY_DIR}/bench_kit/licenses
+    DEPENDS package ngx_harness ml_conformance_d3d12 ml_conformance_vulkan parity VERBATIM)

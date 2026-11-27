@@ -30,10 +30,12 @@ frontend/   NGX exports, parameter reading, batch protocol (section 4)
 core/       interpolator: pass list, constants, histories, UI, subrects. API neutral
 core/ml     TOSA lowering and CPU reference; Vulkan, D3D12 and CUDA kernels
 rhi/        Device / Texture / Buffer / Pass / Network (rhi.h); one implementation on NVIDIA NRI (rhi_nri.cpp)
-tools/      build_shaders.py, build_nri.ps1
-tests/      conformance, parity, NGX harness, quality reference
-experiments/ measured and not used: DirectML, optical flow hardware; the CUDA launch spike
+tools/      build_shaders.py, build_nri.ps1, model_layers, bench/ (the benchmark kit, docs/OPTIMISING.md)
+tests/      conformance, parity, NGX harness, rung plans, quality reference
+docs/       DESIGN (this), RESULTS (measurements, dated), VARIANTS (what is tuned where), OPTIMISING (the kit and the workflow)
 ```
+DirectML, the hardware optical-flow engine and a CUDA launch spike were measured and not used (RESULTS); their probes are in the
+history before 1.0.
 
 | Part | Source | License |
 |---|---|---|
