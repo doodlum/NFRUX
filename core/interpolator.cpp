@@ -158,7 +158,7 @@ struct Interpolator::Impl
     bool     allInput = false, colourDown = false;
     FiConstants c = {};
     float    lastVP[16] = {};
-    PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post;
+    PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post, postHistory;
     PassPtr  mvHints, pyramidP, flowWarp, match, median, bilateral;
     Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion, ofColour;
     Tex      computedMv, flow, pyramid[2], fWarp, fMatch, fSub, fMed, fFlow;
@@ -217,9 +217,9 @@ bool Interpolator::Impl::Create(std::string* error)
     NFRUX_PASS(inpaintSeed, kFiInpaintSeed) NFRUX_PASS(inpaintMip, kFiInpaintMip) NFRUX_PASS(inpaint, kFiInpaint)
     switch (s.outputFormat)
     {
-    case Format::RGBA8Unorm: case Format::BGRA8Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba8) break;
-    case Format::RGB10A2Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgb10a2) break;
-    case Format::RGBA16Float: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba16f) break;
+    case Format::RGBA8Unorm: case Format::BGRA8Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba8) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgba8) break;
+    case Format::RGB10A2Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgb10a2) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgb10a2) break;
+    case Format::RGBA16Float: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba16f) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgba16f) break;
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
@@ -236,7 +236,7 @@ bool Interpolator::Impl::Create(std::string* error)
     auto tex = [&](Tex& t, Format f, Dims d, bool uint = false) { t = dev.CreateTexture(f, d.width, d.height, uint); ok = ok && t; };
     for (auto& t : dynMask) tex(t, Format::R8Unorm, mvLane);
     for (auto& t : depthTm1) tex(t, Format::R32Float, mvLane);
-    for (auto& t : colorTm1) ok = ok && (t = dev.CreateTextureLike(s.colorLike, display.width, display.height));
+    for (auto& t : colorTm1) ok = ok && (t = dev.CreateTextureLike(s.colorLike, display.width, display.height, true));
     if (allInput || colourDown)
         for (auto& t : prep) tex(t, lane, mvLane);
     if (display.height > 1080) tex(ofColour, lane, ofInput);
@@ -402,6 +402,8 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     }
     k._Reset = reset ? 1 : 0;
     const bool down = allInput || colourDown;
+    // The history written by the first composite where the colour's format is the composite's (else copied at the end).
+    const bool storeHistory = backup.storeFormat == s.outputFormat;
     const uint32_t options = (!in.uiSource || (needsAlpha && !in.uiAlpha) ? 0u : in.uiKind) | (in.noWarp ? 0x100u : 0u) | (in.orthographic ? 0x200u : 0u) | (s.swapRB ? 0x1000u : 0u);
 
     if (ofColour)
@@ -510,11 +512,12 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         const Texture& target = i == 0 && in.output0 ? *in.output0 : *o.output;
         const Bind b[] = {Bind::Tex(0, *o.net->params), Bind::Tex(2, *o.filledFlowTm1), Bind::Tex(4, prev), Bind::Tex(5, color), Bind::Tex(6, target),
                           Bind::Data(7, &k, sizeof(k)), Bind::Tex(9, *o.net->gate), Bind::Tex(10, *o.inpaint), Bind::Tex(11, *o.qMotionTp1), Bind::Tex(12, uiSource),
-                          Bind::Tex(13, uiAlpha), Bind::Tex(14, noWarp)};
-        if (!post->Dispatch(b, 12, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup))) return false;
+                          Bind::Tex(13, uiAlpha), Bind::Tex(14, noWarp), Bind::Tex(8, backup)};
+        const bool history = i == 0 && storeHistory;
+        if (!(history ? postHistory : post)->Dispatch(b, history ? 13 : 12, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup))) return false;
     }
     dev.Mark("(composite)");
-    dev.CopyTexture(color, backup);  // the history, in the colour's own format
+    if (!storeHistory) dev.CopyTexture(color, backup);  // the history, in the colour's own format
     return true;
 }
 

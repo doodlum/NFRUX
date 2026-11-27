@@ -408,10 +408,16 @@ public:
         Copy(*src, 0, 0, *use->t, 0, 0, src->width, src->height);
         return use->t.get();
     }
-    std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& e, uint32_t w, uint32_t h) override
+    static Format StoreClass(nri::Format f)  // the composite's formats
     {
-        auto t = MakeTex(HostFormat(e), w, h, false);
-        if (t) t->format = Format::Native;
+        return f == nri::Format::RGBA8_UNORM ? Format::RGBA8Unorm : f == nri::Format::BGRA8_UNORM ? Format::BGRA8Unorm : f == nri::Format::R10_G10_B10_A2_UNORM ? Format::RGB10A2Unorm
+             : f == nri::Format::RGBA16_SFLOAT ? Format::RGBA16Float : Format::Unknown;
+    }
+    std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& e, uint32_t w, uint32_t h, bool storage) override
+    {
+        const nri::Format f = HostFormat(e);
+        auto t = MakeTex(f, w, h, storage && StoreClass(f) != Format::Unknown);
+        if (t) t->format = Format::Native, t->storeFormat = t->uav ? StoreClass(f) : Format::Unknown;
         return t;
     }
     std::unique_ptr<Buffer> CreateBuffer(uint64_t size) override { return MakeBuf(size); }
@@ -913,8 +919,7 @@ public:
         }
         if (IsDepth(f)) t->planes = nri::PlaneBits::DEPTH;
         // A D3D12 output with unordered access in one of the composite's formats: the composite can write it (Texture::storeFormat).
-        const Format store = f == nri::Format::RGBA8_UNORM ? Format::RGBA8Unorm : f == nri::Format::BGRA8_UNORM ? Format::BGRA8Unorm : f == nri::Format::R10_G10_B10_A2_UNORM ? Format::RGB10A2Unorm
-                           : f == nri::Format::RGBA16_SFLOAT ? Format::RGBA16Float : Format::Unknown;
+        const Format store = StoreClass(f);
         const bool storage = output && !isVk && !IsSrgb(e) && store != Format::Unknown && (static_cast<ID3D12Resource*>(e.handle)->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
                              (uint32_t(n.GetFormatSupport(*dev, f)) & uint32_t(nri::FormatSupportBits::STORAGE_TEXTURE)) != 0;
         if (!IsSrgb(e) && !Views(*t, f, storage)) return nullptr;

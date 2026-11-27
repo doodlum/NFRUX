@@ -112,8 +112,8 @@ public:
     virtual ~Device() = default;
     virtual const Caps& caps() const = 0;
     virtual std::unique_ptr<Texture> CreateTexture(Format format, uint32_t width, uint32_t height, bool uintView = false) = 0;
-    // A texture of an external image's own format (the colour history).
-    virtual std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& image, uint32_t width, uint32_t height) = 0;
+    // A texture of an external image's own format (the colour history). storage: also writable by passes where the format allows (storeFormat).
+    virtual std::unique_ptr<Texture> CreateTextureLike(const ExternalImage& image, uint32_t width, uint32_t height, bool storage = false) = 0;
     virtual std::unique_ptr<Buffer>  CreateBuffer(uint64_t size) = 0;
     virtual std::unique_ptr<Pass>    CreatePass(const Shader& shader) = 0;
     virtual std::unique_ptr<Network> CreateNetwork(uint32_t width, uint32_t height, std::string* error) = 0;

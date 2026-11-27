@@ -230,7 +230,7 @@ void postprocess(int32_t2 output_pixel)
     // backbuffer pixel so it can be sampled as colorTm1 on the next frame without
     // an extra copy job (see PREVIOUS_INTERPOLATION_SOURCE_BACKUP).
 #if FFX_ARM_FRAMEINTERPOLATION_OPTION_MANAGE_PREVIOUS_COLOR
-    StorePreviousInterpolationSource(output_pixel, FFX_MIN16_F4(LoadCurrentBackbuffer(output_pixel), 1.0f));
+    StorePreviousInterpolationSource(output_pixel, LoadCurrentBackbufferTexel(output_pixel));  // NFRUX: the texel as it is (the copy it replaces)
 #endif
 }
 

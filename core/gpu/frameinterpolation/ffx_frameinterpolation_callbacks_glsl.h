@@ -479,6 +479,10 @@ FFX_MIN16_F3 LoadCurrentBackbuffer(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
     return FFX_MIN16_F3(texelFetch(r_current_interpolation_source, iPxPos, 0).rgb);
 }
+FfxFloat32x4 LoadCurrentBackbufferTexel(FFX_PARAMETER_IN FfxInt32x2 iPxPos)  // NFRUX: all four channels, as stored (the history)
+{
+    return texelFetch(r_current_interpolation_source, iPxPos, 0);
+}
 FFX_MIN16_F3 SampleCurrentBackbuffer(FFX_PARAMETER_IN FfxFloat32x2 fUv)
 {
     return FFX_MIN16_F3(textureLod(sampler2D(r_current_interpolation_source, s_LinearClamp), fUv, 0.0).xyz);

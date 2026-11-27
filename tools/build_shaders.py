@@ -63,6 +63,7 @@ for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rg
         passes.append((f"kCompose{suffix}", "shaders/frontend/compose", fmt(f), "NFRUX_UNUSED", 60))
 for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
+    passes.append((f"kFiPostprocessHistory{suffix}", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f), INV, 60))  # also stores the colour's texel: the next frame's history
 
 
 def run(cmd):
