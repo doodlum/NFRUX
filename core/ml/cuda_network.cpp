@@ -597,20 +597,16 @@ void CudaGraph::Record(ID3D12GraphicsCommandList* list, CudaGraph* const* graphs
     std::vector<Launch>     launches(batches);
     for (size_t li = 0; li < graphs[0]->m_layers.size(); ++li)
     {
-        b.clear();
         const Layer& first = graphs[0]->m_layers[li];
-        for (int32_t t : {first.src[0], first.src[1], first.dst})
-            if (t >= 0 && dirty[t])
-            {
-                dirty[t] = false;
-                for (uint32_t i = 0; i < count; ++i)
-                {
-                    D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV};
-                    u.UAV.pResource = graphs[i]->m_tensors[t].Get();
-                    b.push_back(u);
-                }
-            }
-        if (!b.empty()) list->ResourceBarrier(UINT(b.size()), b.data());
+        // One barrier for all unordered access (as the Vulkan path's memory barrier): every tensor is then up to date.
+        bool wait = false;
+        for (int32_t t : {first.src[0], first.src[1], first.dst}) wait = wait || (t >= 0 && dirty[t]);
+        if (wait)
+        {
+            D3D12_RESOURCE_BARRIER u = {D3D12_RESOURCE_BARRIER_TYPE_UAV};
+            list->ResourceBarrier(1, &u);
+            std::fill(dirty.begin(), dirty.end(), false);
+        }
         const uint64_t base = graphs[0]->m_constants->GetGPUVirtualAddress();
         for (uint32_t j = 0; j < batches; ++j)
         {
