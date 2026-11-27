@@ -27,6 +27,8 @@ using Microsoft::WRL::ComPtr;
 #define NFRUX_AGILITY 620
 #endif
 
+static double Now() { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f), QueryPerformanceCounter(&c); return double(c.QuadPart) * 1000.0 / double(f.QuadPart); }
+
 // --- NGX parameters, as a core's
 struct Params : NgxParameter
 {
@@ -91,6 +93,7 @@ struct Api
     virtual uint32_t ReadWord() = 0;
     virtual NgxHandle* CreateFeature(NgxParameter& p) = 0;
     virtual NgxResult Evaluate(NgxHandle* h, NgxParameter& p) = 0;  // recorded, submitted, waited for
+    double callMs = 0;  // the last evaluate's call alone (CPU: recording), without the submission and wait
     bool isBack = false;  // the next image made is a back buffer: always in the guide's state
     bool evaluateC = false;  // through EvaluateFeature_C
     virtual NgxResult Release(NgxHandle* h) = 0;
@@ -182,7 +185,10 @@ struct Api12 : Api
         d->CreateCommandList(0, type, al.Get(), nullptr, IID_PPV_ARGS(&cl)), cl->Close();
         d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
         static const wchar_t* path[] = {L"C:\\dev\\nfrux-ref\\dl\\streamline\\sdk\\bin\\x64"};
-        struct { const wchar_t* const* paths; unsigned n; void* internal; void* log; int level; bool noOther; } common = {path, 1};
+        // NFRUX_TEST_NGX_LOG: the core's log lines (a feature's own settings, such as its preset) on stdout.
+        static void (*logLine)(const char*, int, int) = [](const char* m, int, int) { printf("    ngx: %s", m); };
+        struct { const wchar_t* const* paths; unsigned n; void* internal; void* log; int level; bool noOther; } common = {path, 1, nullptr,
+            getenv("NFRUX_TEST_NGX_LOG") ? reinterpret_cast<void*>(logLine) : nullptr, getenv("NFRUX_TEST_NGX_LOG") ? 2 : 0};
         const NgxResult r = Fn<NgxResult (*)(unsigned long long, const wchar_t*, ID3D12Device*, int, const void*)>("NVSDK_NGX_D3D12_Init_Ext")(core ? 231313132 : 0, L".", d.Get(), 0x15, core ? &common : nullptr);
         if (r != kNgxSuccess) printf("  Init_Ext: %08x\n", r);
         return r == kNgxSuccess;
@@ -303,7 +309,9 @@ struct Api12 : Api
     NgxResult Evaluate(NgxHandle* h, NgxParameter& p) override
     {
         Begin();
+        const auto t0 = Now();
         const NgxResult r = Fn<NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_D3D12_EvaluateFeature_C" : "NVSDK_NGX_D3D12_EvaluateFeature")(cl.Get(), h, &p, nullptr);
+        callMs = Now() - t0;
         End();
         return r;
     }
@@ -510,7 +518,9 @@ struct ApiV : Api
     NgxResult Evaluate(NgxHandle* h, NgxParameter& p) override
     {
         Begin();
+        const auto t0 = Now();
         const NgxResult r = Fn<NgxResult (*)(VkCommandBuffer, const NgxHandle*, NgxParameter*, void*)>(evaluateC ? "NVSDK_NGX_VULKAN_EvaluateFeature_C" : "NVSDK_NGX_VULKAN_EvaluateFeature")(cb, h, &p, nullptr);
+        callMs = Now() - t0;
         End();
         return r;
     }
@@ -1229,7 +1239,11 @@ static bool Replay(Api12& a, const std::string& dir, int first, int count, uint3
 // --time: a batch of GEN evaluates, submitted and waited for, with any DLL: milliseconds a rendered frame and what each evaluate was.
 static void Time(Api& a, uint32_t w, uint32_t h, uint32_t gen)
 {
-    Params p;
+    // Through the driver's NGX core (D3D12, the DLL given is _nvngx.dll): the core's parameter block, as a game's.
+    Params own;
+    NgxParameter* core = nullptr;
+    if (auto* a12 = dynamic_cast<Api12*>(&a); a12 && a12->core) a12->Fn<NgxResult (*)(NgxParameter**)>("NVSDK_NGX_D3D12_GetCapabilityParameters")(&core);
+    NgxParameter& p = core ? *core : own;
     TexP back = a.Create(F_BGRA8, w, h, false), out = a.Create(F_BGRA8, w, h, true), depth = a.Create(F_R32F, w, h, false), mv = a.Create(F_RG16F, w, h, false);
     Image dI(w, h, 0.9f), mI(w, h);
     for (uint32_t i = 0; i < w * h; ++i) mI.p[i * 4] = -8, mI.p[i * 4 + 1] = -2;
@@ -1244,6 +1258,7 @@ static void Time(Api& a, uint32_t w, uint32_t h, uint32_t gen)
     std::vector<Bytes> src;
     for (int i = 0; i < 4; ++i) src.push_back(Encode(World(w, h, float(i)), F_BGRA8));
     std::vector<std::vector<double>> ms(gen + 1);
+    std::vector<double> cpu;
     LARGE_INTEGER fr, t0, t1;
     QueryPerformanceFrequency(&fr);
     bool differs = false;
@@ -1251,7 +1266,7 @@ static void Time(Api& a, uint32_t w, uint32_t h, uint32_t gen)
     {
         a.Upload(*back, src[i % 4]);
         p.Set("DLSSG.Reset", int(i == 0));
-        double all = 0;
+        double all = 0, calls = 0;
         for (uint32_t k = 1; k <= gen; ++k)
         {
             p.Set("DLSSG.MultiFrameIndex", k);
@@ -1259,15 +1274,16 @@ static void Time(Api& a, uint32_t w, uint32_t h, uint32_t gen)
             a.Evaluate(f, p);
             QueryPerformanceCounter(&t1);
             const double d = double(t1.QuadPart - t0.QuadPart) * 1000 / fr.QuadPart;
-            all += d;
+            all += d, calls += a.callMs;
             if (i >= 80) ms[k - 1].push_back(d);
         }
-        if (i >= 80) ms[gen].push_back(all);
+        if (i >= 80) ms[gen].push_back(all), cpu.push_back(calls);
         if (i == 159) differs = a.Read(*out) != src[i % 4];
     }
     printf("  %ux%u %ux:", w, h, gen + 1);
     for (auto& v : ms) std::sort(v.begin(), v.end()), printf(" %.2f", v[v.size() / 2]);
-    printf(" ms (each evaluate, then all; medians)%s\n", differs ? "" : "  OUTPUT IS THE BACK BUFFER");
+    std::sort(cpu.begin(), cpu.end());
+    printf(" ms (each evaluate, then all; medians); calls %.2f ms CPU%s\n", cpu[cpu.size() / 2], differs ? "" : "  OUTPUT IS THE BACK BUFFER");
     a.Release(f);
 }
 static void Vram(Api& a)
@@ -1327,7 +1343,7 @@ int main(int argc, char** argv)
         printf("%s\n", w.c_str());
         bool ok;
         if (w == "vulkan") { auto a = std::make_unique<ApiV>(); a->dll = dll, a->minimal = minimal, ok = a->Init(), apis.push_back(std::move(a)); }
-        else { auto a = std::make_unique<Api12>(); a->dll = dll, ok = a->Init(), apis.push_back(std::move(a)); }
+        else { auto a = std::make_unique<Api12>(); a->dll = dll, a->core = soak == ~1u && strstr(argv[1], "_nvngx.dll"), ok = a->Init(), apis.push_back(std::move(a)); }
         if (!ok) return puts("  device failed"), 2;
         results.emplace_back();
         if (soak == ~1u && tw) { for (uint32_t n : {1u, 3u, 5u}) if (!tg || tg == n) Time(*apis.back(), tw, th, n); continue; }

@@ -521,3 +521,6 @@ Rung timing on the first start: D3D12 cuda 0.150 / dot4 0.603 ms, Vulkan cuda 0.
 Video memory (`--vram`, the same at 2x-6x): D3D12 cuda 393 / 469 / 651 MB at 1080p / 1440p / 4K, dot4 291 / 368 / 549; Vulkan cuda 295 / 350 / 470,
 dot4 256 / 311 / 431. Soak 3000 evaluates a API: memory and handles flat. Harness 78/78 a API (Vulkan dot4 forced too), conformance exact,
 parity worst 99.8 dB, rungs_test 15/15. Not run here: AMD and Intel GPUs (their plans are tested by rungs_test only).
+DLSS-G for comparison (`ngx_harness _nvngx.dll --time`, the driver's NGX core with the Streamline SDK's nvngx_dlssg 310.9, its default preset;
+2x only on this card), D3D12, ms a rendered frame: 1280x701 1.47, 1080p 1.76, 1440p 2.83, 4K 3.63; NFRUX 0.84 / 1.15 / 1.44 / 1.61. `--time` now
+also prints the CPU time of the evaluate calls a rendered frame (NFRUX 1080p: 0.18 ms at 2x, 0.54-0.66 at 6x).
