@@ -76,7 +76,7 @@ but they can't emulate another GPU.
 | Tool | What it tells you |
 |---|---|
 | `ngx_harness <dll> --time [WxH[@N]] d3d12\|vulkan` | ms a rendered frame per evaluate, plus NFRUX's CPU time (N generated frames: 1 = 2x ... 5 = 6x) |
-| `NFRUX_TEST_TIMES=1` + `NFRUX_LOG=<file>` | GPU time per pass, median a recording (Vulkan; D3D12 only on a device with a timestamp queue) |
+| `NFRUX_TEST_TIMES=1` + `NFRUX_LOG=<file>` | GPU time per pass, median a recording, and `(recording)` from the first pass to the end (both APIs; on D3D12 the timestamp frequency is asked of a compute queue made for the purpose) |
 | `ml_conformance_d3d12 layers [w h variant]` | CUDA GPU time per network layer, 1 and 5 networks |
 | `model_layers [w h]` | the network's layers, multiply-adds and activation bytes: the ceiling to compare with |
 | `NFRUX_ML`, `NFRUX_TEST_CUDA_VARIANT`, `FFX_ML_DOT4_TILED`, `FFX_ML_DOT4_SUBGROUP` | force a variant (VARIANTS.md, "The variants") |
