@@ -3,10 +3,11 @@
 #   tools\ci\release_notes.ps1 -Version 1.0.0 [-Notes docs\RELEASE_NOTES.md] [-Out notes.md]
 param(
     [Parameter(Mandatory)][string]$Version,
-    [string]$Notes = "$PSScriptRoot\..\..\docs\RELEASE_NOTES.md",
+    [string]$Notes = '',
     [string]$Out = ''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Notes) { $Notes = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..\..\docs\RELEASE_NOTES.md' }  # (Windows PowerShell has no $PSScriptRoot in param defaults)
 $body = @()
 if (Test-Path $Notes) {
     $lines = [IO.File]::ReadAllLines((Resolve-Path $Notes).Path)

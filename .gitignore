@@ -3,3 +3,4 @@ third_party/NRI/
 *.nfrxcap
 build-strict/
 build-ship/
+dist/
