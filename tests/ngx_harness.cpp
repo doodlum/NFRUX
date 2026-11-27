@@ -1297,7 +1297,7 @@ int main(int argc, char** argv)
     HMODULE dll = LoadLibraryExA(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) return printf("cannot load %s\n", argv[1]), 2;
     bool minimal = false;
-    uint32_t soak = 0;
+    uint32_t soak = 0, tw = 0, th = 0, tg = 0;
     int replay = 0;
     std::vector<std::string> which;
     for (int i = 2; i < argc; ++i)
@@ -1307,6 +1307,7 @@ int main(int argc, char** argv)
         else if (s == "--replay") { replay = i; i += 5; }
         else if (s == "--vram") soak = ~0u;
         else if (s == "--time") soak = ~1u;
+        else if (s.find('x') != std::string::npos && isdigit(uint8_t(s[0])) && sscanf(s.c_str(), "%ux%u@%u", &tw, &th, &tg) >= 2) {}  // --time one size: WxH or WxH@N (N generated)
         else if (s == "--soak") soak = uint32_t(atoi(argv[++i]));
         else which.push_back(s);
     }
@@ -1329,7 +1330,8 @@ int main(int argc, char** argv)
         else { auto a = std::make_unique<Api12>(); a->dll = dll, ok = a->Init(), apis.push_back(std::move(a)); }
         if (!ok) return puts("  device failed"), 2;
         results.emplace_back();
-        if (soak == ~1u) { for (uint32_t n : {1u, 3u, 5u}) Time(*apis.back(), 1280, 701, n), Time(*apis.back(), 1920, 1080, n); continue; }
+        if (soak == ~1u && tw) { for (uint32_t n : {1u, 3u, 5u}) if (!tg || tg == n) Time(*apis.back(), tw, th, n); continue; }
+        if (soak == ~1u) { for (uint32_t n : {1u, 3u, 5u}) Time(*apis.back(), 1280, 701, n), Time(*apis.back(), 1920, 1080, n), Time(*apis.back(), 2560, 1440, n), Time(*apis.back(), 3840, 2160, n); continue; }
         if (soak == ~0u) Vram(*apis.back());
         else if (soak) Soak(*apis.back(), soak);
         else Scenes(*apis.back(), results.back());

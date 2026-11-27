@@ -229,7 +229,7 @@ namespace ffx_ml
             case Vendor::Nvidia:
                 // warp32 tensor cores, 16x16xK tiles. fp16 is 20% faster than int8 on an RTX 4070, 5-8% on a 4080 (docs/RESULTS.md),
                 // and gives the same integers (AccumulatorBound).
-                return {4, 32, 16, 128, {MatType::Fp16, MatType::Int8, MatType::Bf16}, 128};
+                return {4, 32, 16, 128, {MatType::Fp16, MatType::Int8, MatType::Bf16}, 128, 1, 32, 32, 40, 8, 8, 4096, 4};
             case Vendor::Amd:
                 // RDNA3+ WMMA runs in wave32, 16x16x16 tiles (untuned). RDNA2 (no WMMA) takes the tiled dot4 kernel, tuned on the
                 // AMD RDNA2 APUs. Channel blocks up to 40 keep the 36-channel KPN layer in one block.
