@@ -37,6 +37,8 @@ add_executable(parity tests/parity.cpp)
 target_include_directories(parity PRIVATE rhi core)
 set(NRI_LIBS ${NRI_DIR}/_Bin/Release/NRI.lib ${NRI_DIR}/_build/Release/NRI_Shared.lib ${NRI_DIR}/_build/Release/NRI_D3D12.lib ${NRI_DIR}/_build/Release/NRI_VK.lib ${NRI_DIR}/_build/Release/NRI_Validation.lib)
 target_link_libraries(parity nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
+add_executable(model_layers tools/model_layers.cpp)
+target_link_libraries(model_layers nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 add_executable(rungs_test tests/rungs_test.cpp)
 target_link_libraries(rungs_test nfrux_core ${NRI_LIBS} d3d12 dxgi dxguid $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
 
