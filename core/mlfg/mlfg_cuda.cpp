@@ -532,6 +532,124 @@ std::string ReduceKernel()
 
 }  // namespace
 
+// The int8 network's layers with an int8 source (mlfg_conv_q8.hlsl's semantics, tools/ffx_extract/mlfg_int8.py) on int8
+// tensor cores (sm_80+: mma.m16n8k32 s8 x s8 -> s32, exact): one warp makes 16 pixels of a row (transposed: 16 input
+// pixels -> 32 x 2 outputs) by NB n tiles of 8 channels; input channels 32 a chunk, A fragments straight from the packed
+// int8 tensors (one 32-bit word = 4 channels; zero by predicate outside / past cin), B fragments from the weights in
+// fragment order ([kc][tap][ntp][lane][2] words). Epilogue as the HLSL kernel's, IEEE-rounded fp32 operations in its order
+// (mul.rn / add.rn, no contraction), quantisation by cvt.rni (nearest even) after the clamp: the same bits.
+std::string KernelQ8(int shape, int NB)
+{
+    const bool T = shape == 3;
+    const int  K = shape == 0 ? 3 : shape == 1 ? 2 : 1, S = shape == 1 ? 2 : 1, pad = shape == 0 ? 1 : 0;
+    const int  taps = T ? 1 : K * K, NA = T ? 4 : 1, wt = T ? 4 : K * K;  // address sets; weight taps
+    static const char* names[4] = {"q8conv3", "q8conv2", "q8conv1", "q8convT"};
+    Ptx w;
+    w.s = std::string(".visible .entry ") + names[shape] + "_" + std::to_string(NB) + "(.param .align 8 .b8 P[136])\n{\n";
+    w(".reg .b32 %%r<240>; .reg .b64 %%rd<80>; .reg .f32 %%f<40>; .reg .pred %%p<80>;");
+    for (int i = 0; i < 5; ++i) w("ld.param.u64 %%rd%d, [P+%d];", 1 + i, i * 8);  // src w mb res out
+    // r1 inW r2 inH r3 pin r4 chin r5 outW r6 outH r7 po r8 cho r9 cout r10 writeEnd r11 act r12 mode r13 pr r14 chr r15 kc r16 ntp r17 cin
+    for (int i = 0; i < 17; ++i) w("ld.param.u32 %%r%d, [P+%d];", 1 + i, 40 + i * 4);
+    for (int i = 0; i < 5; ++i) w("ld.param.f32 %%f%d, [P+%d];", 1 + i, 112 + i * 4);  // invPre sPre invOut sOut sRes
+    w("mov.u32 %%r21, %%tid.x; and.b32 %%r21, %%r21, 31; shr.u32 %%r22, %%r21, 2; and.b32 %%r23, %%r21, 3;");  // lane, g, q
+    w("mov.u32 %%r24, %%ctaid.x; shl.b32 %%r24, %%r24, 4; mov.u32 %%r25, %%ctaid.y; mov.u32 %%r35, %%tid.x; shr.u32 %%r35, %%r35, 5; mad.lo.u32 %%r25, %%r25, %d, %%r35; mov.u32 %%r26, %%ctaid.z; mul.lo.u32 %%r26, %%r26, %d;", kCudaWarps, NB);
+    w("add.u32 %%r27, %%r24, %%r22; add.u32 %%r28, %%r27, 8;");
+    w("setp.eq.s32 %%p1, %%r11, 1; setp.eq.s32 %%p2, %%r11, 2; setp.ne.s32 %%p3, %%r11, 0; and.b32 %%r36, %%r12, 8; setp.ne.u32 %%p4, %%r36, 0;");
+    w("and.b32 %%r36, %%r12, 2; setp.ne.u32 %%p5, %%r36, 0; and.b32 %%r36, %%r12, 4; setp.ne.u32 %%p6, %%r36, 0; or.pred %%p7, %%p5, %%p6;");  // res, fp16 y, fp16 dequant, fp16 out
+    for (int t = 0; t < taps; ++t)
+    {
+        const int ky = t / K, kx = t % K;
+        w("mad.lo.s32 %%r30, %%r25, %d, %d;", S, T ? 0 : ky - pad);
+        w("setp.ge.s32 %%p8, %%r30, 0; setp.lt.s32 %%p9, %%r30, %%r2; and.pred %%p8, %%p8, %%p9;");
+        for (int r = 0; r < 2; ++r)
+        {
+            const int i = t * 2 + r;
+            w("mad.lo.s32 %%r31, %%r%d, %d, %d;", r ? 28 : 27, S, T ? 0 : kx - pad);
+            w("setp.ge.s32 %%p9, %%r31, 0; setp.lt.s32 %%p10, %%r31, %%r1; and.pred %%p9, %%p9, %%p10; and.pred %%p%d, %%p8, %%p9;", 20 + i);
+            w("mad.lo.s32 %%r32, %%r30, %%r1, %%r31; selp.b32 %%r32, %%r32, 0, %%p%d;", 20 + i);
+            w("mad.lo.s32 %%r33, %%r32, %%r3, %%r4; cvt.s64.s32 %%rd7, %%r33; add.s64 %%rd%d, %%rd1, %%rd7;", 20 + i);
+        }
+    }
+    for (int i = 0; i < NA * NB * 4; ++i) w("mov.u32 %%r%d, 0;", 100 + i);
+    w("mul.wide.u32 %%rd8, %%r26, 256; add.s64 %%rd8, %%rd2, %%rd8; mul.wide.u32 %%rd7, %%r21, 8; add.s64 %%rd8, %%rd8, %%rd7;");
+    w("mul.wide.u32 %%rd9, %%r16, 256; mul.lo.u64 %%rd10, %%rd9, %d; mov.u32 %%r40, 0;", wt);  // tap stride, chunk stride
+    w("Q8LOOP:");
+    w("setp.ge.s32 %%p11, %%r40, %%r15; @%%p11 bra Q8END;");
+    w("shl.b32 %%r42, %%r40, 5; shl.b32 %%r41, %%r23, 2; add.s32 %%r42, %%r42, %%r41; add.s32 %%r43, %%r42, 16;");  // c, c + 16
+    w("setp.lt.s32 %%p12, %%r42, %%r17; setp.lt.s32 %%p13, %%r43, %%r17; cvt.s64.s32 %%rd11, %%r42;");
+    for (int t = 0; t < taps; ++t)
+    {
+        for (int r = 0; r < 2; ++r)
+        {
+            const int i = t * 2 + r;
+            w("add.s64 %%rd12, %%rd%d, %%rd11; and.pred %%p14, %%p%d, %%p12; and.pred %%p15, %%p%d, %%p13; mov.u32 %%r%d, 0; mov.u32 %%r%d, 0;", 20 + i, 20 + i, 20 + i, 50 + r, 52 + r);
+            w("@%%p14 ld.global.u32 %%r%d, [%%rd12]; @%%p15 ld.global.u32 %%r%d, [%%rd12+16];", 50 + r, 52 + r);
+        }
+        for (int a = 0; a < NA; ++a)
+        {
+            w("mul.lo.u64 %%rd13, %%rd9, %d; add.s64 %%rd13, %%rd13, %%rd8;", T ? a : t);
+            for (int j = 0; j < NB; ++j)
+            {
+                const int f = 100 + (a * NB + j) * 4;
+                w("ld.global.v2.u32 {%%r54, %%r55}, [%%rd13+%d];", j * 256);
+                w("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%%r%d, %%r%d, %%r%d, %%r%d}, {%%r50, %%r51, %%r52, %%r53}, {%%r54, %%r55}, {%%r%d, %%r%d, %%r%d, %%r%d};",
+                  f, f + 1, f + 2, f + 3, f, f + 1, f + 2, f + 3);
+            }
+        }
+    }
+    w("add.s64 %%rd8, %%rd8, %%rd10; add.s32 %%r40, %%r40, 1; bra Q8LOOP;");
+    w("Q8END:");
+    for (int a = 0; a < NA; ++a)
+        for (int j = 0; j < NB; ++j)
+        {
+            w("add.u32 %%r60, %%r26, %d; shl.b32 %%r60, %%r60, 3; shl.b32 %%r61, %%r23, 1; add.s32 %%r60, %%r60, %%r61;", j);  // c
+            w("setp.lt.s32 %%p30, %%r60, %%r10; add.s32 %%r62, %%r60, 1; setp.lt.s32 %%p31, %%r60, %%r9; setp.lt.s32 %%p32, %%r62, %%r9;");
+            w("mul.wide.s32 %%rd14, %%r60, 4; add.s64 %%rd14, %%rd3, %%rd14; ld.global.v2.f32 {%%f6, %%f7}, [%%rd14];");
+            w("mul.wide.u32 %%rd15, %%r16, 32; add.s64 %%rd15, %%rd14, %%rd15; ld.global.v2.f32 {%%f8, %%f9}, [%%rd15];");  // m, b
+            for (int r = 0; r < 2; ++r)
+            {
+                const int f = 100 + (a * NB + j) * 4 + r * 2, lab = w.label++;
+                if (T) w("shl.b32 %%r63, %%r%d, 1; add.s32 %%r63, %%r63, %d; shl.b32 %%r64, %%r25, 1; add.s32 %%r64, %%r64, %d;", r ? 28 : 27, a & 1, a >> 1);
+                else w("mov.u32 %%r63, %%r%d; mov.u32 %%r64, %%r25;", r ? 28 : 27);
+                w("setp.lt.s32 %%p33, %%r63, %%r5; setp.lt.s32 %%p34, %%r64, %%r6; and.pred %%p33, %%p33, %%p34; and.pred %%p33, %%p33, %%p30; @!%%p33 bra Q8S%d;", lab);
+                w("mad.lo.s32 %%r65, %%r64, %%r5, %%r63;");  // output pixel
+                w("mad.lo.s32 %%r66, %%r65, %%r13, %%r14; add.s32 %%r66, %%r66, %%r60; cvt.s64.s32 %%rd16, %%r66; add.s64 %%rd16, %%rd4, %%rd16;");
+                w("mov.u32 %%r67, 0; mov.u32 %%r68, 0; @%%p4 ld.global.s8 %%r67, [%%rd16]; @%%p4 ld.global.s8 %%r68, [%%rd16+1];");
+                for (int e = 0; e < 2; ++e)
+                {
+                    const int v = 10 + e;  // f10 / f11: y; r70 / r71: O
+                    w("cvt.rn.f32.s32 %%f%d, %%r%d; mul.rn.f32 %%f%d, %%f%d, %%f%d; add.rn.f32 %%f%d, %%f%d, %%f%d;", v, f + e, v, v, 6 + e, v, v, 8 + e);
+                    w("cvt.rn.f32.s32 %%f12, %%r%d; mul.rn.f32 %%f12, %%f12, %%f5; @%%p4 add.rn.f32 %%f%d, %%f%d, %%f12;", 67 + e, v, v);
+                    // with an activation: p = Q(y * invPre) * sPre, act(p), then Q(* invOut); without: Q(y * invOut)
+                    w("mul.rn.f32 %%f13, %%f%d, %%f1; max.f32 %%f13, %%f13, 0fC2FE0000; min.f32 %%f13, %%f13, 0f42FE0000; cvt.rni.s32.f32 %%r72, %%f13;", v);
+                    w("cvt.rn.f32.s32 %%f14, %%r72; mul.rn.f32 %%f14, %%f14, %%f2; setp.gt.f32 %%p35, %%f14, 0f00000000; mul.rn.f32 %%f15, %%f14, 0f3E4CCCCD; selp.f32 %%f15, %%f14, %%f15, %%p35;");
+                    w("max.f32 %%f16, %%f14, 0f00000000; selp.f32 %%f14, %%f15, %%f16, %%p1; selp.f32 %%f14, %%f14, %%f%d, %%p3;", v);
+                    w("mul.rn.f32 %%f14, %%f14, %%f3; max.f32 %%f14, %%f14, 0fC2FE0000; min.f32 %%f14, %%f14, 0f42FE0000; cvt.rni.s32.f32 %%r%d, %%f14;", 70 + e);
+                    w("cvt.rn.f32.s32 %%f17, %%r%d; mul.rn.f32 %%f17, %%f17, %%f4; selp.f32 %%f%d, %%f17, %%f%d, %%p6;", 70 + e, v, v);  // dequantised (mode 4)
+                }
+                w("@%%p7 bra Q8H%d;", lab);
+                w("and.b32 %%r73, %%r70, 255; and.b32 %%r74, %%r71, 255; shl.b32 %%r74, %%r74, 8; or.b32 %%r73, %%r73, %%r74;");
+                w("mad.lo.s32 %%r75, %%r65, %%r7, %%r8; add.s32 %%r75, %%r75, %%r60; cvt.s64.s32 %%rd17, %%r75; add.s64 %%rd17, %%rd5, %%rd17; st.global.u16 [%%rd17], %%r73; bra Q8S%d;", lab);
+                w("Q8H%d:", lab);
+                w("selp.f32 %%f10, %%f10, 0f00000000, %%p31; selp.f32 %%f11, %%f11, 0f00000000, %%p32;");
+                w("{ .reg .b16 %%h<3>; cvt.rn.f16.f32 %%h1, %%f10; cvt.rn.f16.f32 %%h2, %%f11; mov.b32 %%r76, {%%h1, %%h2}; }");
+                w("mad.lo.s32 %%r75, %%r65, %%r7, %%r8; add.s32 %%r75, %%r75, %%r60; mul.wide.s32 %%rd17, %%r75, 2; add.s64 %%rd17, %%rd5, %%rd17; st.global.u32 [%%rd17], %%r76;");
+                w("Q8S%d:", lab);
+            }
+        }
+    w("ret;");
+    return w.s + "}\n";
+}
+
+std::string CudaPtxQ8()
+{
+    std::string p = ".version 7.0\n.target sm_80\n.address_size 64\n";
+    for (int s = 0; s < 4; ++s)
+        for (int nb : {1, 2, 4, 8})
+            if (s < 3 || nb <= 4) p += KernelQ8(s, nb);
+    return p;
+}
+
 // kpos (0-31) of an fp8 k chunk -> its input channel within the chunk's 32 (see FnKernel8).
 int Fp8Channel(int kp) { return (kp >= 16 ? 16 : 0) + 8 * ((kp % 4) / 2) + 2 * ((kp % 16) / 4) + (kp % 2); }
 
@@ -575,9 +693,35 @@ std::unique_ptr<CudaKernels> CudaKernels::Create(Device& dev, std::string* error
         if (!fn(k->m_fn8[i], i ? "fn64f8" : "fn48f8")) return fail("CUDA function");
     return k;
 }
+std::unique_ptr<CudaKernels> CudaKernels::CreateQ8(Device& dev, std::string* error)
+{
+    auto fail = [&](const std::string& m) -> std::unique_ptr<CudaKernels> { if (error) *error = m; return nullptr; };
+    LUID luid;
+    if (!dev.CudaAvailable() || !dev.CudaLuid(reinterpret_cast<uint8_t*>(&luid))) return fail("no CUDA launch on this device");
+    const int cc = cuda::ComputeCapability(luid, error);
+    if (!cc) return nullptr;
+    if (cc < 80) return fail("int8 tensor cores (mma m16n8k32) need sm_80");
+    const std::vector<uint8_t> cubin = cuda::Cubin(CudaPtxQ8(), luid, error);
+    if (cubin.empty()) return nullptr;
+    std::unique_ptr<CudaKernels> k(new CudaKernels(dev));
+    if (!(k->m_module = dev.CudaModule(cubin))) return fail("CUDA module");
+    static const char* names[4] = {"q8conv3", "q8conv2", "q8conv1", "q8convT"};
+    const int nbs[4] = {1, 2, 4, 8};
+    for (int s = 0; s < 4; ++s)
+        for (int i = 0; i < 4; ++i)
+            if ((s < 3 || nbs[i] <= 4) && !(k->m_q8[s][i] = dev.CudaFunction(k->m_module, (std::string(names[s]) + "_" + std::to_string(nbs[i])).c_str())))
+                return fail("CUDA function");
+    return k;
+}
+bool CudaKernels::LaunchQ8(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const QParams& p) const
+{
+    const int i = nb == 1 ? 0 : nb == 2 ? 1 : nb == 4 ? 2 : 3;
+    return m_q8[shape][i] && m_dev.CudaLaunch(m_q8[shape][i], grid, 32 * kCudaWarps, &p, sizeof(p), bufs, n);
+}
 CudaKernels::~CudaKernels()
 {
     std::vector<void*> f(m_fnk, m_fnk + 2);
+    for (auto& s : m_q8) f.insert(f.end(), s, s + 4);
     f.insert(f.end(), m_fn8, m_fn8 + 2);
     f.insert(f.end(), m_convM, m_convM + 3);
     f.push_back(m_splitK), f.push_back(m_reduce);

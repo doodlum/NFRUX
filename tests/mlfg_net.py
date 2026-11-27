@@ -185,7 +185,7 @@ def main():
                     continue  # coopmat is Vulkan's
                 env = dict(os.environ, NFRUX_MLFG=tier)
                 if A.int8:
-                    env = dict(os.environ, NFRUX_AMD_PRECISION='int8', **({'NFRUX_MLFG_Q8': tier} if tier in ('dot4', 'int') else {'NFRUX_MLFG': tier}))
+                    env = dict(os.environ, NFRUX_AMD_PRECISION='int8', NFRUX_MLFG_Q8=tier)  # int8 tiers: dot4 / int (HLSL), cuda
                     if A.int8_bin:
                         env['NFRUX_AMD_WEIGHTS_INT8'] = A.int8_bin
                 r = subprocess.run([A.exe, api, str(W)] + (['--bench', str(A.bench)] if A.bench else []), capture_output=True, text=True, env=env)

@@ -124,7 +124,8 @@ private:
     bool FlowBlockQ(uint32_t block, const View& in, const View& out13);
     bool Stage2Q(const View& in, const View& logits);
     bool FasterNetQ(uint32_t first, uint32_t C, const View& x, const View& y, const View& hin, const View& h, const View* skip, const View* upOut);
-    bool                    m_int8 = false, m_dot4 = false;
+    bool                    m_int8 = false, m_dot4 = false, m_q8cuda = false;  // m_q8cuda: int8 CUDA kernels (m_cuda) for int8-source layers
+    std::vector<uint32_t>   m_qcOffset, m_qcMb;  // int8 CUDA: per layer weight words (m_gpuW8), m / b floats (m_gpuBias)
     QWeights                m_q;
     std::vector<uint32_t>   m_qOffset;           // per layer: weight words, then m / b / rf
     std::unique_ptr<Pass>   m_q8[4][3];          // int8: 3x3, 2x2/2, 1x1, transposed; large / small tile / 8x8 by 32 channels

@@ -266,8 +266,8 @@ Network::~Network()
 std::string Network::Describe() const
 {
     if (m_int8)
-        return std::string("int8, generic HLSL kernels, ") + (m_dot4 ? (m_dev.caps().vulkan ? "integer dot product" : "SM 6.4 packed dot product") : "32-bit integers") +
-               (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)");
+        return std::string("int8, ") + (m_q8cuda ? "CUDA kernels on int8 tensor cores + " : "") + "generic HLSL kernels, " +
+               (m_dot4 ? (m_dev.caps().vulkan ? "integer dot product" : "SM 6.4 packed dot product") : "32-bit integers") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)");
     if (m_tier == Tier::CoopMat)
         return "cooperative matrices fp16, fragments " + std::to_string(m_matSet->m) + "x" + std::to_string(m_matSet->n) + "x16, subgroup " + std::to_string(m_matSet->sg) + " (Vulkan)";
     return m_tier == Tier::Cuda ? std::string(m_gpuW8 ? "CUDA kernels, fp16 tensor cores, FP8 for stage 2's FasterNet blocks" : "CUDA kernels, fp16 tensor cores") + (m_dev.caps().vulkan ? " (Vulkan)" : " (D3D12)") : "generic HLSL kernels (fp32, strict)";
@@ -387,9 +387,28 @@ bool Network::SelectPrecision(std::string* error)
     // marker of their own (the 32-bit integer kernels as the fallback). NFRUX_MLFG_Q8=dot4 | int (tests): forced, strict.
     const Caps& caps = m_dev.caps();
     const char* q8   = Env("NFRUX_MLFG_Q8");
-    if (q8 && strcmp(q8, "dot4") && strcmp(q8, "int")) { if (error) *error = std::string("NFRUX_MLFG_Q8=") + q8 + ": not dot4 or int"; return false; }
+    if (q8 && strcmp(q8, "dot4") && strcmp(q8, "int") && strcmp(q8, "cuda")) { if (error) *error = std::string("NFRUX_MLFG_Q8=") + q8 + ": not dot4, int or cuda"; return false; }
     if (q8 && !strcmp(q8, "dot4") && !caps.dot4) { if (error) *error = "NFRUX_MLFG_Q8=dot4: no packed dot product on this device"; return false; }
-    m_dot4 = q8 ? !strcmp(q8, "dot4") : caps.dot4;
+    // NVIDIA RTX 30 and newer: int8 tensor cores (CUDA, both APIs) for the layers with an int8 source, behind a crash marker as
+    // the fp16 CUDA tier's; the block entries and FasterNet pconv layers stay on the HLSL kernels (dot4 there).
+    const bool cudaQ = q8 && !strcmp(q8, "cuda");
+    if ((q8 ? cudaQ : caps.nvidia) && m_dev.CudaAvailable())
+    {
+        std::string why;
+        char        b[64];
+        snprintf(b, sizeof(b), "%s_mlfg_q8cuda_%04x", caps.vulkan ? "vulkan" : "d3d12", caps.deviceId);
+        if (cudaQ || MarkerBegin(b))
+        {
+            if ((m_cuda = CudaKernels::CreateQ8(m_dev, &why))) { if (!cudaQ) m_marker = b; }
+            else if (!cudaQ) MarkerOk(b);
+        }
+        else why = "crash marker";
+        if (!m_cuda && cudaQ) { if (error) *error = "NFRUX_MLFG_Q8=cuda: " + why; return false; }
+        if (!m_cuda) Log("FSR FG4 network: int8 CUDA not used (%s)", why.c_str());
+    }
+    else if (cudaQ) { if (error) *error = "NFRUX_MLFG_Q8=cuda: no CUDA launch on this device"; return false; }
+    m_q8cuda = m_cuda != nullptr;
+    m_dot4 = q8 && !cudaQ ? !strcmp(q8, "dot4") : caps.dot4;
     if (m_dot4 && !q8 && !caps.nvidia)
     {
         char b[64];
@@ -549,7 +568,7 @@ bool Network::Make(uint32_t l0w, uint32_t l0h, uint32_t s2w, uint32_t s2h, std::
     bool ok = true;
     auto tensor = [&](Tensor& t, uint32_t w, uint32_t h, uint32_t pitch) {
         t.w = w, t.h = h, t.pitch = pitch;
-        t.buf = m_dev.CreateBuffer(uint64_t(w) * h * pitch * 2, m_tier == Tier::Cuda);
+        t.buf = m_dev.CreateBuffer(uint64_t(w) * h * pitch * 2, m_tier == Tier::Cuda || m_q8cuda);
         ok = ok && t.buf;
     };
     // Stage-1 scratch, used at many sizes (views): the largest of each role.
@@ -830,6 +849,44 @@ bool Network::MakeInt8(std::string* error)
     for (int i = 0; i < 4; ++i)
         for (int j = 0; j < 2; ++j)
             if (!(m_q8[i][j] = m_dev.CreatePass(*(m_dot4 ? d4 : in)[i][j]))) return fail("int8 network passes");
+    if (!m_q8cuda) return true;
+    // CUDA int8 (KernelQ8): per layer [kc][tap][ntp][lane] word pairs, word e = W[o = 8 n + g][k = 32 kc + 16 e + 4 q + b]
+    // in byte b (lane = 4 g + q); m / b fp32 [ntp * 8] each (the HLSL blob's values).
+    std::vector<uint32_t> cw;
+    std::vector<float>    mb;
+    m_qcOffset.resize(kLayers), m_qcMb.resize(kLayers), m_nb.assign(kLayers, 0);
+    for (uint32_t l = 0; l < kLayers; ++l)
+    {
+        const QLayerWeights& L = m_q.layers[l];
+        const uint32_t taps = L.k * L.k, kc = (L.cin + 31) / 32, nt = (L.cout + 7) / 8;
+        const uint32_t nb = std::min(L.kind == 1 ? 4u : 8u, nt <= 1 ? 1u : nt <= 2 ? 2u : nt <= 4 ? 4u : 8u), ntp = (nt + nb - 1) / nb * nb;
+        m_nb[l] = nb, m_qcOffset[l] = uint32_t(cw.size()), m_qcMb[l] = uint32_t(mb.size());
+        cw.resize(cw.size() + size_t(kc) * taps * ntp * 64, 0);
+        uint32_t* p = cw.data() + m_qcOffset[l];
+        for (uint32_t c = 0; c < kc; ++c)
+            for (uint32_t t = 0; t < taps; ++t)
+                for (uint32_t n = 0; n < ntp; ++n)
+                    for (uint32_t lane = 0; lane < 32; ++lane)
+                        for (uint32_t e = 0; e < 2; ++e)
+                        {
+                            const uint32_t o = 8 * n + (lane >> 2);
+                            uint32_t       word = 0;
+                            for (uint32_t b = 0; b < 4 && o < L.cout; ++b)
+                            {
+                                const uint32_t i = 32 * c + 16 * e + 4 * (lane & 3) + b;
+                                if (i >= L.cin) continue;
+                                const size_t src = L.kind == 0 ? (size_t(o) * L.cin + i) * taps + t : (size_t(i) * L.cout + o) * taps + t;
+                                word |= (uint32_t(m_q.W(l, src)) & 0xFFu) << (8 * b);
+                            }
+                            p[(((size_t(c) * taps + t) * ntp + n) * 32 + lane) * 2 + e] = word;
+                        }
+        mb.resize(mb.size() + 16 * ntp, 0.0f);
+        const float* f = reinterpret_cast<const float*>(m_blob.data()) + m_qOffset[l] + size_t(taps) * ((L.cin + 3) / 4) * ((L.cout + 31) & ~31u);
+        for (uint32_t o = 0; o < L.cout; ++o) mb[m_qcMb[l] + o] = f[o], mb[m_qcMb[l] + 8 * ntp + o] = f[((L.cout + 31) & ~31u) + o];
+    }
+    m_blob8.resize(cw.size() * 4), memcpy(m_blob8.data(), cw.data(), m_blob8.size());
+    m_biasBlob.resize(mb.size() * 4), memcpy(m_biasBlob.data(), mb.data(), m_biasBlob.size());
+    if (!(m_gpuW8 = m_dev.CreateBuffer(m_blob8.size(), true)) || !(m_gpuBias = m_dev.CreateBuffer(m_biasBlob.size(), true))) return fail("int8 CUDA weights buffers");
     return true;
 }
 
@@ -837,7 +894,8 @@ bool Network::RunQ(const QConv& c)
 {
     const QLayerWeights& L = m_q.layers[c.layer];
     char label[48] = "";
-    if (m_dev.Timing()) snprintf(label, sizeof(label), "L%03u q8 %s%ux%u %u->%u", c.layer, L.kind ? "T" : "k", L.k, L.stride, L.cin, L.cout), m_dev.Label(label);
+    if (m_dev.Timing()) snprintf(label, sizeof(label), "L%03u q8 %s%ux%u %u->%u", c.layer, L.kind ? "T" : "k", L.k, L.stride, L.cin, L.cout);
+    if (label[0] && !(m_q8cuda && !c.srcF16 && c.copyFrom == ~0u)) m_dev.Label(label);  // CUDA launches mark themselves
     const bool     f16 = (L.flags & QLayerWeights::kF16Out) != 0 || c.outF16;
     const uint32_t copyTo = c.copyFrom != ~0u ? c.writeEnd : 0;
     const uint32_t writeEnd = c.writeEnd ? c.writeEnd : f16 ? (L.cout + 1) & ~1u : L.cout;
@@ -857,6 +915,22 @@ bool Network::RunQ(const QConv& c)
         {c.res ? int32_t(c.res.pitch) : 0, int32_t(c.res.ch), copyTo ? int32_t(c.copyFrom) : 0x7FFFFFFF, 0},
         {rcp(sPre), sPre, rcp(sOut), sOut}, {m_q.S(L.qres), m_q.S(L.qin), 0, 0}};
     const int      shape = L.kind == 1 ? 3 : L.k == 3 ? 0 : L.k == 2 ? 1 : 2;
+    if (m_q8cuda && !c.srcF16 && !copyTo)
+    {
+        const uint32_t nb = m_nb[c.layer], ntp = ((L.cout + 7) / 8 + nb - 1) / nb * nb;
+        if ((writeEnd + 7) / 8 > ntp) return false;
+        const Buffer* bufs[] = {c.src.buf, m_gpuW8.get(), m_gpuBias.get(), c.res ? c.res.buf : c.src.buf, c.out.buf};
+        const QParams p = {m_dev.NativeAddress(*bufs[0]), m_dev.NativeAddress(*bufs[1]) + uint64_t(m_qcOffset[c.layer]) * 4, m_dev.NativeAddress(*bufs[2]) + uint64_t(m_qcMb[c.layer]) * 4,
+                           m_dev.NativeAddress(*bufs[3]), m_dev.NativeAddress(*bufs[4]), int32_t(c.src.w), int32_t(c.src.h), int32_t(c.src.pitch), int32_t(c.src.ch),
+                           int32_t(c.out.w), int32_t(c.out.h), int32_t(c.out.pitch), int32_t(c.out.ch), int32_t(L.cout), int32_t(writeEnd), int32_t(L.act), mode,
+                           c.res ? int32_t(c.res.pitch) : 0, int32_t(c.res.ch), int32_t((L.cin + 31) / 32), int32_t(ntp), int32_t(L.cin), 0,
+                           k.q[0], k.q[1], k.q[2], k.q[3], k.q2[0], 0.0f};
+        const bool     T = L.kind == 1;
+        const uint32_t grid[3] = {((T ? c.src.w : c.out.w) + 15) / 16, ((T ? c.src.h : c.out.h) + kCudaWarps - 1) / kCudaWarps, ntp / nb};
+        const bool     ok = m_cuda->LaunchQ8(bufs, 5, shape, nb, grid, p);
+        if (label[0]) m_dev.Mark(label);
+        return ok;
+    }
     const uint32_t zs = (std::max(copyTo ? copyTo : L.cout, writeEnd) + 7) / 8, th = shape == 1 ? 8 : 16;
     const bool     small = uint64_t((c.out.w + 15) / 16) * ((c.out.h + th - 1) / th) * zs < 768;
     const Bind b[] = {Bind::Data(0, &k, sizeof(k)), Bind::Buf(1, *c.src.buf), Bind::Buf(3, *m_gpuWeights), Bind::Buf(4, c.res ? *c.res.buf : *c.src.buf), Bind::Buf(5, *c.out.buf)};

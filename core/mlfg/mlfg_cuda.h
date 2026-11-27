@@ -36,10 +36,23 @@ struct FnParams  // a fused FasterNet block (C 48 / 64)
 #pragma pack(pop)
 static_assert(sizeof(FnParams) == 72, "the fused kernel's parameter block");
 
+#pragma pack(push, 4)
+struct QParams  // an int8 layer (KernelQ8): tensors (bytes), weights, m / b floats, residual, output
+{
+    uint64_t src, w, mb, res, out;
+    int32_t  inW, inH, pin, chin, outW, outH, po, cho, cout, writeEnd, act, mode, pr, chr, kc, ntp, cin, pad;
+    float    invPre, sPre, invOut, sOut, sRes, pad2;
+};
+#pragma pack(pop)
+static_assert(sizeof(QParams) == 136, "the int8 kernels' parameter block");
+
 class CudaKernels
 {
 public:
     static std::unique_ptr<CudaKernels> Create(Device& dev, std::string* error);
+    // The int8 network's kernels (sm_80+: mma.m16n8k32 s8): shape 0-3, nb 1 / 2 / 4 / 8 n tiles a warp (transposed up to 4).
+    static std::unique_ptr<CudaKernels> CreateQ8(Device& dev, std::string* error);
+    bool LaunchQ8(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const QParams& p) const;
     ~CudaKernels();
     // shape 0 3x3/1, 1 2x2/2, 2 1x1, 3 transposed; nb n tiles (8 channels) a warp: 1, 2, 3, 4, 6, 8 (transposed up to 4); bufs: the buffers it touches (Device::CudaLaunch).
     bool Launch(const Buffer* const* bufs, uint32_t n, int shape, uint32_t nb, const uint32_t grid[3], const CudaParams& p) const;
@@ -60,6 +73,7 @@ private:
     void*         m_fn8[2] = {};
     void*         m_convM[3] = {};  // 3x3 / 2x2 / 1x1, 8 n tiles, 32 pixels a warp
     void*         m_splitK = nullptr, *m_reduce = nullptr;
+    void*         m_q8[4][4] = {};
 };
 std::string CudaPtx(bool fp8);  // tests
 int         Fp8Channel(int kpos);  // an fp8 k chunk's position -> input channel within its 32 (weights' packing)
