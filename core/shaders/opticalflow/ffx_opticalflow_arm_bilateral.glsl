@@ -6,6 +6,8 @@
 // hint SAD read them 25 times (the hint's warp a bilinear sample and a hint fetch each).
 // Ported from Arm's ML Emulation Layer for Vulkan (github.com/arm/ai-ml-emulation-layer-for-vulkan, Apache-2.0).
 //
+// The median filter (step 3) is taken here too, into shared memory, from the match's flow (a 14 x 14 tile): one dispatch less a level.
+//
 // FFX_OF_IMAGE=arm (ffx_opticalflow_arm_common.h), per level, step 4 of 4: the layer's bilateral_filter.comp, a 5x5
 // filter of the flow weighted by TM1's intensity differences, which the next finer level warps by. At the last level
 // (level 2) also the hint (the layer's dense_warp.comp, block_match_of.comp's RAW_SAD and mv_replace.comp): TP1
@@ -32,7 +34,7 @@ layout (local_size_x = GROUP, local_size_y = GROUP, local_size_z = 1) in;
 
 layout(set = 0, binding = 1)        uniform texture2D r_pyramid_tm1;
 layout(set = 0, binding = 2)        uniform texture2D r_pyramid_tp1;
-layout(set = 0, binding = 3)        uniform texture2D r_arm_med;
+layout(set = 0, binding = 3)        uniform texture2D r_arm_sub;    // the match's flow: its 3x3 median (step 3) is taken here
 layout(set = 0, binding = 4)        uniform utexture2D r_arm_match;
 layout(set = 0, binding = 5)        uniform texture2D r_flow_hint;  // the hint, colour pixels per 4x4 cell
 layout(set = 0, binding = 6, rg16f) uniform writeonly image2D rw_arm_flow;
@@ -41,9 +43,19 @@ layout(set = 0, binding = 7, rg16f) uniform writeonly image2D rw_flow;  // optic
 const float16_t kSigmaIntensityDivSqrt = float16_t(5.05129933779);
 const float16_t kSpatial               = float16_t(-0.00913);
 
+#define SUB (TILE + 2)  // 14: the medians' 3x3 neighbourhoods
 shared float      s_tm1[TILE * TILE];   // TM1's texel, clamped to the level (ArmTexel)
+shared f16vec2    s_sub[SUB * SUB];     // the match's flow, clamped to the level
 shared f16vec2    s_med[TILE * TILE];   // the median flow, clamped to the level
 shared FfxUInt32  s_hint[TILE * TILE];  // the last level: TP1 warped by the hint (zero off the level)
+
+#define SORT(a, b)                     \
+    {                                  \
+        const f16vec2 lo = min(a, b);  \
+        const f16vec2 hi = max(a, b);  \
+        a                = lo;         \
+        b                = hi;         \
+    }
 
 // TP1's level 2 warped by the hint at p (dense_warp.comp), zero off the level as the RAW_SAD reads it.
 FfxUInt32 HintWarped(FfxInt32x2 p)
@@ -60,13 +72,36 @@ void main()
 {
     const FfxInt32x2 origin = FfxInt32x2(gl_WorkGroupID.xy) * GROUP - ARM_BLOCK_R;
     const bool       last   = ubo._Final != 0;
+    const FfxInt32x2 maxPos = ubo._LevelDims - FfxInt32x2(1);
+    for (FfxUInt32 i = gl_LocalInvocationIndex; i < SUB * SUB; i += GROUP * GROUP)
+        s_sub[i] = f16vec2(texelFetch(r_arm_sub, clamp(origin - 1 + FfxInt32x2(i % SUB, i / SUB), FfxInt32x2(0), maxPos), 0).xy);
     for (FfxUInt32 i = gl_LocalInvocationIndex; i < TILE * TILE; i += GROUP * GROUP)
     {
         const FfxInt32x2 k = origin + FfxInt32x2(i % TILE, i / TILE);
         s_tm1[i]           = ArmTexel(r_pyramid_tm1, ubo._LevelRow, ubo._LevelDims, k);
-        s_med[i]           = f16vec2(texelFetch(r_arm_med, clamp(k, FfxInt32x2(0), ubo._LevelDims - FfxInt32x2(1)), 0).xy);
         if (last)
             s_hint[i] = HintWarped(k);
+    }
+    barrier();
+    // The layer's median_filter.comp (what step 3 wrote and this read back): the 3x3 median of each component at the texel clamped to the level,
+    // its neighbours clamped too, by the same sorting network. Each median is one of its texels, so it is that texel's value.
+    for (FfxUInt32 i = gl_LocalInvocationIndex; i < TILE * TILE; i += GROUP * GROUP)
+    {
+        const FfxInt32x2 q = clamp(origin + FfxInt32x2(i % TILE, i / TILE), FfxInt32x2(0), maxPos);
+        f16vec2 v[9];
+        [[unroll]] for (FfxInt32 j = 0; j < 9; ++j)
+        {
+            const FfxInt32x2 p = clamp(q + FfxInt32x2(j % 3, j / 3) - 1, FfxInt32x2(0), maxPos) - (origin - 1);
+            v[j] = s_sub[p.y * SUB + p.x];
+        }
+        SORT(v[1], v[2]); SORT(v[4], v[5]); SORT(v[7], v[8]);
+        SORT(v[0], v[1]); SORT(v[3], v[4]); SORT(v[6], v[7]);
+        SORT(v[1], v[2]); SORT(v[4], v[5]); SORT(v[7], v[8]);
+        SORT(v[0], v[3]); SORT(v[5], v[8]); SORT(v[4], v[7]);
+        SORT(v[3], v[6]); SORT(v[1], v[4]); SORT(v[2], v[5]);
+        SORT(v[4], v[7]); SORT(v[4], v[2]); SORT(v[6], v[4]);
+        SORT(v[4], v[2]);
+        s_med[i] = v[4];
     }
     barrier();
 

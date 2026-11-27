@@ -33,7 +33,7 @@ fi_ = "shaders/frameinterpolation/ffx_frameinterpolation"
 # name, source, defines, inversion define, D3D12 shader model
 passes = []
 for n, s in [("kOfMvHints", of_ + "_mv_hints"), ("kOfArmPyramid", of_ + "_arm_pyramid"), ("kOfArmWarp", of_ + "_arm_warp"),
-             ("kOfArmMatch", of_ + "_arm_match"), ("kOfArmMedian", of_ + "_arm_median"),
+             ("kOfArmMatch", of_ + "_arm_match"),
              ("kOfArmBilateral", of_ + "_arm_bilateral")]:
     passes.append((n, s, OF, "DEPTH_INVERTED", 60))
 INV = P + "INVERTED_DEPTH"

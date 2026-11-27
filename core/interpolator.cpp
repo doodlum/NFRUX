@@ -159,9 +159,9 @@ struct Interpolator::Impl
     FiConstants c = {};
     float    lastVP[16] = {};
     PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post, postHistory;
-    PassPtr  mvHints, pyramidP, flowWarp, match, median, bilateral;
+    PassPtr  mvHints, pyramidP, flowWarp, match, bilateral;
     Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion, ofColour;
-    Tex      computedMv, flow, pyramid[2], fWarp, fMatch, fSub, fMed, fFlow;
+    Tex      computedMv, flow, pyramid[2], fWarp, fMatch, fSub, fFlow;
     bool     pyramidValid = false;
     uint32_t dynCur = 0, depthCur = 0, prepCur = 0, pyrCur = 0;
     uint64_t frame = 0;
@@ -223,7 +223,7 @@ bool Interpolator::Impl::Create(std::string* error)
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
-    NFRUX_PASS(match, kOfArmMatch) NFRUX_PASS(median, kOfArmMedian) NFRUX_PASS(bilateral, kOfArmBilateral)
+    NFRUX_PASS(match, kOfArmMatch) NFRUX_PASS(bilateral, kOfArmBilateral)
     level[0] = ofInput;
     int32_t rows = 0;
     for (uint32_t l = 1; l < 6; ++l)
@@ -244,7 +244,7 @@ bool Interpolator::Impl::Create(std::string* error)
     tex(computedMv, Format::RG16Float, of), tex(flow, Format::RG16Float, of);
     for (auto& t : pyramid) tex(t, Format::R8Unorm, {level[1].width, uint32_t(rows)});
     tex(fWarp, Format::R8Unorm, level[2]), tex(fMatch, Format::R32Uint, level[2]);
-    tex(fSub, Format::RG16Float, level[2]), tex(fMed, Format::RG16Float, level[2]), tex(fFlow, Format::RG16Float, level[2]);
+    tex(fSub, Format::RG16Float, level[2]), tex(fFlow, Format::RG16Float, level[2]);
     if (!ok)
         return fail("out of memory");
 
@@ -350,10 +350,9 @@ bool Interpolator::Impl::Match(bool reset)
             const uint32_t gx = Groups(d.width), gy = Groups(d.height);
             const Bind w[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, p1), Bind::Tex(2, *fFlow), Bind::Tex(3, *fWarp)};
             const Bind mb[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, m1), Bind::Tex(2, *fWarp), Bind::Tex(3, *fFlow), Bind::Tex(4, *fSub), Bind::Tex(5, *fMatch)};
-            const Bind md[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, *fSub), Bind::Tex(2, *fMed)};
-            const Bind bl[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, m1), Bind::Tex(2, p1), Bind::Tex(3, *fMed), Bind::Tex(4, *fMatch),
+            const Bind bl[] = {Bind::Data(0, &ic, sizeof(ic)), Bind::Tex(1, m1), Bind::Tex(2, p1), Bind::Tex(3, *fSub), Bind::Tex(4, *fMatch),
                                Bind::Tex(5, *computedMv), Bind::Tex(6, *fFlow), Bind::Tex(7, *flow)};
-            if (!flowWarp->Dispatch(w, 4, gx, gy) || !match->Dispatch(mb, 6, gx, gy) || !median->Dispatch(md, 3, gx, gy) || !bilateral->Dispatch(bl, 8, gx, gy))
+            if (!flowWarp->Dispatch(w, 4, gx, gy) || !match->Dispatch(mb, 6, gx, gy) || !bilateral->Dispatch(bl, 8, gx, gy))  // the median in the filter
                 return false;
         }
     }
