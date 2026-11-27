@@ -80,7 +80,8 @@ static NgxResult __cdecl Req12(void* a, const NgxFeatureDiscoveryInfo* i, NgxFea
 // --- Vulkan
 using PFN_InitVk2 = NgxResult(__cdecl*)(unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, int, const void*);
 static uint32_t g_ml_(); static VkDevice g_dev_();
-static void NoteVk(VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd) { if (auto f = Ours<void(__cdecl*)(VkDevice, uint32_t)>("NFRUX_SetVulkanFeatures"); f && g_dev_()) f(d, g_ml_()); if (auto o = Ours<PFN_InitVk2>("NVSDK_NGX_VULKAN_Init_Ext2")) o(0, nullptr, i, pd, d, gi, gd, 0x15, nullptr); }
+static uint32_t g_api_();
+static void NoteVk(VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd) { if (auto f = Ours<void(__cdecl*)(VkDevice, uint32_t, uint32_t)>("NFRUX_SetVulkanFeatures"); f && g_dev_()) f(d, g_ml_(), g_api_()); if (auto o = Ours<PFN_InitVk2>("NVSDK_NGX_VULKAN_Init_Ext2")) o(0, nullptr, i, pd, d, gi, gd, 0x15, nullptr); }
 static NgxResult __cdecl InitVk(unsigned long long a, const wchar_t* b, VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd, const void* fi, int v) { NoteVk(i, pd, d, gi, gd); return Real<decltype(&InitVk)>("NVSDK_NGX_VULKAN_Init")(a, b, i, pd, d, gi, gd, fi, v); }
 static NgxResult __cdecl InitVk2(unsigned long long a, const wchar_t* b, VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd, int v, const void* fi) { NoteVk(i, pd, d, gi, gd); return Real<decltype(&InitVk2)>("NVSDK_NGX_VULKAN_Init_Ext2")(a, b, i, pd, d, gi, gd, v, fi); }
 static NgxResult __cdecl InitVkP(const char* pid, int e, const char* ev, const wchar_t* b, VkInstance i, VkPhysicalDevice pd, VkDevice d, PFN_vkGetInstanceProcAddr gi, PFN_vkGetDeviceProcAddr gd, int v, const void* fi) { NoteVk(i, pd, d, gi, gd); return Real<decltype(&InitVkP)>("NVSDK_NGX_VULKAN_Init_ProjectID_Ext")(pid, e, ev, b, i, pd, d, gi, gd, v, fi); }
@@ -296,6 +297,17 @@ static VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice pd, const VkDeviceCreat
     return r;
 }
 static uint32_t g_ml_() { return g_ml; } static VkDevice g_dev_() { return g_featureDevice; }
+// vkCreateInstance: the apiVersion the game (or Streamline, which raises it to 1.3) asked for caps what the device may use.
+static PFN_vkCreateInstance g_createInstance;
+static uint32_t             g_api;
+static uint32_t g_api_() { return g_api; }
+static VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* out)
+{
+    const VkResult r = g_createInstance(ci, a, out);
+    if (r == VK_SUCCESS) g_api = ci && ci->pApplicationInfo && ci->pApplicationInfo->apiVersion ? ci->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
+    L("vkCreateInstance -> %d, Vulkan 1.%u", r, VK_API_VERSION_MINOR(g_api));
+    return r;
+}
 static PFN_vkDestroyDevice g_destroyDevice;
 static void VKAPI_CALL DestroyDevice(VkDevice d, const VkAllocationCallbacks* a)
 {
@@ -316,6 +328,7 @@ static PFN_vkGetInstanceProcAddr g_gipa;
 static PFN_vkVoidFunction VKAPI_CALL HookGipa(VkInstance i, const char* n)
 {
     PFN_vkVoidFunction f = g_gipa(i, n);
+    if (f && n && !i && !strcmp(n, "vkCreateInstance")) { if (!g_createInstance) g_createInstance = (PFN_vkCreateInstance)f; return (PFN_vkVoidFunction)CreateInstance; }
     if (f && n && !strcmp(n, "vkCreateDevice")) { if (!g_createDevice) g_createDevice = (PFN_vkCreateDevice)f; return (PFN_vkVoidFunction)CreateDevice; }
     if (f && n && !strcmp(n, "vkDestroyDevice")) { Trampoline(); return (PFN_vkVoidFunction)DestroyDevice; }
     if (f && n && !strcmp(n, "vkGetDeviceProcAddr")) { if (!g_gdpa) g_gdpa = (PFN_vkGetDeviceProcAddr)f; return (PFN_vkVoidFunction)HookGdpa; }
@@ -390,6 +403,7 @@ static FARPROC WINAPI HookGPA(HMODULE m, LPCSTR n)
     }
     if (HIWORD(n) && r && m == GetModuleHandleA("vulkan-1.dll"))
     {
+        if (!strcmp(n, "vkCreateInstance")) { g_createInstance = (PFN_vkCreateInstance)r; return (FARPROC)CreateInstance; }
         if (!strcmp(n, "vkCreateDevice")) { g_createDevice = (PFN_vkCreateDevice)r; return (FARPROC)CreateDevice; }
         if (!strcmp(n, "vkDestroyDevice")) { g_destroyDevice = (PFN_vkDestroyDevice)r; return (FARPROC)DestroyDevice; }
         if (!strcmp(n, "vkGetDeviceProcAddr")) { g_gdpa = (PFN_vkGetDeviceProcAddr)r; return (FARPROC)HookGdpa; }

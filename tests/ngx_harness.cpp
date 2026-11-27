@@ -331,7 +331,7 @@ struct TexV : Tex
 };
 struct ApiV : Api
 {
-    bool minimal = false;
+    bool minimal = false, unknown = false;  // unknown: the device's features are not reported (no loader, no Streamline): NFRUX must refuse
     VkInstance inst = VK_NULL_HANDLE;
     VkPhysicalDevice pd = VK_NULL_HANDLE;
     VkDevice dv = VK_NULL_HANDLE;
@@ -404,7 +404,8 @@ struct ApiV : Api
         VkCommandBufferAllocateInfo ca = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         vkAllocateCommandBuffers(dv, &ca, &cb);
         vkGetPhysicalDeviceMemoryProperties(pd, &mp);
-        if (!minimal && GetProcAddress(dll, "NFRUX_SetVulkanFeatures")) Fn<void (*)(VkDevice, uint32_t)>("NFRUX_SetVulkanFeatures")(dv, ml);
+        // As the loader does: what this device was created with (minimal: nothing beyond Vulkan 1.2's core).
+        if (!unknown && GetProcAddress(dll, "NFRUX_SetVulkanFeatures")) Fn<void (*)(VkDevice, uint32_t, uint32_t)>("NFRUX_SetVulkanFeatures")(dv, ml, ai.apiVersion);
         return Fn<NgxResult (*)(unsigned long long, const wchar_t*, VkInstance, VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr, PFN_vkGetDeviceProcAddr, int, const void*)>("NVSDK_NGX_VULKAN_Init_Ext2")(
                    0, L".", inst, pd, dv, nullptr, nullptr, 0x15, nullptr) == kNgxSuccess;
     }
@@ -1309,10 +1310,9 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) return puts("ngx_harness DLL [--minimal] [--soak N] [d3d12|vulkan]"), 2;
     if (!getenv("NFRUX_ASYNC_TEST")) SetEnvironmentVariableA("NFRUX_SYNC_CREATE", "1");  // every frame counted on; else the worker thread's path
-    for (int i = 2; i < argc; ++i) if (!strcmp(argv[i], "--minimal") && !getenv("NFRUX_VK_ASSUME_FEATURES")) SetEnvironmentVariableA("NFRUX_VK_ASSUME_FEATURES", "0");  // nothing is enabled there
     HMODULE dll = LoadLibraryExA(argv[1], nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!dll) return printf("cannot load %s\n", argv[1]), 2;
-    bool minimal = false;
+    bool minimal = false, unknown = false;
     uint32_t soak = 0, tw = 0, th = 0, tg = 0;
     int replay = 0;
     std::vector<std::string> which;
@@ -1320,6 +1320,12 @@ int main(int argc, char** argv)
     {
         const std::string s = argv[i];
         if (s == "--minimal") minimal = true;
+        else if (s == "--unknown") unknown = true;
+        else if (s == "--streamline")  // as in a Streamline game with no loader: sl.interposer.dll is loaded, features are not reported
+        {
+            unknown = true;
+            if (!LoadLibraryA(getenv("NFRUX_TEST_SL_INTERPOSER") ? getenv("NFRUX_TEST_SL_INTERPOSER") : "sl.interposer.dll")) return puts("  no sl.interposer.dll (NFRUX_TEST_SL_INTERPOSER: its path)"), 2;
+        }
         else if (s == "--replay") { replay = i; i += 5; }
         else if (s == "--vram") soak = ~0u;
         else if (s == "--time") soak = ~1u;
@@ -1342,9 +1348,16 @@ int main(int argc, char** argv)
     {
         printf("%s\n", w.c_str());
         bool ok;
-        if (w == "vulkan") { auto a = std::make_unique<ApiV>(); a->dll = dll, a->minimal = minimal, ok = a->Init(), apis.push_back(std::move(a)); }
+        if (w == "vulkan") { auto a = std::make_unique<ApiV>(); a->dll = dll, a->minimal = minimal, a->unknown = unknown, ok = a->Init(), apis.push_back(std::move(a)); }
         else { auto a = std::make_unique<Api12>(); a->dll = dll, a->core = soak == ~1u && strstr(argv[1], "_nvngx.dll"), ok = a->Init(), apis.push_back(std::move(a)); }
         if (!ok) return puts("  device failed"), 2;
+        if (unknown && !GetModuleHandleA("sl.interposer.dll"))  // nothing known about the device: creation must be refused, and nothing else happen
+        {
+            Params p;
+            NgxHandle* f = apis.back()->CreateFeature(p);
+            printf("    %s  feature refused when the device's features are unknown\n", f ? "FAIL" : "ok  ");
+            fflush(stdout), TerminateProcess(GetCurrentProcess(), f ? 1 : 0);
+        }
         results.emplace_back();
         if (soak == ~1u && tw) { for (uint32_t n : {1u, 3u, 5u}) if (!tg || tg == n) Time(*apis.back(), tw, th, n); continue; }
         if (soak == ~1u) { for (uint32_t n : {1u, 3u, 5u}) Time(*apis.back(), 1280, 701, n), Time(*apis.back(), 1920, 1080, n), Time(*apis.back(), 2560, 1440, n), Time(*apis.back(), 3840, 2160, n); continue; }

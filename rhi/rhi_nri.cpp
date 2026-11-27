@@ -170,7 +170,6 @@ public:
         if (timerPool) n.DestroyQueryPool(timerPool);
         if (timerBack) n.DestroyBuffer(timerBack);
         if (cudaState == 1 && !Lost()) MarkerOk(isVk ? cudaMarker : CudaRung());
-        if (vkMarked && !vk.marker.empty()) MarkerOk(vk.marker);
         if (!matMarker.empty() && !Lost()) MarkerOk(matMarker);
         for (auto* x : cbv) n.DestroyDescriptor(x);
         for (auto* x : samplers) if (x) n.DestroyDescriptor(x);
@@ -267,6 +266,15 @@ public:
     bool InitVulkan(const VulkanHost& h)
     {
         vk = h, isVk = true;
+        // NFRUX's own storage images: each format must support storage on this GPU (the optional shaderStorageImageExtendedFormats only
+        // guarantees the whole group; the formats themselves are allowed in shaders whatever it says). The host's outputs are its own.
+        auto formatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(h.gipa(h.instance, "vkGetPhysicalDeviceFormatProperties"));
+        for (VkFormat f : {VK_FORMAT_R8_UNORM, VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT})
+        {
+            VkFormatProperties p = {};
+            if (formatProps) formatProps(h.physicalDevice, f, &p);
+            if (!(p.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return Log("Vulkan: format %d cannot be a storage image on this GPU", int(f)), false;
+        }
         nri::DeviceCreationVKDesc d = {};
         d.vkInstance = h.instance, d.vkDevice = h.device, d.vkPhysicalDevice = h.physicalDevice, d.minorVersion = uint8_t(h.minorVersion);
         
@@ -439,7 +447,6 @@ public:
     }
 
     std::mutex making;
-    bool        vkMarked = false;  // the assumed features' marker is begun
     bool        vkCuda = false;  // Vulkan: the last network made runs CUDA kernels
     std::string cudaMarker;
     std::string matMarker;  // cooperative matrices off NVIDIA (untested there): begun, cleared like the others
@@ -451,7 +458,7 @@ public:
         if (rung < 0 || rung >= 2) return false;
         if (rung == 0 && !isVk) cudaState = -1;  // its marker stays: not "ok"
         if (isVk && rung == 0 && vkCuda) { cudaState = -1, vkCuda = false, cudaMarker.clear(); return true; }  // its marker stays; cooperative matrices next
-        if (isVk) vk.marker.clear(), matMarker.clear();  // a failed self-check keeps both markers
+        if (isVk) matMarker.clear();  // a failed self-check keeps the marker
         if (isVk && rung == 0 && lastFloat && !noFloats) { noFloats = true; return true; }  // the int8 matrices next, if there are any
         topRung = rung + 1;
         return true;
@@ -651,8 +658,10 @@ public:
                 else if (m == "cuda") {}
                 else { if (error) *error = "NFRUX_ML: unknown path"; return nullptr; }
             }
-            // CUDA kernels first where they can be launched (NVIDIA tensor cores): the same as on D3D12.
+            // CUDA kernels first where they can be launched (NVIDIA tensor cores): the same as on D3D12. Only with VK_NVX_binary_import and
+            // bufferDeviceAddress known to be enabled on the game's device (kFeatureCudaLaunch), forced or not.
             const bool forced = ml && !strcmp(ml, "cuda") && !topRung && cudaState >= 0;
+            if (forced && !(vk.mlFeatures & kFeatureCudaLaunch)) { if (error) *error = "NFRUX_ML=cuda: the launch extension or buffer addresses are not enabled on this device"; return nullptr; }
             if (forced || (!ml && !topRung && !noFloats && cudaState >= 0 && Has(plan, Rung::Cuda) && (vk.mlFeatures & kFeatureCudaLaunch)))
             {
                 std::string why;
@@ -701,11 +710,6 @@ public:
                         if (sel.path != ffx_ml::Path::Dot4) topRung = 2, sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None);
                         sel.rescaleFloat = false, rung = sel.path == ffx_ml::Path::Dot4 ? 1 : 2;
                     }
-                }
-                if (!vk.marker.empty() && !vkMarked && sel.path != ffx_ml::Path::Scalar)
-                {
-                    vkMarked = MarkerBegin(vk.marker);
-                    if (!vkMarked) vk.marker.clear(), topRung = 2, rung = 2, sel = ffx_ml::SelectPath(dc, ffx_ml::Path::Scalar, ffx_ml::MatType::None), sel.rescaleFloat = false;
                 }
                 net->vk = ffx_ml::Graph::Create(dc, sel, DescribeModel(w, h), error);
                 if (!net->vk) return nullptr;
@@ -815,7 +819,6 @@ public:
         FinishTrial();
         // Recordings from well after the network first ran have completed (those before it say nothing).
         if (cudaState == 1 && ran && finished >= firstRun + 40 && !marked) marked = true, MarkerOk(isVk ? cudaMarker : CudaRung());
-        if (vkMarked && !vk.marker.empty() && ran && finished >= firstRun + 40) MarkerOk(vk.marker), vk.marker.clear();
         if (!matMarker.empty() && ran && finished >= firstRun + 40) MarkerOk(matMarker), matMarker.clear();
         nativeCmd = commands, t_recording = true;
         if (!isVk) LogBarriers(static_cast<ID3D12GraphicsCommandList*>(commands));

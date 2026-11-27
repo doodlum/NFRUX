@@ -78,3 +78,6 @@ Numbered so commits and reports can refer to them. Close one by linking the chan
 5. **CUDA tile shapes tuned on sm_89 only.** Turing, Ampere and Blackwell need reports; the timing protects against a loss, not
    against leaving speed unused.
 6. **No reports outside the RTX 4070.** Every **untested** and **inherited** row above.
+7. **Vulkan without the loader (OptiScaler routes).** Only Streamline's guarantees are known there (DESIGN, "Vulkan features"): CUDA
+   kernels on NVIDIA RTX, and only the 32-bit integer network everywhere else, since cooperative matrices and dot4 need features nobody
+   is known to have enabled. Installing the DLL as `dbghelp.dll` / `version.dll` as well would enable them; or OptiScaler could enable them.

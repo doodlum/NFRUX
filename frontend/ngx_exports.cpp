@@ -25,6 +25,7 @@ namespace
 std::mutex g_mutex;
 struct Vk { VkInstance i = VK_NULL_HANDLE; VkPhysicalDevice pd = VK_NULL_HANDLE; VkDevice d = VK_NULL_HANDLE; PFN_vkGetInstanceProcAddr gi = nullptr; PFN_vkGetDeviceProcAddr gd = nullptr; } g_vk;
 uint32_t g_vkMl = 0;          // known enabled (NFRUX_SetVulkanFeatures)
+uint32_t g_vkApi = 0;         // the game's instance apiVersion, when the loader saw it (0: not)
 bool     g_vkKnown = false;
 VkDevice g_vkDevice = VK_NULL_HANDLE;
 struct Feature { NgxHandle handle; std::shared_ptr<FrameGenerator> fg; bool vulkan; void* host; };
@@ -51,23 +52,27 @@ std::unique_ptr<Device> DeviceForVk()
     if (!h.gipa || !h.gdpa) return nullptr;
     VkPhysicalDeviceProperties p = {};
     reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(h.gipa(h.instance, "vkGetPhysicalDeviceProperties"))(h.physicalDevice, &p);
-    if (VK_API_VERSION_MINOR(p.apiVersion) < 2)
-        return Log("Vulkan 1.2 is needed"), nullptr;
-    h.minorVersion = 2;  // whatever the GPU reports: the host may have asked for less
-    if (!g_vkKnown) Log("Vulkan: assuming 1.2 and shaderStorageImageExtendedFormats are enabled on the game's device (no loader to tell)");
-    if (g_vkKnown && g_vkDevice == g_vk.d) h.mlFeatures = g_vkMl;
-    // Unknown (OptiScaler): the GPU's features on NVIDIA, whose driver takes them whether or not the game enabled them (2026-11-25), behind a
-    // crash marker; elsewhere only when asked for. NFRUX_VK_ASSUME_FEATURES=0 / 1 decides.
-    else if (EnvFlag("NFRUX_VK_ASSUME_FEATURES", p.vendorID == 0x10DE))
+    // Only what is known to be enabled on the game's device is used (DESIGN, "Vulkan features"):
+    // - the loader saw vkCreateDevice (and vkCreateInstance): exactly what was enabled there, its own additions included;
+    // - else Streamline made the device: its contract (sl.interposer's vkCreateDevice, or slGetFeatureRequirements when hooked by hand)
+    //   is an instance of Vulkan 1.3 and bufferDeviceAddress, timelineSemaphore, descriptorIndexing. VK_NVX_binary_import counts when its
+    //   commands resolve on this device (they do not for an extension not enabled). Nothing else: CUDA kernels or the integer network;
+    // - else nothing is known: no frame generation.
+    const uint32_t gpuMinor = VK_API_VERSION_MINOR(p.apiVersion);
+    if (g_vkKnown && g_vkDevice == g_vk.d)
     {
-        char m[48];
-        snprintf(m, sizeof(m), "vulkan_%04x_%04x", p.vendorID, p.deviceID);
-        h.marker = m;  // begun when a network that uses these features is made (CUDA has its own)
-        std::vector<const char*> ext;
-        h.mlFeatures = ffx_ml::QueryDeviceFeatures(h.instance, h.physicalDevice, h.gipa, &ext);
-        if (CudaVulkanGraph::Supported(h.device, h.gdpa)) h.mlFeatures |= kFeatureCudaLaunch;  // Streamline enables the extension; buffer addresses are assumed with it
-        Log("Vulkan: the GPU's features are used whether or not the game enabled them (NFRUX_VK_ASSUME_FEATURES=0: not)");
+        h.mlFeatures   = g_vkMl;
+        h.minorVersion = g_vkApi ? std::min(gpuMinor, VK_API_VERSION_MINOR(g_vkApi)) : GetModuleHandleA("sl.interposer.dll") ? std::min(gpuMinor, 3u) : 0;
+        Log("Vulkan: the device's features as created (ml 0x%x), Vulkan 1.%u", h.mlFeatures, h.minorVersion);
     }
+    else if (GetModuleHandleA("sl.interposer.dll"))
+    {
+        h.minorVersion = std::min(gpuMinor, 3u);
+        if (CudaVulkanGraph::Supported(h.device, h.gdpa)) h.mlFeatures |= kFeatureCudaLaunch;
+        Log("Vulkan: Streamline's device: Vulkan 1.%u, buffer addresses%s", h.minorVersion, h.mlFeatures & kFeatureCudaLaunch ? ", CUDA launches" : "; no CUDA launches");
+    }
+    else return Log("Vulkan: the game's device features are unknown (no Streamline, no NFRUX loader): no frame generation"), nullptr;
+    if (h.minorVersion < 2) return Log("Vulkan 1.2 is needed (the game's instance asked for 1.%u)", h.minorVersion), nullptr;
     return CreateNriVulkanDevice(h);
 }
 NgxResult Add(void* host, bool vulkan, NgxHandle** out)
@@ -316,7 +321,8 @@ extern "C" __declspec(dllexport) void __cdecl NFRUX_NoteState(void* resource, ui
     if (g_states.size() > 256 && !g_states.count(resource)) g_states.erase(g_states.begin());
     g_states[resource] = state;
 }
-extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkKnown = true; }
+// What is enabled on a device, from whoever created it (the loader, a test host): ffx_ml::FEATURE_* | kFeatureCudaLaunch, and the instance's apiVersion (0: not seen).
+extern "C" __declspec(dllexport) void __cdecl NFRUX_SetVulkanFeatures(VkDevice d, uint32_t mlFeatures, uint32_t apiVersion) { g_vkDevice = d, g_vkMl = mlFeatures, g_vkApi = apiVersion, g_vkKnown = true; }
 // The loader saw vkDestroyDevice: everything on it goes first.
 extern "C" __declspec(dllexport) void __cdecl NFRUX_DropVulkanDevice(VkDevice d)
 {

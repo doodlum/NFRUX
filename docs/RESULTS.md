@@ -549,3 +549,22 @@ fragments (no change, layer 0 slower with its pixels padded to 32 bytes), coales
 stride 2 (layer 0 0.30). Fusing layers 20 and 21 was not tried: without the timing barriers they already run side by side. Exact: ml_conformance on both
 APIs and both variants, parity worst 99.82 dB, ngx_harness 78 / 78 on each API with each variant as the default, rungs_test passes.
 Tuned on the RTX 4070 only (sm_89): the tile shapes and the 100k-pixel threshold. sm_75 gets the tiled kernels with m8n8k16 and the earlier kernels as the alternative; the trial picks per GPU.
+
+# Vulkan: only features known to be enabled (2026-11-27)
+
+The "assumed features" option (`AssumeFeatures`, `NFRUX_VK_ASSUME_FEATURES`, on by default on NVIDIA where the host's features were unknown) is gone.
+Sources of truth now (DESIGN, "Vulkan features"):
+1. The loader: what `vkCreateDevice` enabled and the instance's apiVersion.
+2. Otherwise Streamline's contract: Vulkan 1.3, buffer addresses, and binary import confirmed by its commands resolving.
+3. Otherwise refusal.
+
+Storage-image formats are checked per format. A forced Vulkan `cuda` needs the launch feature known as well. RTX 4070, shipped build:
+
+| Host | Result |
+|---|---|
+| Loader-like (features reported) | 78/78, CUDA, Vulkan 1.3 |
+| Minimal (Vulkan 1.2, nothing enabled) | 78/78 on the integer network, Khronos validation 0 messages |
+| `--streamline` (sl.interposer loaded, nothing reported) | 78/78, CUDA on Vulkan |
+| `--unknown` | refused, process ends normally |
+
+Forced rungs on Vulkan: dot4, scalar, coopmat and cuda each 78/78. D3D12 78/78. Conformance exact on both APIs, parity 99.82 dB, rungs_test passes.

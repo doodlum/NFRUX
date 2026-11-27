@@ -24,7 +24,6 @@ const Known kKnown[] = {
     {"general", "log", "NFRUX_LOG", false},
     {"d3d12", "network", nullptr, false},
     {"vulkan", "network", nullptr, false},
-    {"vulkan", "assumefeatures", "NFRUX_VK_ASSUME_FEATURES", true},
     {"vulkan", "dot4tiled", "FFX_ML_DOT4_TILED", true},
     {"vulkan", "dot4subgroup", "FFX_ML_DOT4_SUBGROUP", false},
     {"vulkan", "fullbarriers", "NFRUX_FULL_BARRIERS", true},

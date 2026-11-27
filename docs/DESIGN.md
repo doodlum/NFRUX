@@ -163,16 +163,16 @@ completion tokens, network kernels.
 
 What NRI needs of a wrapped Vulkan device: 1.2 and the Vulkan 1.0 features the GPU reports. `DeviceCreationVKDesc::unknownFeatures = true` (new
 after v192, the reason for the pin) makes it treat every optional 1.1+ feature (bufferDeviceAddress, synchronization2, maintenance*, memoryPriority,
-...) as absent; `minorVersion` is always given as 2 and no extensions are listed, whatever the GPU reports, as the host's own choice is not known. Below
-1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" is an assumption on both routes; the ones our call set uses are
-shaderStorageImageExtendedFormats, which the loader adds. No queue family is given to NRI (it would ask for a queue the host may not have made; NFRUX never submits through it). On the OptiScaler route the
-assumptions are (a) 1.2, (b) shaderStorageImageExtendedFormats, and on NVIDIA (c) the optional features of D3, all logged at creation. A minimal-host test is A10.
+...) as absent; `minorVersion` is the version known for the game's instance (see "Vulkan features" below) and no extensions are listed. Below
+1.2: creation refused, logged. NRI's "all supported 1.0 features enabled" covers nothing NFRUX's calls need: its storage-image formats are checked one
+by one instead (below). No queue family is given to NRI (it would ask for a queue the host may not have made; NFRUX never submits through it).
+A minimal-host test is A10.
 Static linking of d3d12 and vulkan-1 is replaced by delay-load: a game on one API never loads the other.
 **D2. Exact integer network.** Every path gives the CPU reference's bytes. Cooperative matrix is int8, fp16 or bf16: the float forms hold every int8 value and
 x - zero point exactly, and their float32 sums are the same integers while every partial sum is below 2^24. The bound (per output channel, max
 |x - zp| * sum |w| + |bias|) is computed from the weights when a network is made: 7,021,312 of 16,777,216 for this one; at 2^24 or more the float forms are not
-used. A prefix of a sum is at most the sum of absolute values, so partial sums are covered. Order when a float form is refused or fails its self-check: int8, dot4, integer. fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only where it is known or assumed enabled
-(NFRUX_SetVulkanFeatures in the tests; the OptiScaler route's assumed features on NVIDIA; the loader does not enable it, so `coopmat_bf16` there falls back). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
+used. A prefix of a sum is at most the sum of absolute values, so partial sums are covered. Order when a float form is refused or fails its self-check: int8, dot4, integer. fp16 is first on NVIDIA (20% faster than int8 on the RTX 4070), int8 elsewhere. bf16 is reached only where it is known to be enabled
+(NFRUX_SetVulkanFeatures in the tests; the loader does not enable it, so `coopmat_bf16` there falls back). D3D12 rescale uses a 32x32 -> 64 multiply from 16-bit halves, so Int64ShaderOps is not needed. Float
 requantisation is off. `conv2d.hlsl` implements a restricted layer class (rescale input zero point 0, single rounding,
 dilation 1, square kernel and stride, resize on source 0 only, shift >= 1, source strides equal to the words read): graph creation
 checks each layer and the rung fails if any is outside it. The shape list is written by hand in `build_shaders.py`; a shape missing from it fails creation.
@@ -188,11 +188,10 @@ params / gate textures on every path (paths that write images directly are an op
 | General Log | `NFRUX_LOG` | flag (nfrux.log and nfrux_loader.log beside the DLL) or a file path |
 | D3D12 Network | `NFRUX_ML` | cuda, dot4, scalar |
 | Vulkan Network | `NFRUX_ML` | cuda, coopmat, coopmat_int8 / fp16 / bf16, dot4, scalar |
-| Vulkan AssumeFeatures | `NFRUX_VK_ASSUME_FEATURES` | flag |
 | Vulkan Dot4Tiled, Dot4Subgroup | `FFX_ML_DOT4_TILED`, `FFX_ML_DOT4_SUBGROUP` | flag; subgroup size |
 | Vulkan FullBarriers | `NFRUX_FULL_BARRIERS` | flag |
 
-`Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) does not consult `AssumeFeatures`: it asks for the launch function itself and assumes buffer addresses with it, as the automatic NVIDIA choice does (below).
+`Network` from the ini falls back to the automatic choice (logged, for the rest of that device) when it cannot be made, and counts crash markers like the automatic choice; the self-check applies to every choice. A Vulkan `cuda` (ini or environment) needs the launch extension and buffer addresses known to be enabled, as the automatic choice does ("Vulkan features" below); else it cannot be made.
 
 Automatic choice (`core/rungs.cpp`): a prior order per architecture family by PCI device ID (NVIDIA with / without tensor cores, AMD RDNA3/4
 with matrix units / older, Intel Arc Alchemist / Battlemage / integrated), then a quirk list (NVIDIA without tensor cores: no cooperative
@@ -208,11 +207,15 @@ a crash-marked ladder, goes back to the plan. `tests/rungs_test.cpp` checks the 
 | D3D12 NVIDIA RTX (20 and later) | CUDA via NVAPI | SM 6.4 dot4 | SM 6.0 |
 | D3D12 other (AMD, Intel, GTX) | SM 6.4 dot4 | - | SM 6.0 |
 
-Vulkan baseline (passes and floor): 1.2 (NRI with unknownFeatures, D1b) and one feature, `shaderStorageImageExtendedFormats` (storage images in r8, rg16f,
-rgb10_a2, r11f_g11f_b10f; Streamline_Sample does not enable it). BGRA8 outputs: the composite stores blue first into an RGBA8 image of
-its own, copied raw (size-compatible) into the host's. Everything
-else is optional and needs to be *enabled*. Source of truth:
-- Standalone route: the loader intercepts `vkCreateDevice`, obtained through GetProcAddress of vulkan-1.dll
+**Vulkan features.** NFRUX uses only what is known to be enabled on the game's device; nothing is assumed from what the GPU supports.
+Baseline (passes and floor): Vulkan 1.2 core, and storage images in r8, rg16f, r32f, r32ui, rgba8 and rgba16f, each checked with
+vkGetPhysicalDeviceFormatProperties (STORAGE_IMAGE in optimal tiling) when the device is wrapped; one missing: no frame generation, logged.
+(The optional shaderStorageImageExtendedFormats only guarantees that whole group; the formats are allowed in shaders whatever it says.)
+The host's own outputs (rgb10_a2, r11f_g11f_b10f, ...) were made by the host with storage use. BGRA8 outputs: the composite stores blue
+first into an RGBA8 image of its own, copied raw (size-compatible) into the host's. Everything else is optional and needs to be
+*enabled*. Sources of truth, in order:
+- The loader (standalone route): it records the instance's apiVersion from `vkCreateInstance` (Streamline raises it to 1.3 below the
+  game) and intercepts `vkCreateDevice`, obtained through GetProcAddress of vulkan-1.dll
   and through vkGetInstanceProcAddr / vkGetDeviceProcAddr, whose returned pointer for that name it wraps. It appends (and records what it
   appended), when supported per `vkGetPhysicalDeviceFeatures2`: shaderStorageImageExtendedFormats,
   cooperativeMatrix, vulkanMemoryModel (+ DeviceScope), shaderInt8, storageBuffer8BitAccess, shaderFloat16, storageBuffer16BitAccess, shaderIntegerDotProduct,
@@ -222,10 +225,13 @@ else is optional and needs to be *enabled*. Source of truth:
   present is set in that copy; else the individual struct is chained. Core features go into pEnabledFeatures when the app uses that, else
   Features2. The app's own values are never cleared. If creation with additions fails, the app's original call is made. Only the
   app's own process and device are affected; additions are logged.
-- OptiScaler route: the enabled set is unknown. The assumptions of D1b (Vulkan 1.2, shaderStorageImageExtendedFormats) are made and logged. On NVIDIA the GPU's optional features are used as well (project,
-  2026-11-25: outside strict validity when the game has not enabled them; its driver takes them, RTX 4070 tested), behind the crash marker of CUDA's kind and the self-check; elsewhere the floor.
-  `NFRUX_VK_ASSUME_FEATURES=0 / 1` decides on any GPU. Markers (both rungs) are cleared when 40 recordings have completed since the network first ran, or on an orderly end.
-The loader hands the DLL the recorded set per VkDevice (export `NFRUX_SetVulkanFeatures`); no record means the OptiScaler behaviour.
+  The loader hands the DLL the recorded set and apiVersion per VkDevice (export `NFRUX_SetVulkanFeatures`, which test hosts call as well).
+- Streamline, no loader (the OptiScaler routes: every Vulkan route into NFRUX is a game using Streamline): `sl.interposer.dll` is in the
+  process. Streamline's contract for the device it makes (its own vkCreateDevice, or slGetFeatureRequirements' lists when the game creates it):
+  an instance of Vulkan 1.3, bufferDeviceAddress, timelineSemaphore, descriptorIndexing. VK_NVX_binary_import counts as enabled when its
+  commands resolve through vkGetDeviceProcAddr on this device (they do not for an extension that is not enabled). So CUDA kernels on NVIDIA,
+  else the 32-bit integer network; cooperative matrices and dot4 need the loader.
+- Neither: the enabled set is unknown, and no frame generation (logged; `ngx_harness --unknown` checks the refusal).
 A4's validation run uses the standalone loader, which makes the cooperative-matrix rung valid. Fallback when M0a cannot intercept
 vkCreateDevice: Vulkan uses the floor, A4 claims only that, and the ladder text is amended.
 M0d result (RESULTS): SM 6.9 cooperative vectors are in neither the inbox runtime (SM 6.8) nor the retail SDK; DirectML's integer convolution is
@@ -245,13 +251,13 @@ Variant 1, rows (the kernels before 2026-11-27): m8n8k16 on every GPU, read from
 Both launch a batch's networks (up to 8, the timesteps) as one grid a layer: z is network x channel-tile group, and each network's sources and output are kernel parameters.
 
 On Vulkan the same kernels are launched by vkCmdCuLaunchKernelNVX (`core/ml/cuda_vulkan.cpp`): buffers by address, a full memory barrier where a layer reads what the last wrote. The loader enables the extension and
-bufferDeviceAddress; Streamline enables the extension itself, so on the OptiScaler route its presence is asked (the function's address) and buffer addresses are assumed with it. Same marker and self-check. A batch's networks run a
+bufferDeviceAddress; without the loader, Streamline's contract gives buffer addresses and the extension is confirmed by its commands resolving ("Vulkan features"). Same marker and self-check. A batch's networks run a
 layer at a time on both APIs, one launch a layer for up to 8 networks.
 
 AMD and Intel matrix hardware is reached through Vulkan cooperative matrices (behind a crash marker of their own off NVIDIA, since untested there: refused, dot4; tested on the RTX 4070 by forcing it, `NFRUX_TEST_MAT_MARKER`): any M, N up to 16 and K a multiple of 4; subgroups of 32 on AMD, of 16 (the tile's N) on Intel when
 the size can be required, else the driver's own. Untested on such GPUs (none here): the self-check and the next rung are the safety. On D3D12 there is no public shader interface to
 them (no cooperative vectors in the retail runtime; AMD's and Intel's are device-creation or vendor-driver extensions), so dot4.
-Crash safety, for what depends on vendor-specific launches (CUDA on both APIs) or on features the game may not have enabled (the NVIDIA default on the OptiScaler route): before the first use in a process an "attempts" file in %LOCALAPPDATA%\NFRUX (wide paths; logged with its name), named by
+Crash safety, for what depends on vendor-specific launches (CUDA on both APIs): before the first use in a process an "attempts" file in %LOCALAPPDATA%\NFRUX (wide paths; logged with its name), named by
 rung, device (D3D12: also the adapter LUID) and nvcuda.dll's file time, is counted up; it is removed when 40 recordings have completed since the network first ran at its real size (the 64-wide self-check does not count), or on an orderly end, and kept after a failed
 self-check or (D3D12) a device removal; on Vulkan a device loss is not detected at teardown, so an orderly end after one clears it. At two, that way is not used (one line in the log; deleting the file or `NFRUX_IGNORE_MARKERS` tries again). No folder or not writable: not used, logged. The assumed features' marker is begun only when a network that is not CUDA's uses them. A game closed twice in its
 first seconds has the same effect. Tested with a process that ends at the first real run. A device loss in the game's process cannot be recovered and is not claimed to be. A network made in place of one that could not be created at
