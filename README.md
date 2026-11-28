@@ -8,7 +8,7 @@ rendered frames around it. The game's UI is kept out of the interpolation.
 
 NFRUX is an independent project, not affiliated with or endorsed by NVIDIA or Arm.
 
-## Status: 0.0.1 (first release)
+## Status: 0.0.2
 
 | GPU | What runs | Tuned |
 |---|---|---|

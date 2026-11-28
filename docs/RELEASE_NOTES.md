@@ -1,6 +1,6 @@
 # Release notes
 
-## Unreleased
+## 0.0.2
 
 - **Faster frames on both APIs**, the same image (every path still gives the same bytes). On an RTX 4070, ms per rendered frame, before / after:
   D3D12 1080p 2x 0.93 / 0.77, 6x 2.67 / 2.35, 4K 2x 1.49 / 1.17, 6x 4.37 / 3.81; Vulkan 1080p 2x 1.03 / 0.92, 6x 2.98 / 2.59,
@@ -13,6 +13,8 @@
   to that path, 1080p 4x 3.15 / 2.41 ms, 6x 5.05 / 3.56.
 - **For testers and optimisers**: `NFRUX_TEST_TIMES` now works on D3D12 too, and `NFRUX_TEST_TIMES=2` lists every pass by its place in the
   frame (docs/OPTIMISING.md).
+- **Help wanted**: still only the RTX 4070 has been measured. The benchmark kit (`NFRUX_bench_kit_0.0.2.zip`, docs/OPTIMISING.md) checks
+  correctness and times every path on your GPU in about ten minutes. Please send the report.
 
 ## 0.0.1
 
