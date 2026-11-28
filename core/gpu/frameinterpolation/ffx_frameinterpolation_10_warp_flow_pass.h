@@ -59,6 +59,31 @@ float LoadDilatedDepthTap3x3(int32_t2 pos, int32_t2 offset, int32_t2 depth_size,
     return LoadDilatedDepthTap3x3(pos, offset, depth_size, depth_texture, clamped_sample_pos);
 }
 
+// NFRUX: the 3x3's eight neighbours as LoadDilatedDepthTap3x3 gives them (off the image: the far plane), in its offsets' order, from two
+// gathers at the pixel's opposite corners and the two corners they miss (the clamped texels the taps' fetches read).
+void LoadNeighbours3x3(int32_t2 pos, int32_t2 depth_size, highp texture2D depth_texture, out float taps[9], out int32_t2 positions[9])
+{
+    const int32_t2 offsets[9] = {int32_t2(+0, +0), int32_t2(+1, +0), int32_t2(+0, +1), int32_t2(+0, -1), int32_t2(-1, +0),
+                                 int32_t2(-1, +1), int32_t2(+1, +1), int32_t2(-1, -1), int32_t2(+1, -1)};
+    const float4   ga = textureGather(sampler2D(depth_texture, s_PointClamp), float2(pos) / float2(depth_size));
+    const float4   gd = textureGather(sampler2D(depth_texture, s_PointClamp), float2(pos + 1) / float2(depth_size));
+    const int32_t2 lo = clamp(pos - 1, int32_t2(0), depth_size - int32_t2(1)), hi = clamp(pos + 1, int32_t2(0), depth_size - int32_t2(1));
+    const float    t[9] = {0.0f, gd.z, gd.x, ga.z, ga.x, texelFetch(depth_texture, int32_t2(lo.x, hi.y), 0).x, gd.y, ga.w, texelFetch(depth_texture, int32_t2(hi.x, lo.y), 0).x};
+#if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH
+    const float non_valid_depth = 0.0f;
+#else
+    const float non_valid_depth = 1.0f;
+#endif
+#pragma unroll
+    for (int32_t i = 1; i < 9; ++i)
+    {
+        const int32_t2 sample_pos = pos + offsets[i];
+        positions[i]              = clamp(sample_pos, int32_t2(0), depth_size - int32_t2(1));
+        const float valid_sample  = float(all(equal(sample_pos, positions[i])));
+        taps[i]                   = non_valid_depth * (1.0f - valid_sample) + t[i] * valid_sample;
+    }
+}
+
 // return the nearest depth in a 3x3 region around the given pixel
 float LoadDilatedDepth3x3(int32_t2 pos, highp texture2D depth_texture)
 {
@@ -74,18 +99,11 @@ float LoadDilatedDepth3x3(int32_t2 pos, highp texture2D depth_texture)
                                             int32_t2(-1, -1),
                                             int32_t2(+1, -1)};
 
-    float depth_taps[iSampleCount];
+    float    depth_taps[iSampleCount];
+    int32_t2 unused[iSampleCount];
 
-    // Pull out the depth loads to allow SC to batch them.
+    LoadNeighbours3x3(pos, depth_size, depth_texture, depth_taps, unused);
     depth_taps[0] = texelFetch(depth_texture, ClampTexelCoord(pos, depth_texture), 0).x;
-    depth_taps[1] = LoadDilatedDepthTap3x3(pos, offsets[1], depth_size, depth_texture);
-    depth_taps[2] = LoadDilatedDepthTap3x3(pos, offsets[2], depth_size, depth_texture);
-    depth_taps[3] = LoadDilatedDepthTap3x3(pos, offsets[3], depth_size, depth_texture);
-    depth_taps[4] = LoadDilatedDepthTap3x3(pos, offsets[4], depth_size, depth_texture);
-    depth_taps[5] = LoadDilatedDepthTap3x3(pos, offsets[5], depth_size, depth_texture);
-    depth_taps[6] = LoadDilatedDepthTap3x3(pos, offsets[6], depth_size, depth_texture);
-    depth_taps[7] = LoadDilatedDepthTap3x3(pos, offsets[7], depth_size, depth_texture);
-    depth_taps[8] = LoadDilatedDepthTap3x3(pos, offsets[8], depth_size, depth_texture);
 
     float best_depth = depth_taps[0];
 #pragma unroll
@@ -123,17 +141,9 @@ float LoadDilatedDepthAndMotion3x3(int32_t2          pos,
     int32_t2 sample_positions[iSampleCount];
     float    depth_taps[iSampleCount];
 
-    // Pull out the depth loads to allow SC to batch them.
+    LoadNeighbours3x3(pos, depth_size, depth_texture, depth_taps, sample_positions);
     sample_positions[0] = ClampTexelCoord(pos, depth_texture);
     depth_taps[0]       = texelFetch(depth_texture, sample_positions[0], 0).x;
-    depth_taps[1]       = LoadDilatedDepthTap3x3(pos, offsets[1], depth_size, depth_texture, sample_positions[1]);
-    depth_taps[2]       = LoadDilatedDepthTap3x3(pos, offsets[2], depth_size, depth_texture, sample_positions[2]);
-    depth_taps[3]       = LoadDilatedDepthTap3x3(pos, offsets[3], depth_size, depth_texture, sample_positions[3]);
-    depth_taps[4]       = LoadDilatedDepthTap3x3(pos, offsets[4], depth_size, depth_texture, sample_positions[4]);
-    depth_taps[5]       = LoadDilatedDepthTap3x3(pos, offsets[5], depth_size, depth_texture, sample_positions[5]);
-    depth_taps[6]       = LoadDilatedDepthTap3x3(pos, offsets[6], depth_size, depth_texture, sample_positions[6]);
-    depth_taps[7]       = LoadDilatedDepthTap3x3(pos, offsets[7], depth_size, depth_texture, sample_positions[7]);
-    depth_taps[8]       = LoadDilatedDepthTap3x3(pos, offsets[8], depth_size, depth_texture, sample_positions[8]);
 
     float    best_depth = out_center_depth = depth_taps[0];
     int32_t2 best_sample_pos               = sample_positions[0];
