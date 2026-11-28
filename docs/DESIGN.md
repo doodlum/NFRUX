@@ -60,7 +60,12 @@ and the host allow on a given GPU is theirs; A4 records it.
 
 Per rendered frame: luma pyramid, hints (camera reprojection of the previous depth, as the SDK; no
 scattered game vectors: measured no gain), optical flow once, reduction to the motion lane (<= 540 rows). Per generated frame: warps, hole fill, 20-channel
-tensor, network, inpainting, composite. A batch runs stage by stage.
+tensor, network, inpainting, composite. A batch runs stage by stage; from 3x each stage after the flow is one dispatch for all
+its timesteps (z = timestep, the shaders' `...Batch` variants, `NFRUX_BATCH`): a resource of each timestep's own is bound once a
+timestep, at its binding + 16 x timestep, and picked by the workgroup's z; timesteps 1-4 are in the constants; the warp's
+timestep-free outputs and the colour history are stored by timestep 0. 2x keeps the one-timestep passes (with nothing to pick, the
+picking cost the 1080p preprocess 0.052 -> 0.059 ms on the RTX 4070). The networks run as one batch (CUDA: one launch a layer; D3D12 dot4 /
+integers and Vulkan: layer by layer, each layer's barriers for all of them at once).
 
 The graph is v1 (v14's inputs): channels 16-19 are t, t|mv|/64, (1-t)|mv|/64, 0; 17-18 are clamped to 0..1 (saturate). All quantisation constants are
 `nfru_mfg_v15_int8_metadata.json`'s, written in `interpolator.cpp` (checked end to end by A3; v15: input 0.003921569 / -128 (SNORM 0.4980392 / -1.00787), params 0.3125911 / 86 (SNORM 39.699 / 0.67717), gate 0.003921557 / -128; earlier v1: input 0.003921557 / -128 (SNORM 0.4980377 / -1.00787), params 0.2640706 / 89, gate 0.003921557 / -128; v2's and v14's input scale 1/255 are not used: corrected 2026-11-26 after review).

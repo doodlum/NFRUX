@@ -3,12 +3,14 @@
 ## Unreleased
 
 - **Faster frames on both APIs**, the same image (every path still gives the same bytes). On an RTX 4070, ms per rendered frame, before / after:
-  D3D12 1080p 2x 0.93 / 0.77, 6x 2.67 / 2.40, 4K 2x 1.49 / 1.16, 6x 4.37 / 3.86; Vulkan 1080p 2x 1.03 / 0.92, 6x 2.98 / 2.72,
-  4K 2x 1.72 / 1.47, 6x 4.94 / 4.47.
+  D3D12 1080p 2x 0.93 / 0.77, 6x 2.67 / 2.35, 4K 2x 1.49 / 1.17, 6x 4.37 / 3.81; Vulkan 1080p 2x 1.03 / 0.92, 6x 2.98 / 2.59,
+  4K 2x 1.72 / 1.47, 6x 4.94 / 4.29.
 - **What changed**: a faster optical-flow block match and one pass fewer a flow level; independent passes recorded without barriers between
-  them (a batch's timesteps run side by side); on D3D12 the first generated frame is written straight into the game's output; the history of
-  the colour is written by the composite instead of copied; fewer barriers around the CUDA network on D3D12; cheaper loads in the warp,
-  downsample and composite passes.
+  them; from 3x each pass after the optical flow makes all of a batch's frames in one dispatch; on D3D12 the first generated frame is written
+  straight into the game's output; the history of the colour is written by the composite instead of copied; fewer barriers around the CUDA
+  network on D3D12; cheaper loads in the warp, downsample and composite passes.
+- **D3D12 without CUDA (AMD and Intel GPUs)**: the networks of a batch run side by side instead of one after another. On an RTX 4070 forced
+  to that path, 1080p 4x 3.15 / 2.41 ms, 6x 5.05 / 3.56.
 - **For testers and optimisers**: `NFRUX_TEST_TIMES` now works on D3D12 too, and `NFRUX_TEST_TIMES=2` lists every pass by its place in the
   frame (docs/OPTIMISING.md).
 

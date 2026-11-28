@@ -636,3 +636,49 @@ parameter textures 0.015 (the same kernels and copies; launched by VK_NVX_binary
 output 0.027 (Vulkan outputs: their usage is not known, so the composite cannot write them; their BGRA8 is also written blue first into RGBA8),
 the downsample passes (at 4K: downsample of the colour 0.077 against 0.030); and about 0.03 a recording in submitting and waiting (a recording
 of one copy: 0.19 against 0.16 ms on D3D12), which `--time` counts for each of a batch's evaluates.
+
+# Timesteps in one dispatch (2026-11-28, RTX 4070 idle; 0d5e9fa -> ebda42d, shipped build)
+
+VARIANTS gap 2: at 4x-6x every pass after the flow ran once a generated frame. Now each runs once a batch from 3x, and the D3D12
+networks without CUDA run side by side. Every byte kept: parity dumps of every output and intermediate (both APIs, shipped and strict
+builds, the eight configurations of the last round) equal to 0d5e9fa's, and with dot4 forced equal to them too; the sample recording
+through the front end (2x / 4x / 6x, 108 images) equal; ML conformance exact; `ngx_harness` 78/78 on each API with each rung forced, in
+both builds; rungs_test; Vulkan synchronisation validation and the D3D12 debug layer silent.
+
+`ngx_harness --time`, ms a rendered frame (submitted and waited for, medians of 2 alternate runs; the automatic rung, CUDA):
+
+| | 1080p 2x / 4x / 6x | 1440p 2x / 4x / 6x | 4K 2x / 4x / 6x |
+|---|---|---|---|
+| D3D12 before | 0.77 / 1.60 / 2.40 | 0.92 / 1.89 / 2.72 | 1.17 / 2.61 / 3.86 |
+| D3D12 after | 0.77 / **1.58 / 2.35** | 0.92 / **1.87 / 2.69** | 1.17 / 2.61 / **3.81** |
+| Vulkan before | 0.94 / 1.72 / 2.71 | 1.11 / 2.09 / 3.07 | 1.47 / 3.00 / 4.47 |
+| Vulkan after | 0.94 / **1.67 / 2.59** | **1.08** / **2.00 / 2.95** | 1.47 / **2.97 / 4.29** |
+
+Vulkan 2x from a 4-run alternation (the same DLL reads 0.86-0.94 at 1080p and 1.03-1.11 at 1440p from one session to the next); 2x runs
+the same one-timestep passes as before. CPU of the evaluates at 6x, before / after: D3D12 1080p 0.45 / 0.41 ms, 4K 0.50 / 0.47; Vulkan
+1080p 0.44 / 0.34, 4K 0.51 / 0.38. GPU time of a 1080p 6x recording (NFRUX_TEST_TIMES, `(recording)`): D3D12 1.486 -> 1.457 ms, Vulkan
+1.691 -> 1.566. The last round's estimate for the CPU alone was 0.06 ms (D3D12) and 0.14 (Vulkan) at 6x; measured: 0.05 and 0.12 a frame.
+
+D3D12 with the network forced to dot4 (`NFRUX_ML=dot4`, the path of D3D12 games on AMD and Intel GPUs), 1080p, before / after: 2x 1.27 /
+1.27, 4x 3.15 / 2.41, 6x 5.05 / 3.56.
+
+| Commit | What | Effect (RTX 4070) |
+|---|---|---|
+| 8e2e7c5 | Warp, warp TM1, fill, preprocess, inpaint seed / mips / resolve, composite (and the warp's clear): from 3x one dispatch for all timesteps, z = timestep (`...Batch` shader variants: each timestep's own resources at binding + 16 x timestep, picked by the workgroup's z; timesteps 1-4 in the constants; the warp's shared outputs and the history stored by timestep 0). 60 dispatches -> 12 at 6x, 24 -> 12 at 3x | 1080p 6x: D3D12 2.39 -> 2.34, Vulkan 2.72 -> 2.60 |
+| ebda42d | D3D12 dot4 / integer networks: a batch's networks layer by layer (each layer's barriers for all at once, dispatches side by side) instead of one network after the other | dot4 1080p 6x 5.05 -> 3.56 |
+
+Not kept: the batched passes at 2x as well (all five bindings and the picking with one timestep): D3D12 1080p 2x 0.77 -> 0.80, Vulkan 0.86
+-> 0.94; the preprocess 0.052 -> 0.059 ms. So 2x keeps the one-timestep passes (the shaders are built both ways). The preprocess's 3x3 motion
+neighbourhood picked load by load: D3D12 6x 0.236 ms (5 x 0.047) -> 0.250; loaded in one pick: 0.241. The DLL grows from 4.4 to 5.5 MB with the batch
+variants.
+
+What still runs once a timestep: the networks' work itself (CUDA: one launch a layer for the batch), the copies of each network's two
+outputs into the textures the composite filters (a buffer cannot be filtered with the same bytes), the composite's UI test (the same
+answer for every timestep), and the copy out of each frame after the first (the host's output for frame k comes with evaluate k). Vulkan
+also copies frame 1 out (gap 1).
+
+Kit report [bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md) (ebda42d): correctness ok on
+every check; the automatic choice is cuda/0 on both APIs (its 2x rows and the forced cuda/0 rows differ by run-to-run noise, up to 0.03 ms).
+Against the 2026-11-27 report (both rounds' changes): D3D12 auto 1080p 6x 2.66 -> 2.37 ms, 4K 6x 4.38 -> 3.82; Vulkan auto 1080p 6x
+3.00 -> 2.59, 4K 6x 5.27 -> 4.28; D3D12 dot4 1080p 6x 5.38 -> 3.57, 4K 6x 7.24 -> 4.98; Vulkan coopmat 1080p 6x 4.23 -> 3.88, dot4 tiled
+4.43 -> 3.99.

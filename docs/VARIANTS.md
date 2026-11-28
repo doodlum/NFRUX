@@ -41,12 +41,12 @@ reports in [bench/](bench/).
 
 | Family | API | Order | Rung / variant | Status | Evidence, notes |
 |---|---|---|---|---|---|
-| NVIDIA RTX 40 (Ada, sm_89) | both | cuda, coopmat, dot4 | cuda/0 tiled | **tuned** | RTX 4070: tile shapes, the 100k-pixel threshold ([bench](bench/), RESULTS "CUDA tiled kernels") |
-| | | | cuda/1 rows | **tuned** | RTX 4070, earlier rounds |
-| | Vulkan | | coopmat fp16 | **tuned** | RTX 4070 (fp16 20% over int8), 4080 per TuningFor's comment |
-| | Vulkan | | dot4 tiled | **measured** | RTX 4070 with AMD's tuning (1080p 4x 5.0 -> 3.0 ms) |
-| | D3D12 | | dot4, scalar | **measured** | RTX 4070 |
-| | both | | passes | **gap** | Vulkan at 1080p and below: see gaps 1-2. Measured and changed on the RTX 4070 for every GPU (no per-family setting): dispatch groups, the flow match, preprocess in 16 x 16 workgroups (RESULTS, 2026-11-28) |
+| NVIDIA RTX 40 (Ada, sm_89) | both | cuda, coopmat, dot4 | cuda/0 tiled | **tuned** | RTX 4070: tile shapes, the 100k-pixel threshold ([bench](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md), RESULTS "CUDA tiled kernels") |
+| | | | cuda/1 rows | **tuned** | RTX 4070, earlier rounds ([bench](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md)) |
+| | Vulkan | | coopmat fp16 | **tuned** | RTX 4070 (fp16 20% over int8), 4080 per TuningFor's comment ([bench](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md)) |
+| | Vulkan | | dot4 tiled | **measured** | RTX 4070 with AMD's tuning (1080p 4x 5.0 -> 3.0 ms; 2.58 on 2026-11-28, [bench](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md)) |
+| | D3D12 | | dot4, scalar | **measured** | RTX 4070 ([bench](bench/nfrux_bench_NVIDIA-GeForce-RTX-4070_20261128-0220.md)): since 2026-11-28 a batch's networks run layer by layer, side by side (1080p 6x 5.38 -> 3.57 ms, 4K 6x 7.24 -> 4.98 between the 2026-11-27 and 2026-11-28 reports) |
+| | both | | passes | **gap** | Vulkan at 1080p and below: see gap 1. Measured and changed on the RTX 4070 for every GPU (no per-family setting): dispatch groups, the flow match, preprocess in 16 x 16 workgroups, from 3x a batch's timesteps in one dispatch a pass (RESULTS, "Passes, barriers and copies" and "Timesteps in one dispatch", 2026-11-28) |
 | NVIDIA RTX 50 (Blackwell, sm_120) | both | cuda, coopmat, dot4 | cuda/0, cuda/1 | **inherited** | sm_80 PTX linked by the driver; tile shapes from sm_89 |
 | NVIDIA RTX 30 (Ampere, sm_86) | both | cuda, coopmat, dot4 | cuda/0, cuda/1 | **inherited** | same instructions as Ada |
 | NVIDIA RTX 20 (Turing, sm_75) | both | cuda, coopmat, dot4 | cuda/0 (m8n8k16) | **untested** | the only sm_75 instruction path; the timing falls back to cuda/1 if slower |
@@ -67,17 +67,19 @@ reports in [bench/](bench/).
 
 Numbered so commits and reports can refer to them. Close one by linking the change and the report that shows it.
 
-1. **Vulkan at 1080p and below (RTX 4070).** Narrowed (RESULTS, "Passes, barriers and copies", 2026-11-28), still slower than the fastest
-   competing frame generator we measure: 1080p 2x / 6x 0.92 / 2.72 ms (was 1.11 / 2.99) against 0.88 / 2.55; 720p-class 2x 0.73 against
-   0.51. GPU time a frame at 1080p 2x is 0.63 ms (was 0.73): network 0.18, optical flow 0.155 (12 dispatches, the level-2 match 0.045),
+1. **Vulkan at 1080p and below (RTX 4070).** Narrowed (RESULTS, "Passes, barriers and copies" and "Timesteps in one dispatch", 2026-11-28),
+   still slower than the fastest competing frame generator we measure: 1080p 2x / 6x 0.92 / 2.59 ms (was 1.11 / 2.99) against 0.88 / 2.55;
+   720p-class 2x 0.73 against 0.51. GPU time a frame at 1080p 2x is 0.63 ms (was 0.73): network 0.18, optical flow 0.155 (12 dispatches, the level-2 match 0.045),
    composite with the history store 0.086, motion vectors 0.10, preprocess 0.05, output copy 0.027. The 0.15 ms over D3D12 (0.77) at the same
    size is now accounted for: the CUDA kernels and their copies 0.04 more through VK_NVX_binary_import and vkCmdCopyBufferToImage, the output
    copy (D3D12 writes frame 1 into the host's output; a Vulkan output's usage is not known), slower downsample passes, about 0.03 a recording
    in submission, and descriptor-set binding (1.4 us a dispatch of CPU against 0.1 on D3D12).
-2. **Per-timestep passes at 4x-6x.** Every pass after the flow reads the timestep, so each is run once a generated frame; only a
-   network that shares work across timesteps (retraining) removes that. Since 2026-11-28 a batch's timesteps of each pass are recorded as one
-   group (no barrier between them) and run side by side; one dispatch for all timesteps (texture arrays, z = timestep) would also save the
-   CPU of about 52 dispatches at 6x (D3D12 ~0.06 ms, Vulkan ~0.14) and is not done. Cheaper passes help every multiplier.
+2. **Per-timestep work at 4x-6x.** Narrowed (RESULTS, "Timesteps in one dispatch", 2026-11-28): from 3x each pass after the flow is one
+   dispatch for all timesteps (z = timestep; 60 dispatches -> 12 at 6x), and the D3D12 dot4 / integer networks of a batch run layer by layer
+   side by side. 1080p 6x: D3D12 2.40 -> 2.35 ms, Vulkan 2.71 -> 2.59; D3D12 dot4 5.05 -> 3.56. Each timestep still costs its own work in
+   every pass (they read the timestep; only a network that shares work across timesteps, i.e. retraining, removes that), the copies of each
+   network's two outputs into the textures the composite filters, the composite's UI test (the same for every timestep), and the copy out of
+   frames 2-n. Cheaper passes help every multiplier.
 3. **Intel dot4.** No tiled-dot4 tuning for Intel (TuningFor uses the untiled kernel); Arc A and integrated GPUs run it first.
 4. **No matrix path on D3D12 off NVIDIA.** AMD and Intel D3D12 games run dot4. D3D12 Cooperative Vectors were skipped while preview-only.
 5. **CUDA tile shapes tuned on sm_89 only.** Turing, Ampere and Blackwell need reports; the timing protects against a loss, not
