@@ -38,6 +38,7 @@ for n, s in [("kOfMvHints", of_ + "_mv_hints"), ("kOfArmPyramid", of_ + "_arm_py
     passes.append((n, s, OF, "DEPTH_INVERTED", 60))
 INV = P + "INVERTED_DEPTH"
 D = FI + HIST
+BATCH = ["-DNFRUX_BATCH=1"]  # the ...Batch variants: a batch's timesteps in one dispatch, z = timestep (ffx_frameinterpolation_callbacks_glsl.h)
 # Full precision in the source, for both APIs: the 16-bit float types are 32-bit (and no pass may declare 8- or 16-bit types).
 F32 = ["-Dfloat16_t=float", "-Df16vec2=vec2", "-Df16vec3=vec3", "-Df16vec4=vec4", "-Dmediump=", "-Dlowp="]
 BANNED = {9: "Float16", 22: "Int16", 39: "Int8", **{c: "a group operation" for c in (18, *range(61, 69), 4423, 4431)},
@@ -51,6 +52,7 @@ for n, s, d in [("kFiInitWarp", fi_ + "_00_init_warp_pass", D + fmt("rgba16f")),
                 ("kFiInpaintMip", fi_ + "_31_downsample_inpaint_mip_pass", D + fmt("rgba16f")),
                 ("kFiInpaint", fi_ + "_50_inpaint_pass", D + fmt("rgba16f"))]:
     passes.append((n, s, d, INV, 60))
+    passes.append((n + "Batch", s, d + BATCH, INV, 60))
 for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:  # lanes in the colour's format
     for n, s in [("kFiDownsampleOf", "01_downsample_of_colour"), ("kFiDownsampleAll", "02_downsample_all_input"), ("kFiDownsampleColour", "03_downsample_colour")]:
         passes.append((n + suffix, fi_ + f"_{s}_pass", D + fmt(f), INV, 60))
@@ -64,6 +66,8 @@ for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rg
 for suffix, f in [("Rgba16f", "rgba16f"), ("Rgb10a2", "rgb10_a2"), ("Rgba8", "rgba8")]:
     passes.append((f"kFiPostprocessNoHistory{suffix}", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f), INV, 60))
     passes.append((f"kFiPostprocessHistory{suffix}", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f), INV, 60))  # also stores the colour's texel: the next frame's history
+    passes.append((f"kFiPostprocessNoHistory{suffix}Batch", fi_ + "_50_postprocess_pass", FI + NOHIST + fmt(f) + BATCH, INV, 60))
+    passes.append((f"kFiPostprocessHistory{suffix}Batch", fi_ + "_50_postprocess_pass", FI + HIST + fmt(f) + BATCH, INV, 60))
 
 
 def run(cmd):
@@ -131,8 +135,8 @@ def build(job):
                 continue
             k = {"ubos": "Cbv", "textures": "SrvTexture", "separate_images": "SrvTexture", "images": "UavTexture"}.get(kind)
             if kind == "ssbos":
-                k = "SrvBuffer" if f": register(t{r['binding']}" in hl else "UavBuffer"
-            if kind == "images" and f": register(t{r['binding']}" in hl:
+                k = "SrvBuffer" if f": register(t{r['binding']}," in hl else "UavBuffer"
+            if kind == "images" and f": register(t{r['binding']}," in hl:
                 k = "SrvTexture"
             binds.append((r["binding"], k))
     return n, open(b + ".spv", "rb").read(), open(b + ".dxil", "rb").read(), sorted(set(binds)), sm

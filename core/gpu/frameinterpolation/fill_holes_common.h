@@ -12,13 +12,15 @@
 #error "FFX_FRAMEINTERPOLATION_DEPTH_QDATA_TEXTURE must be defined before including fill_holes_common.h"
 #endif
 
-#define _DepthQDataTex usampler2D(FFX_FRAMEINTERPOLATION_DEPTH_QDATA_TEXTURE, s_PointClamp)
-
 /*
     To use, declare the following:
     uint32_t LoadPackedQDepth(FfxInt32x2 coord)
     {
         return LoadWarpedFlowQDataTM1(coord);
+    }
+    FfxUInt32x4 GatherPackedQDepth(FfxFloat32x2 uv)  // NFRUX: point-clamp gather of component 0
+    {
+        return GatherWarpedFlowQDataTM1(uv);
     }
 */
 void FillHoles(FfxInt32x2 output_pixel, FfxInt32x2 output_dims, FfxFloat32x2 inv_output_dims)
@@ -36,7 +38,7 @@ void FillHoles(FfxInt32x2 output_pixel, FfxInt32x2 output_dims, FfxFloat32x2 inv
     FfxFloat32x2 texelSize       = 1.0f / FfxFloat32x2(output_dims);
 
     // Gather around (x-1, y-1): covers (-1,-1), (0,-1), (-1,0), (0,0)
-    FfxUInt32x4 gather1 = textureGather(_DepthQDataTex, normalizedCoord - texelSize, 0);
+    FfxUInt32x4 gather1 = GatherPackedQDepth(normalizedCoord - texelSize);
     // GLSL gather component mapping at pixel centers:
     // x = (u0, v1), y = (u1, v1), z = (u1, v0), w = (u0, v0)
     depth_mvs_packed[0] = gather1.y;  // (0, 0)
@@ -45,7 +47,7 @@ void FillHoles(FfxInt32x2 output_pixel, FfxInt32x2 output_dims, FfxFloat32x2 inv
     depth_mvs_packed[7] = gather1.w;  // (-1,-1)
 
     // Gather around (x, y): covers (0,0), (1,0), (0,1), (1,1)
-    FfxUInt32x4 gather2 = textureGather(_DepthQDataTex, normalizedCoord, 0);
+    FfxUInt32x4 gather2 = GatherPackedQDepth(normalizedCoord);
     depth_mvs_packed[1] = gather2.z;  // (1,0)
     depth_mvs_packed[2] = gather2.x;  // (0,1)
     depth_mvs_packed[6] = gather2.y;  // (1,1)
@@ -75,5 +77,3 @@ void FillHoles(FfxInt32x2 output_pixel, FfxInt32x2 output_dims, FfxFloat32x2 inv
 }
 
 #endif  // FILL_HOLES_COMMON
-
-#undef _DepthQDataTex

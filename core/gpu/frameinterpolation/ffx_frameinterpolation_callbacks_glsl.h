@@ -51,6 +51,34 @@ uint32_t PackInt8(FfxInt32x4 v)
     return (uint32_t(v.x) & 0xffu) | ((uint32_t(v.y) & 0xffu) << 8) | ((uint32_t(v.z) & 0xffu) << 16) | ((uint32_t(v.w) & 0xffu) << 24);
 }
 
+// NFRUX: NFRUX_BATCH 1 (the passes' ...Batch variants): a batch's timesteps in one dispatch. The timestep is the workgroup's z; a
+// resource of its own for each timestep has one binding a timestep (the first's + 16 i), and its accessors pick by the timestep
+// (the same in a whole workgroup). Otherwise one timestep, the batch's first.
+#if NFRUX_BATCH
+FfxUInt32 TimestepIndex()
+{
+    return gl_WorkGroupID.z;
+}
+#define NFRUX_SLOTS(decl, b, name) decl(b, name) decl((b) + 16, name##_1) decl((b) + 32, name##_2) decl((b) + 48, name##_3) decl((b) + 64, name##_4)
+// F(texture) is a statement that returns.
+#define NFRUX_PICK(name, F) switch (TimestepIndex()) { case 1u: F(name##_1) case 2u: F(name##_2) case 3u: F(name##_3) case 4u: F(name##_4) } F(name)
+#else
+FfxUInt32 TimestepIndex()
+{
+    return 0u;
+}
+#define NFRUX_SLOTS(decl, b, name) decl(b, name)
+#define NFRUX_PICK(name, F) F(name)
+#endif
+#define NFRUX_UTEX(b, name) layout(set = 0, binding = b) uniform utexture2D name;
+#define NFRUX_TEX(b, name) layout(set = 0, binding = b) uniform highp texture2D name;
+#define NFRUX_R32UI(b, name) layout(set = 0, binding = b, r32ui) uniform uimage2D name;
+#define NFRUX_RG16F(b, name) layout(set = 0, binding = b, rg16f) uniform image2D name;
+#define NFRUX_RGBA8(b, name) layout(set = 0, binding = b, rgba8) uniform image2D name;
+#define NFRUX_RGBA8W(b, name) layout(set = 0, binding = b, rgba8) writeonly uniform image2D name;
+#define NFRUX_OUT(b, name) layout(set = 0, binding = b, OUTPUT_IMG_FORMAT) uniform image2D name;
+#define NFRUX_WORDS(b, name) layout(set = 0, binding = b, std430) writeonly buffer name##_t { uint32_t data[]; } name;
+
 ///////////////////////////////////////////////
 // declare CBs and CB accessors
 ///////////////////////////////////////////////
@@ -90,8 +118,8 @@ layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION,
     FfxFloat32x2 _OfInputSizeRcp;
     FfxFloat32   _DepthClipScale;
     FfxFloat32   _DepthClipPower;
-    FfxUInt32    _Options;  // UI kind (bits 0-7), no-warp mask (0x100), orthographic camera (0x200), the
-                            // warp's timestep-free outputs already written by the batch's first frame (0x400)
+    FfxUInt32    _Options;  // UI kind (bits 0-7), no-warp mask (0x100), orthographic camera (0x200)
+    FfxFloat32x4 _TimestepsAfterFirst;  // NFRUX: the batch's timesteps 1-4 (_Timestep is timestep 0's)
 }
 cbFI;
 
@@ -166,7 +194,8 @@ FfxBoolean Reset()
 
 FfxFloat32 Timestep()
 {
-    return cbFI._Timestep;
+    const FfxUInt32 i = TimestepIndex();
+    return i == 0u ? cbFI._Timestep : cbFI._TimestepsAfterFirst[i - 1u];
 }
 
 FfxUInt32 RandomSeed()
@@ -265,7 +294,7 @@ FfxBoolean IsOrthographic()
 // writes them; the same values for every timestep).
 FfxBoolean WarpSharedOutputsWritten()
 {
-    return (cbFI._Options & 0x400u) != 0u;
+    return TimestepIndex() != 0u;
 }
 
 FfxFloat32 ConvertFromDeviceDepthToViewSpace(FfxFloat32 fDeviceDepth)
@@ -409,32 +438,56 @@ FfxInt32x2 DynamicMaskTp1Size()
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_MOTION_QDATA_TP1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_MOTION_QDATA_TP1) uniform utexture2D r_warped_motion_qdata_tp1;
+NFRUX_SLOTS(NFRUX_UTEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_MOTION_QDATA_TP1, r_warped_motion_qdata_tp1)
 FfxUInt32 LoadWarpedMotionQDataTP1(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
-    return texelFetch(r_warped_motion_qdata_tp1, iPxPos, 0).x;
+#define F(t) return texelFetch(t, iPxPos, 0).x;
+    NFRUX_PICK(r_warped_motion_qdata_tp1, F)
+#undef F
+}
+// A pixel and its eight neighbours in one pick (the loads issued together): gathers at its opposite corners, the two corners they
+// miss (clamped to the image), and the pixel.
+void LoadWarpedMotionQDataTP1Around(FFX_PARAMETER_IN FfxInt32x2 pixel, FFX_PARAMETER_IN FfxInt32x2 size, out FfxUInt32x4 ga, out FfxUInt32x4 gd,
+                                    out FfxUInt32 g0, out FfxUInt32 g1, out FfxUInt32 centre)
+{
+#define F(t) { ga = textureGather(usampler2D(t, s_PointClamp), FfxFloat32x2(pixel) / FfxFloat32x2(size)); \
+               gd = textureGather(usampler2D(t, s_PointClamp), FfxFloat32x2(pixel + 1) / FfxFloat32x2(size)); \
+               g0 = texelFetch(t, clamp(pixel + FfxInt32x2(-1, 1), FfxInt32x2(0), size - 1), 0).x; \
+               g1 = texelFetch(t, clamp(pixel + FfxInt32x2(1, -1), FfxInt32x2(0), size - 1), 0).x; centre = texelFetch(t, pixel, 0).x; return; }
+    NFRUX_PICK(r_warped_motion_qdata_tp1, F)
+#undef F
 }
 
-FfxInt32x2 WarpedMotionQDataTP1Size()
+FfxInt32x2 WarpedMotionQDataTP1Size()  // every timestep's
 {
     return FfxInt32x2(textureSize(r_warped_motion_qdata_tp1, 0));
 }
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FLOW_QDATA_TM1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FLOW_QDATA_TM1) uniform utexture2D r_warped_flow_qdata_tm1;
+NFRUX_SLOTS(NFRUX_UTEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FLOW_QDATA_TM1, r_warped_flow_qdata_tm1)
 FfxUInt32 LoadWarpedFlowQDataTM1(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
-    return texelFetch(r_warped_flow_qdata_tm1, iPxPos, 0).x;
+#define F(t) return texelFetch(t, iPxPos, 0).x;
+    NFRUX_PICK(r_warped_flow_qdata_tm1, F)
+#undef F
+}
+FfxUInt32x4 GatherWarpedFlowQDataTM1(FFX_PARAMETER_IN FfxFloat32x2 fUv)
+{
+#define F(t) return textureGather(usampler2D(t, s_PointClamp), fUv, 0);
+    NFRUX_PICK(r_warped_flow_qdata_tm1, F)
+#undef F
 }
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_FLOW_TM1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_FLOW_TM1) uniform mediump texture2D r_warped_filled_flow_tm1;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_FLOW_TM1, r_warped_filled_flow_tm1)
 // bilinear flow sampling
 FFX_MIN16_F2 SampleWarpedFilledFlowTM1(FFX_PARAMETER_IN FfxFloat32x2 fUv)
 {
-    return FFX_MIN16_F2(textureLod(sampler2D(r_warped_filled_flow_tm1, s_LinearClamp), fUv, 0.0).xy);
+#define F(t) return FFX_MIN16_F2(textureLod(sampler2D(t, s_LinearClamp), fUv, 0.0).xy);
+    NFRUX_PICK(r_warped_filled_flow_tm1, F)
+#undef F
 }
 #endif
 
@@ -613,76 +666,97 @@ int8_t4 LoadInTensorData3(FFX_PARAMETER_IN FfxUInt32x2 coord)
 #endif
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_TENSOR
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_TENSOR) uniform lowp texture2D r_out_params_tensor;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_TENSOR, r_out_params_tensor)
 
 FfxFloat32x4 SampleOutParamsTensor(FFX_PARAMETER_IN FfxFloat32x2 UV)
 {
-    FfxFloat32x4 weights = textureLod(sampler2D(r_out_params_tensor, s_LinearClamp), UV, 0.0);
-    return weights;
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), UV, 0.0);
+    NFRUX_PICK(r_out_params_tensor, F)
+#undef F
 }
 #endif
 
 // inpaint SRVs
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_GATE_TENSOR
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_GATE_TENSOR) uniform lowp texture2D r_out_params_gate_tensor;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_OUT_PARAMS_GATE_TENSOR, r_out_params_gate_tensor)
 FfxFloat32 SampleOutParamsGateTensor(FFX_PARAMETER_IN FfxFloat32x2 UV)
 {
-    return textureLod(sampler2D(r_out_params_gate_tensor, s_LinearClamp), UV, 0.0).x;
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), UV, 0.0).x;
+    NFRUX_PICK(r_out_params_gate_tensor, F)
+#undef F
 }
 #endif
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SEED
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SEED) uniform highp texture2D r_inpaint_seed;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SEED, r_inpaint_seed)
 FfxFloat32x4 SampleInpaintSeed(FFX_PARAMETER_IN FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_inpaint_seed, s_LinearClamp), uv, 0.0);
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), uv, 0.0);
+    NFRUX_PICK(r_inpaint_seed, F)
+#undef F
 }
 #endif
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SOURCE
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SOURCE) uniform highp texture2D r_inpaint_source;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_SOURCE, r_inpaint_source)
 FfxFloat32x4 SampleInpaintSource(FFX_PARAMETER_IN FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_inpaint_source, s_LinearClamp), uv, 0.0);
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), uv, 0.0);
+    NFRUX_PICK(r_inpaint_source, F)
+#undef F
 }
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_0) && defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_1) && \
     defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_2) && defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_3) && \
     defined(FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_4)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_0) uniform highp texture2D r_inpaint_level_0;
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_1) uniform highp texture2D r_inpaint_level_1;
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_2) uniform highp texture2D r_inpaint_level_2;
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_3) uniform highp texture2D r_inpaint_level_3;
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_4) uniform highp texture2D r_inpaint_level_4;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_0, r_inpaint_level_0)
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_1, r_inpaint_level_1)
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_2, r_inpaint_level_2)
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_3, r_inpaint_level_3)
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_LEVEL_4, r_inpaint_level_4)
 FfxFloat32x4 SampleInpaintLevel(FFX_PARAMETER_IN FfxFloat32x2 uv, FFX_PARAMETER_IN FfxInt32 level)
 {
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), uv, 0.0);
     if (level == 0)
-        return textureLod(sampler2D(r_inpaint_level_0, s_LinearClamp), uv, 0.0);
+    {
+        NFRUX_PICK(r_inpaint_level_0, F)
+    }
     if (level == 1)
-        return textureLod(sampler2D(r_inpaint_level_1, s_LinearClamp), uv, 0.0);
+    {
+        NFRUX_PICK(r_inpaint_level_1, F)
+    }
     if (level == 2)
-        return textureLod(sampler2D(r_inpaint_level_2, s_LinearClamp), uv, 0.0);
+    {
+        NFRUX_PICK(r_inpaint_level_2, F)
+    }
     if (level == 3)
-        return textureLod(sampler2D(r_inpaint_level_3, s_LinearClamp), uv, 0.0);
-    return textureLod(sampler2D(r_inpaint_level_4, s_LinearClamp), uv, 0.0);
+    {
+        NFRUX_PICK(r_inpaint_level_3, F)
+    }
+    NFRUX_PICK(r_inpaint_level_4, F)
+#undef F
 }
 #endif
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_RESULT
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_RESULT) uniform highp texture2D r_inpaint_result;
+NFRUX_SLOTS(NFRUX_TEX, FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPAINT_RESULT, r_inpaint_result)
 FfxFloat32x4 SampleInpaintResult(FFX_PARAMETER_IN FfxFloat32x2 uv)
 {
-    return textureLod(sampler2D(r_inpaint_result, s_LinearClamp), uv, 0.0);
+#define F(t) return textureLod(sampler2D(t, s_LinearClamp), uv, 0.0);
+    NFRUX_PICK(r_inpaint_result, F)
+#undef F
 }
 #endif
 
 // inpaint UAVs / render targets
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_SEED)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_SEED, rgba8) uniform image2D rw_inpaint_seed;
+NFRUX_SLOTS(NFRUX_RGBA8, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_SEED, rw_inpaint_seed)
 void StoreInpaintSeed(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32x4 value)
 {
-    imageStore(rw_inpaint_seed, iPxPos, value);
+#define F(t) { imageStore(t, iPxPos, value); return; }
+    NFRUX_PICK(rw_inpaint_seed, F)
+#undef F
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_INPAINT_SEED)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_INPAINT_SEED) out highp FfxFloat32x4 rw_inpaint_seed;
@@ -693,22 +767,26 @@ void StoreInpaintSeed(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFl
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_DESTINATION)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_DESTINATION, rgba8) uniform image2D rw_inpaint_destination;
+NFRUX_SLOTS(NFRUX_RGBA8, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_DESTINATION, rw_inpaint_destination)
 void StoreInpaintDestination(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32x4 value)
 {
-    imageStore(rw_inpaint_destination, iPxPos, value);
+#define F(t) { imageStore(t, iPxPos, value); return; }
+    NFRUX_PICK(rw_inpaint_destination, F)
+#undef F
 }
-FfxInt32x2 InpaintDestinationSize()
+FfxInt32x2 InpaintDestinationSize()  // every timestep's
 {
     return imageSize(rw_inpaint_destination);
 }
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_RESULT)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_RESULT, rgba8) writeonly uniform image2D rw_inpaint_result;
+NFRUX_SLOTS(NFRUX_RGBA8W, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_INPAINT_RESULT, rw_inpaint_result)
 void StoreInpaintResult(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32x4 value)
 {
-    imageStore(rw_inpaint_result, iPxPos, value);
+#define F(t) { imageStore(t, iPxPos, value); return; }
+    NFRUX_PICK(rw_inpaint_result, F)
+#undef F
 }
 #endif
 
@@ -771,26 +849,34 @@ void StoreDynamicMaskTp1(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN Ff
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_MOTION_QDATA_TP1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_MOTION_QDATA_TP1, r32ui) uniform uimage2D rw_warped_motion_qdata_tp1;
+NFRUX_SLOTS(NFRUX_R32UI, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_MOTION_QDATA_TP1, rw_warped_motion_qdata_tp1)
 void UpdateWarpMotionQDataTp1(FFX_PARAMETER_IN FFX_MIN16_I2 iPxSample, FFX_PARAMETER_IN FfxUInt32 qdata)
 {
-    imageAtomicMax(rw_warped_motion_qdata_tp1, iPxSample, qdata);
+#define F(t) { imageAtomicMax(t, iPxSample, qdata); return; }
+    NFRUX_PICK(rw_warped_motion_qdata_tp1, F)
+#undef F
 }
 void InitWarpClearQDataTp1(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
-    imageStore(rw_warped_motion_qdata_tp1, iPxPos, uvec4(0));
+#define F(t) { imageStore(t, iPxPos, uvec4(0)); return; }
+    NFRUX_PICK(rw_warped_motion_qdata_tp1, F)
+#undef F
 }
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FLOW_QDATA_TM1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FLOW_QDATA_TM1, r32ui) uniform uimage2D rw_warped_flow_qdata_tm1;
+NFRUX_SLOTS(NFRUX_R32UI, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FLOW_QDATA_TM1, rw_warped_flow_qdata_tm1)
 void UpdateWarpFlowQDataTm1(FFX_PARAMETER_IN FfxInt32x2 iPxSample, FFX_PARAMETER_IN FfxUInt32 qdata)
 {
-    imageAtomicMax(rw_warped_flow_qdata_tm1, iPxSample, qdata);
+#define F(t) { imageAtomicMax(t, iPxSample, qdata); return; }
+    NFRUX_PICK(rw_warped_flow_qdata_tm1, F)
+#undef F
 }
 void InitWarpClearQDataTm1(FFX_PARAMETER_IN FfxInt32x2 iPxPos)
 {
-    imageStore(rw_warped_flow_qdata_tm1, iPxPos, uvec4(0));
+#define F(t) { imageStore(t, iPxPos, uvec4(0)); return; }
+    NFRUX_PICK(rw_warped_flow_qdata_tm1, F)
+#undef F
 }
 #endif
 
@@ -823,10 +909,12 @@ void StoreReducedMotionP1(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN F
 #endif
 
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FILLED_FLOW_TM1)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FILLED_FLOW_TM1, rg16f) uniform image2D rw_warped_filled_flow_tm1;
+NFRUX_SLOTS(NFRUX_RG16F, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_WARP_FILLED_FLOW_TM1, rw_warped_filled_flow_tm1)
 void StoreWarpFilledFlowTm1(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FFX_MIN16_F2 val)
 {
-    imageStore(rw_warped_filled_flow_tm1, iPxPos, FFX_MIN16_F4(val, 0.0f, 0.0f));
+#define F(t) { imageStore(t, iPxPos, FFX_MIN16_F4(val, 0.0f, 0.0f)); return; }
+    NFRUX_PICK(rw_warped_filled_flow_tm1, F)
+#undef F
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_WARP_FILLED_FLOW_TM1)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_WARP_FILLED_FLOW_TM1) out mediump FfxFloat32x4 rw_warped_filled_flow_tm1;
@@ -867,29 +955,27 @@ void StoreInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN InputTen
 #endif
 #else
 #if defined(FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR)
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR, std430) writeonly buffer InputTensorBuffer_t
-{
-    uint32_t data[];
-}
-rw_in_tensor;
+NFRUX_SLOTS(NFRUX_WORDS, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR, rw_in_tensor)
 
 void StoreInTensor(FFX_PARAMETER_IN FfxUInt32x2 coord, FFX_PARAMETER_IN InputTensorElement_t te)
 {
     const FfxUInt32 idx = (coord.y * InputTensorSize().x + coord.x) * 5;
-    rw_in_tensor.data[idx + 0] = te.rgbM1MV_rP1MV;
-    rw_in_tensor.data[idx + 1] = te.gbP1MV_rgM1OF;
-    rw_in_tensor.data[idx + 2] = te.bM1OF_rgbP1OF;
-    rw_in_tensor.data[idx + 3] = te.depth_disMask;
-    rw_in_tensor.data[idx + 4] = te.timestep_pad;
+#define F(t) { t.data[idx + 0] = te.rgbM1MV_rP1MV; t.data[idx + 1] = te.gbP1MV_rgM1OF; t.data[idx + 2] = te.bM1OF_rgbP1OF; \
+               t.data[idx + 3] = te.depth_disMask; t.data[idx + 4] = te.timestep_pad; return; }
+    NFRUX_PICK(rw_in_tensor, F)
+#undef F
 }
 #endif
 #endif  //FFX_ARM_FRAMEINTERPOLATION_OPTION_ENABLE_DATA_GRAPH_FI
 
 #ifdef FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_OUTPUT
-layout(set = 0, binding = FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_OUTPUT, OUTPUT_IMG_FORMAT) uniform image2D rw_output;
+NFRUX_SLOTS(NFRUX_OUT, FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_OUTPUT, rw_output)
 void StoreFrameinterpolationOutput(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FFX_MIN16_F4 val)
 {
-    imageStore(rw_output, iPxPos, (cbFI._Options & 0x1000u) != 0u ? val.bgra : val);  // NFRUX: blue first (BGRA8 outputs)
+    const FFX_MIN16_F4 v = (cbFI._Options & 0x1000u) != 0u ? val.bgra : val;  // NFRUX: blue first (BGRA8 outputs)
+#define F(t) { imageStore(t, iPxPos, v); return; }
+    NFRUX_PICK(rw_output, F)
+#undef F
 }
 #elif defined(FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_OUTPUT)
 layout(location = FFX_ARM_FRAMEINTERPOLATION_BIND_RENDER_TARGET_OUTPUT) out mediump FfxFloat32x4 rw_output;

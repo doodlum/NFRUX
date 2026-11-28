@@ -44,9 +44,12 @@ struct FiConstants
     float    _DepthClipScale;
     float    _DepthClipPower;
     uint32_t _Options;
+    uint32_t _OptionsPadding[3];
+    float    _TimestepsAfterFirst[4];  // the batch's timesteps 1-4 (each pass runs them all in one dispatch, z = timestep)
 };
 static_assert(offsetof(FiConstants, _MvSimilarityThresholds) == 224 && offsetof(FiConstants, _InputTensorSize) == 240 &&
-                  offsetof(FiConstants, _QuantParamsGateSNORM) == 304 && offsetof(FiConstants, _Options) == 336,
+                  offsetof(FiConstants, _QuantParamsGateSNORM) == 304 && offsetof(FiConstants, _Options) == 336 &&
+                  offsetof(FiConstants, _TimestepsAfterFirst) == 352,
               "constants must match the std140 block");
 
 // ffxNfruRoundPositive (ffx_frameinterpolation_resolution.h): to nearest, ties to even.
@@ -147,7 +150,7 @@ using PassPtr = std::unique_ptr<Pass>;
 struct Out
 {
     std::unique_ptr<Network> net;
-    Tex qMotionTp1, qFlowTm1, filledFlowTm1, level[5], inpaint, seed, output, dynScratch, depthScratch;
+    Tex qMotionTp1, qFlowTm1, filledFlowTm1, level[5], inpaint, seed, output;
 };
 
 struct Interpolator::Impl
@@ -158,7 +161,9 @@ struct Interpolator::Impl
     bool     allInput = false, colourDown = false;
     FiConstants c = {};
     float    lastVP[16] = {};
-    PassPtr  initWarp, downOf, downAll, downColour, warp, warpTm1, fillTm1, preprocess, inpaintSeed, inpaintMip, inpaint, post, postHistory;
+    PassPtr  downOf, downAll, downColour;
+    // [0] one timestep, [1] a batch's timesteps in one dispatch (the shaders' ...Batch variants)
+    PassPtr  initWarp[2], warp[2], warpTm1[2], fillTm1[2], preprocess[2], inpaintSeed[2], inpaintMip[2], inpaint[2], post[2], postHistory[2];
     PassPtr  mvHints, pyramidP, flowWarp, match, bilateral;
     Tex      dynMask[2], depthTm1[2], colorTm1[2], prep[2], reducedMotion, ofColour;
     Tex      computedMv, flow, pyramid[2], fWarp, fMatch, fSub, fFlow;
@@ -183,6 +188,7 @@ struct Interpolator::Impl
 };
 
 #define NFRUX_PASS(var, name) if (!MakePass(var, shaders::name, shaders::name##Inv)) return fail("pass " #name);
+#define NFRUX_PASS2(var, name) NFRUX_PASS(var[0], name) NFRUX_PASS(var[1], name##Batch)
 
 bool Interpolator::Impl::Create(std::string* error)
 {
@@ -203,7 +209,7 @@ bool Interpolator::Impl::Create(std::string* error)
     flowLane = {RoundPositive(double(flowRows) * aspect), flowRows};
     graph    = {(mvLane.width + 7) / 8 * 8, (mvLane.height + 7) / 8 * 8};
 
-    NFRUX_PASS(initWarp, kFiInitWarp)
+    NFRUX_PASS2(initWarp, kFiInitWarp)
     Format lane = s.outputFormat == Format::BGRA8Unorm ? Format::RGBA8Unorm : s.outputFormat;
 #define NFRUX_LANE(suffix) { NFRUX_PASS(downOf, kFiDownsampleOf##suffix) NFRUX_PASS(downAll, kFiDownsampleAll##suffix) NFRUX_PASS(downColour, kFiDownsampleColour##suffix) }
     switch (lane)
@@ -213,13 +219,13 @@ bool Interpolator::Impl::Create(std::string* error)
     case Format::RGBA16Float: NFRUX_LANE(Rgba16f) break;
     default: return fail("unsupported output format");
     }
-    NFRUX_PASS(warp, kFiWarpFlow) NFRUX_PASS(warpTm1, kFiWarpFlowTm1) NFRUX_PASS(fillTm1, kFiFillHolesTm1) NFRUX_PASS(preprocess, kFiPreprocess)
-    NFRUX_PASS(inpaintSeed, kFiInpaintSeed) NFRUX_PASS(inpaintMip, kFiInpaintMip) NFRUX_PASS(inpaint, kFiInpaint)
+    NFRUX_PASS2(warp, kFiWarpFlow) NFRUX_PASS2(warpTm1, kFiWarpFlowTm1) NFRUX_PASS2(fillTm1, kFiFillHolesTm1) NFRUX_PASS2(preprocess, kFiPreprocess)
+    NFRUX_PASS2(inpaintSeed, kFiInpaintSeed) NFRUX_PASS2(inpaintMip, kFiInpaintMip) NFRUX_PASS2(inpaint, kFiInpaint)
     switch (s.outputFormat)
     {
-    case Format::RGBA8Unorm: case Format::BGRA8Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba8) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgba8) break;
-    case Format::RGB10A2Unorm: NFRUX_PASS(post, kFiPostprocessNoHistoryRgb10a2) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgb10a2) break;
-    case Format::RGBA16Float: NFRUX_PASS(post, kFiPostprocessNoHistoryRgba16f) NFRUX_PASS(postHistory, kFiPostprocessHistoryRgba16f) break;
+    case Format::RGBA8Unorm: case Format::BGRA8Unorm: NFRUX_PASS2(post, kFiPostprocessNoHistoryRgba8) NFRUX_PASS2(postHistory, kFiPostprocessHistoryRgba8) break;
+    case Format::RGB10A2Unorm: NFRUX_PASS2(post, kFiPostprocessNoHistoryRgb10a2) NFRUX_PASS2(postHistory, kFiPostprocessHistoryRgb10a2) break;
+    case Format::RGBA16Float: NFRUX_PASS2(post, kFiPostprocessNoHistoryRgba16f) NFRUX_PASS2(postHistory, kFiPostprocessHistoryRgba16f) break;
     default: return fail("unsupported output format");
     }
     NFRUX_PASS(mvHints, kOfMvHints) NFRUX_PASS(pyramidP, kOfArmPyramid) NFRUX_PASS(flowWarp, kOfArmWarp)
@@ -286,7 +292,6 @@ bool Interpolator::Impl::MakeOuts(uint32_t n, std::string* error)
         for (uint32_t l = 0; l < 5; ++l)
             tex(o.level[l], Format::RGBA8Unorm, {std::max(1u, flowLane.width >> l), std::max(1u, flowLane.height >> l)});
         tex(o.output, s.outputFormat, display);
-        if (made) tex(o.dynScratch, Format::R8Unorm, mvLane), tex(o.depthScratch, Format::R32Float, mvLane);
         if (!ok || !o.net)
             return false;
     }
@@ -425,28 +430,49 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
     const uint32_t gx = Groups(std::max(mvLane.width, flowLane.width), kFiGroup), gy = Groups(std::max(mvLane.height, flowLane.height), kFiGroup);
     if (reset)
         count = 1, total = 1;
-    auto set = [&](uint32_t i) { k._Timestep = float(i + 1) / float(total + 1), k._Options = options | (i ? 0x400u : 0u); };
+    // Each pass after the flow runs every timestep of the batch in one dispatch (z = timestep): the timesteps are in the constants,
+    // and a resource of each timestep's own is bound once a timestep, at its binding + 16 x timestep (the shaders pick by z).
+    // Slots past the batch are given the first timestep's (bound, never used). One timestep: the passes without the other slots.
+    const uint32_t batch = count > 1 ? 1 : 0, slotCount = batch ? kMaxGenerated : 1;
+    k._Timestep = 1.0f / float(total + 1), k._Options = options;
+    for (uint32_t i = 1; i < kMaxGenerated; ++i) k._TimestepsAfterFirst[i - 1] = i < count ? float(i + 1) / float(total + 1) : 0.0f;
+    struct Binds
+    {
+        Bind     b[96];
+        uint32_t n = 0;
+        Binds&   operator<<(const Bind& x) { b[n++] = x; return *this; }
+    };
+    auto slots = [&](Binds& bs, uint32_t binding, auto&& of) {
+        for (uint32_t i = 0; i < slotCount; ++i)
+        {
+            Bind x = of(i < count ? i : 0u);
+            x.binding = binding + 16 * i;
+            bs << x;
+        }
+    };
+    auto tex = [this](Tex Out::*t) { return [this, t](uint32_t i) { return Bind::Tex(0, *(outs[i].*t)); }; };
+    auto level = [this](uint32_t l) { return [this, l](uint32_t i) { return Bind::Tex(0, *outs[i].level[l]); }; };
     const Bind downB[] = {Bind::Tex(0, flowColour), Bind::Tex(1, depth), Bind::Tex(2, mv), Bind::Tex(3, down ? prepP1 : color), Bind::Tex(4, dNext),
                           Bind::Tex(5, allInput ? *reducedMotion : dNext), Bind::Data(6, &k, sizeof(k))};
-    auto warpRun = [&](uint32_t i) {
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, warpMotion), Bind::Tex(1, warpDepth), Bind::Tex(2, dTm1), Bind::Tex(3, dynTm1), Bind::Tex(4, i ? *o.dynScratch : dynTp1),
-                          Bind::Tex(5, *o.qMotionTp1), Bind::Tex(8, i ? *o.depthScratch : dNext), Bind::Data(9, &k, sizeof(k))};
-        return warp->Dispatch(b, 8, lx, ly);
-    };
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Bind b[] = {Bind::Tex(0, *outs[i].qMotionTp1), Bind::Tex(1, *outs[i].qFlowTm1), Bind::Data(4, &k, sizeof(k))};
-        if (!initWarp->Dispatch(b, 3, gx, gy)) return false;
+        Binds b;
+        b << Bind::Data(4, &k, sizeof(k));
+        slots(b, 0, tex(&Out::qMotionTp1)), slots(b, 1, tex(&Out::qFlowTm1));
+        if (!initWarp[batch]->Dispatch(b.b, b.n, gx, gy, count)) return false;
     }
-    set(0);
     if (allInput && !downAll->Dispatch(downB, 7, lx, ly)) return false;
     if (colourDown && !downColour->Dispatch(downB, 7, lx, ly)) return false;
-    // The pyramid's levels between the warps (each level reads the one before; the first warp writes what the others read).
-    if (!Pyramid(flowColour, 1) || !warpRun(0) || !Pyramid(flowColour, 2)) return false;
-    for (uint32_t i = 1; i < count; ++i) { set(i); if (!warpRun(i)) return false; }
-    for (int32_t l = 3; l < 6; ++l) if (!Pyramid(flowColour, l)) return false;
+    // The warp beside the pyramid's first level (each level reads the one before). Its timestep-free outputs (the next depth, the TP1
+    // mask) are written by timestep 0.
+    if (!Pyramid(flowColour, 1)) return false;
+    {
+        Binds b;
+        b << Bind::Tex(0, warpMotion) << Bind::Tex(1, warpDepth) << Bind::Tex(2, dTm1) << Bind::Tex(3, dynTm1) << Bind::Tex(4, dynTp1) << Bind::Tex(8, dNext)
+          << Bind::Data(9, &k, sizeof(k));
+        slots(b, 5, tex(&Out::qMotionTp1));
+        if (!warp[batch]->Dispatch(b.b, b.n, lx, ly, count)) return false;
+    }
+    for (int32_t l = 2; l < 6; ++l) if (!Pyramid(flowColour, l)) return false;
     if (!Match(reset)) return false;
     pyramidValid = true;
     pyrCur ^= 1;
@@ -456,65 +482,58 @@ bool Interpolator::Impl::Frame(const FrameInputs& in, uint32_t count, uint32_t t
         dev.CopyTexture(color, backup);
         return true;
     }
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *flow), Bind::Tex(1, dTm1), Bind::Tex(2, *o.qFlowTm1), Bind::Data(3, &k, sizeof(k))};
-        if (!warpTm1->Dispatch(b, 4, Groups(flowLane.width, 32), Groups(flowLane.height, 4))) return false;
+        Binds b;
+        b << Bind::Tex(0, *flow) << Bind::Tex(1, dTm1) << Bind::Data(3, &k, sizeof(k));
+        slots(b, 2, tex(&Out::qFlowTm1));
+        if (!warpTm1[batch]->Dispatch(b.b, b.n, Groups(flowLane.width, 32), Groups(flowLane.height, 4), count)) return false;
     }
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *o.qFlowTm1), Bind::Tex(1, *o.filledFlowTm1), Bind::Data(2, &k, sizeof(k))};
-        if (!fillTm1->Dispatch(b, 3, Groups(flowLane.width, kFiGroup), Groups(flowLane.height, kFiGroup))) return false;
+        Binds b;
+        b << Bind::Data(2, &k, sizeof(k));
+        slots(b, 0, tex(&Out::qFlowTm1)), slots(b, 1, tex(&Out::filledFlowTm1));
+        if (!fillTm1[batch]->Dispatch(b.b, b.n, Groups(flowLane.width, kFiGroup), Groups(flowLane.height, kFiGroup), count)) return false;
     }
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *o.qMotionTp1), Bind::Tex(1, *o.filledFlowTm1), Bind::Tex(2, prepM1), Bind::Tex(3, prepP1), Bind::Tex(4, dNext), Bind::Tex(5, dTm1),
-                          Bind::Buf(8, *o.net->input), Bind::Tex(10, *o.seed), Bind::Data(9, &k, sizeof(k))};
-        if (!preprocess->Dispatch(b, 9, Groups(graph.width, 16), Groups(graph.height, 16))) return false;
+        Binds b;
+        b << Bind::Tex(2, prepM1) << Bind::Tex(3, prepP1) << Bind::Tex(4, dNext) << Bind::Tex(5, dTm1) << Bind::Data(9, &k, sizeof(k));
+        slots(b, 0, tex(&Out::qMotionTp1)), slots(b, 1, tex(&Out::filledFlowTm1)), slots(b, 10, tex(&Out::seed));
+        slots(b, 8, [this](uint32_t i) { return Bind::Buf(0, *outs[i].net->input); });
+        if (!preprocess[batch]->Dispatch(b.b, b.n, Groups(graph.width, 16), Groups(graph.height, 16), count)) return false;
     }
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *o.seed), Bind::Tex(1, *o.level[0]), Bind::Data(2, &k, sizeof(k))};
-        if (!inpaintSeed->Dispatch(b, 3, Groups(flowLane.width, 16), Groups(flowLane.height, 8))) return false;
+        Binds b;
+        b << Bind::Data(2, &k, sizeof(k));
+        slots(b, 0, tex(&Out::seed)), slots(b, 1, level(0));
+        if (!inpaintSeed[batch]->Dispatch(b.b, b.n, Groups(flowLane.width, 16), Groups(flowLane.height, 8), count)) return false;
     }
     for (uint32_t l = 1; l < 5; ++l)
-        for (uint32_t i = 0; i < count; ++i)
-        {
-            set(i);
-            const Out& o = outs[i];
-            const Bind b[] = {Bind::Tex(0, *o.level[l - 1]), Bind::Tex(1, *o.level[l]), Bind::Data(2, &k, sizeof(k))};
-            if (!inpaintMip->Dispatch(b, 3, Groups(o.level[l]->width, 16), Groups(o.level[l]->height, 8))) return false;
-        }
+    {
+        Binds b;
+        b << Bind::Data(2, &k, sizeof(k));
+        slots(b, 0, level(l - 1)), slots(b, 1, level(l));
+        if (!inpaintMip[batch]->Dispatch(b.b, b.n, Groups(outs[0].level[l]->width, 16), Groups(outs[0].level[l]->height, 8), count)) return false;
+    }
     Network* nets[kMaxGenerated];
     for (uint32_t i = 0; i < count; ++i) nets[i] = outs[i].net.get();
     dev.RunNetworks(nets, count);
     dev.Mark("network");
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Bind b[] = {Bind::Tex(0, *o.level[0]), Bind::Tex(1, *o.level[1]), Bind::Tex(2, *o.level[2]), Bind::Tex(3, *o.level[3]), Bind::Tex(4, *o.level[4]),
-                          Bind::Tex(5, *o.inpaint), Bind::Data(6, &k, sizeof(k))};
-        if (!inpaint->Dispatch(b, 7, Groups(flowLane.width, 16), Groups(flowLane.height, 8))) return false;
+        Binds b;
+        b << Bind::Data(6, &k, sizeof(k));
+        for (uint32_t l = 0; l < 5; ++l) slots(b, l, level(l));
+        slots(b, 5, tex(&Out::inpaint));
+        if (!inpaint[batch]->Dispatch(b.b, b.n, Groups(flowLane.width, 16), Groups(flowLane.height, 8), count)) return false;
     }
-    for (uint32_t i = 0; i < count; ++i)
     {
-        set(i);
-        const Out& o = outs[i];
-        const Texture& target = i == 0 && in.output0 ? *in.output0 : *o.output;
-        const Bind b[] = {Bind::Tex(0, *o.net->params), Bind::Tex(2, *o.filledFlowTm1), Bind::Tex(4, prev), Bind::Tex(5, color), Bind::Tex(6, target),
-                          Bind::Data(7, &k, sizeof(k)), Bind::Tex(9, *o.net->gate), Bind::Tex(10, *o.inpaint), Bind::Tex(11, *o.qMotionTp1), Bind::Tex(12, uiSource),
-                          Bind::Tex(13, uiAlpha), Bind::Tex(14, noWarp), Bind::Tex(8, backup)};
-        const bool history = i == 0 && storeHistory;
-        if (!(history ? postHistory : post)->Dispatch(b, history ? 13 : 12, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup))) return false;
+        // Frame 1 may go straight into the host's output; the history is stored by timestep 0.
+        Binds b;
+        b << Bind::Tex(4, prev) << Bind::Tex(5, color) << Bind::Data(7, &k, sizeof(k)) << Bind::Tex(12, uiSource) << Bind::Tex(13, uiAlpha) << Bind::Tex(14, noWarp);
+        if (storeHistory) b << Bind::Tex(8, backup);
+        slots(b, 0, [this](uint32_t i) { return Bind::Tex(0, *outs[i].net->params); }), slots(b, 9, [this](uint32_t i) { return Bind::Tex(0, *outs[i].net->gate); });
+        slots(b, 2, tex(&Out::filledFlowTm1)), slots(b, 10, tex(&Out::inpaint)), slots(b, 11, tex(&Out::qMotionTp1));
+        slots(b, 6, [&](uint32_t i) { return Bind::Tex(0, i == 0 && in.output0 ? *in.output0 : *outs[i].output); });
+        if (!(storeHistory ? postHistory : post)[batch]->Dispatch(b.b, b.n, Groups(display.width, kFiGroup), Groups(display.height, kFiGroup), count)) return false;
     }
     dev.Mark("(composite)");
     if (!storeHistory) dev.CopyTexture(color, backup);  // the history, in the colour's own format

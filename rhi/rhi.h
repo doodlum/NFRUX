@@ -93,7 +93,8 @@ class Pass
 {
 public:
     virtual ~Pass() = default;
-    virtual bool Dispatch(const Bind* binds, uint32_t count, uint32_t groupsX, uint32_t groupsY) = 0;
+    // groupsZ: a batch's timesteps, one a z (the passes read it as their timestep)
+    virtual bool Dispatch(const Bind* binds, uint32_t count, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ = 1) = 0;
 };
 
 // The network at one size. Input: the 20-channel int8 tensor; outputs: the blend parameters (4 int8) and the gate (its int8

@@ -11,6 +11,10 @@ uint32_t LoadPackedQDepth(int32_t2 coord)
 {
     return LoadWarpedFlowQDataTM1(coord);
 }
+FfxUInt32x4 GatherPackedQDepth(FfxFloat32x2 uv)
+{
+    return GatherWarpedFlowQDataTM1(uv);
+}
 
 void StoreDilatedVector(int32_t2 coord, FFX_MIN16_F2 value)
 {

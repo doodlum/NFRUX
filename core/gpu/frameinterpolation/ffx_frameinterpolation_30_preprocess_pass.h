@@ -113,9 +113,8 @@ void WriteToInputTensor(int32_t2     outputPixel,
 
 // read the raw packed warped MV/depth (QMVD) for the t->m1 motion, detecting holes (raw == 0) and
 // dynamic-OOB markers (raw == 0x7FFFFFFF).
-FFX_MIN16_F2 LoadMotionQMVD(int32_t2 pixel, out bool dynamic_oob_hole)
+FFX_MIN16_F2 MotionFromQMVD(FfxUInt32 packed, out bool dynamic_oob_hole)
 {
-    FfxUInt32 packed = LoadWarpedMotionQDataTP1(pixel);
     dynamic_oob_hole = (packed == 0x7FFFFFFFu);
     float2 motion    = dqFloatMv(packed);
     motion += float2(0.001f) * step(0.5f, float(packed));
@@ -135,15 +134,14 @@ FFX_MIN16_F2 LoadMotionAndHoleEdgeDetect(int32_t2 pixel, out FFX_MIN16_F hole_ed
     const int32_t2 size   = WarpedMotionQDataTP1Size();
     const bvec4    side   = bvec4(greaterThan(pixel, int32_t2(0)), lessThan(pixel + 1, size));  // left, up, right, down
     const bvec4    corner = bvec4(side.x && side.y, side.z && side.w, side.x && side.w, side.z && side.y);
-    const uvec4    ga     = textureGather(usampler2D(r_warped_motion_qdata_tp1, s_PointClamp), float2(pixel) / float2(size));
-    const uvec4    gd     = textureGather(usampler2D(r_warped_motion_qdata_tp1, s_PointClamp), float2(pixel + 1) / float2(size));
-    const uint32_t g0     = LoadWarpedMotionQDataTP1(clamp(pixel + int32_t2(-1, 1), int32_t2(0), size - 1));
-    const uint32_t g1     = LoadWarpedMotionQDataTP1(clamp(pixel + int32_t2(1, -1), int32_t2(0), size - 1));
+    uvec4    ga, gd;
+    uint32_t g0, g1, centre;
+    LoadWarpedMotionQDataTP1Around(pixel, size, ga, gd, g0, g1, centre);
     hole_edge_mask = Count4(And4(side, equal(uvec4(ga.x, ga.z, gd.z, gd.x), uvec4(0u)))) + Count4(And4(corner, equal(uvec4(ga.w, gd.y, g0, g1), uvec4(0u))));
     const FFX_MIN16_F valid_sample_count = Count4(side) + Count4(corner);
     hole_edge_mask *= FFX_MIN16_F(hole_edge_mask != valid_sample_count);
 
-    return LoadMotionQMVD(pixel, dynamic_oob_hole);
+    return MotionFromQMVD(centre, dynamic_oob_hole);
 }
 
 // 3x3 min-depth dilation (selects the nearest surface within the neighbourhood). Skipped when masked

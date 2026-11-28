@@ -103,7 +103,7 @@ struct PassN : Pass
     nri::PipelineLayout*       layout = nullptr;
     nri::Pipeline*             pipeline = nullptr;
     ~PassN() override;
-    bool Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy) override;
+    bool Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy, uint32_t gz) override;
 };
 struct NetN : Network
 {
@@ -979,7 +979,7 @@ public:
     }
     // Dispatches are recorded in groups (PassN::Dispatch): one that binds nothing another of the group writes, and writes nothing
     // another binds, joins it; the group's barriers are recorded together before its dispatches. Anything else drains it first.
-    struct Pending { PassN* pass; nri::DescriptorSet* set; uint32_t gx, gy; };
+    struct Pending { PassN* pass; nri::DescriptorSet* set; uint32_t gx, gy, gz; };
     std::vector<Pending> pending;
     uint32_t group = 1, dispatchSerial = 0;
     const bool grouping = !EnvFlag("NFRUX_FULL_BARRIERS", false) && !EnvFlag("NFRUX_TEST_NO_GROUPS", false);
@@ -998,7 +998,7 @@ public:
             nri::SetDescriptorSetDesc sd = {0, p.set, nri::BindPoint::COMPUTE};
             n.CmdSetDescriptorSet(*cmd, sd);
             if (timed && !markCount) MarkRaw("begin");
-            n.CmdDispatch(*cmd, {p.gx, p.gy, 1});
+            n.CmdDispatch(*cmd, {p.gx, p.gy, p.gz});
             if (timed) MarkRaw(p.pass->name.c_str());
         }
         pending.clear();
@@ -1258,12 +1258,12 @@ TexN::~TexN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyD
 BufN::~BufN() { if (srv) dev->n.DestroyDescriptor(srv); if (uav) dev->n.DestroyDescriptor(uav); if (buf) dev->n.DestroyBuffer(buf); }
 PassN::~PassN() { if (pipeline) dev->n.DestroyPipeline(pipeline); if (layout) dev->n.DestroyPipelineLayout(layout); }
 
-bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy)
+bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy, uint32_t gz)
 {
     DevN& d = *dev;
     nri::DescriptorSet* set = nullptr;
     if (!NRI_OK(d.n.AllocateDescriptorSets(*d.pools[d.slot], *layout, 0, &set, 1, 0))) return Log("%s: out of descriptor sets", name.c_str()), false;
-    constexpr size_t kMaxBindings = 32;
+    constexpr size_t kMaxBindings = 96;  // a batched pass binds its per-timestep resources once a timestep
     if (bindings.size() > kMaxBindings) return Log("%s: %zu bindings", name.c_str(), bindings.size()), false;
     nri::Descriptor*               ds[kMaxBindings];
     nri::UpdateDescriptorRangeDesc up[kMaxBindings];
@@ -1318,7 +1318,7 @@ bool PassN::Dispatch(const Bind* binds, uint32_t count, uint32_t gx, uint32_t gy
         up[i] = {set, uint32_t(i), 0, &ds[i], 1};
     }
     d.n.UpdateDescriptorRanges(up, uint32_t(bindings.size()));
-    d.pending.push_back({this, set, gx, gy});
+    d.pending.push_back({this, set, gx, gy, gz});
     if (!d.grouping) d.Drain();
     return true;
 }
