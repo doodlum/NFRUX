@@ -127,7 +127,9 @@ now in COPY_DEST. Seen in Streamline_Sample with the production Streamline 2.14.
 On the OptiScaler route nothing hands the states over: the guide's state is assumed, which is known to be wrong for tags in other states (section 7).
 Diagnosis switches in the DLL, off unless set: NFRUX_TEST_D3D12_MESSAGES (the debug layer's messages and barriers into the log), NFRUX_TEST_PASSTHROUGH, NFRUX_TEST_ABSENT, NFRUX_TEST_NAMES.
 Lists may be COMPUTE or DIRECT; NRI is patched (build_nri.ps1) to use 0x40, not 0xC0, for shader resources on DIRECT lists. Barriers use compute-legal states only
-(NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. No blits: scaling or converting copies
+(NON_PIXEL_SHADER_RESOURCE, UNORDERED_ACCESS, COPY_*), since lists may be COMPUTE type. Dispatches are recorded in groups: one that binds nothing the
+pending group writes, and writes nothing it binds, joins it, and the group's barriers go before all its dispatches (rhi_nri.cpp, Drain); anything else
+records the group first; NFRUX_FULL_BARRIERS records each dispatch alone. No blits: scaling or converting copies
 are a compute pass. Depth: plane 0, the R32F / R24X8 / R16 SRV of its typeless family; Vulkan depth aspect. After a D3D12
 Evaluate the caller must rebind descriptor heaps, root signature and PSO (NGX's rule); after Vulkan, compute bindings.
 
@@ -326,7 +328,9 @@ format than the back buffer is converted when both are SDR formats (else ignored
 one.
 **D9. Formats.** RGBA8, BGRA8 (and their sRGB images), RGB10A2 (SDR or HDR10 PQ), as DLSS-G. Float back buffers (scRGB) are not supported (2026-11-25):
 the back buffer is shown, logged. Values are always the stored ones: sRGB inputs are copied raw into a UNORM image of NFRUX's and read from there (a UNORM
-view of them is not always legal); outputs are copied raw. fp16 is used only inside, for the staged path. A D3D12 device without BGRA8 typed store cannot
+view of them is not always legal); outputs are copied raw. Two copies are left out where the formats allow (2026-11-28): on D3D12 the composite writes frame 1
+of a batch into the host's output itself when that output has unordered access in the composite's format and would be copied whole; and the first composite stores the
+colour's texel into the next frame's history (Vulkan BGRA8 through an RGBA8 view, blue first). fp16 is used only inside, for the staged path. A D3D12 device without BGRA8 typed store cannot
 generate BGRA8 (said in the log). A2R10G10B10 is not supported.
 **D10. Build.** CMake, MSVC x64, Vulkan SDK >= 1.4.363 tools and Python 3 (standard library only). Clean checkout:
 `tools\build_nri.ps1` (network, once), then `cmake -B build -A x64` and `cmake --build build --config Release`. Run time needs no compiler.

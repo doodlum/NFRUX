@@ -568,3 +568,71 @@ Storage-image formats are checked per format. A forced Vulkan `cuda` needs the l
 | `--unknown` | refused, process ends normally |
 
 Forced rungs on Vulkan: dot4, scalar, coopmat and cuda each 78/78. D3D12 78/78. Conformance exact on both APIs, parity 99.82 dB, rungs_test passes.
+
+# Passes, barriers and copies (2026-11-27/28, RTX 4070 idle; e43258b -> 8ac6f2d, shipped build)
+
+The network was left as tuned; this round is the rest of the frame on both APIs, D3D12 first. Every change keeps every byte: parity dumps of
+every output and intermediate, both APIs, shipped and strict builds, compared with e43258b's (synthetic 1080p 2x and 6x, 4K from 1080p render, 4K
+from 4K render with inverted depth, 1277x719 RGB10A2 inverted, 1280x720 BGRA8 from 640x360, 1600x900 RGBA16F, the 64-frame sample recording at 6x);
+the sample recording through the front end (`ngx_harness --replay`, 2x / 4x / 6x, 108 images); ML conformance exact; `ngx_harness` 78/78 on each
+API with each rung forced; strict parity 0 bytes between the APIs; rungs_test; Vulkan synchronisation validation and the D3D12 debug layer silent.
+
+`ngx_harness --time`, ms a rendered frame (submitted and waited for, medians of 3 alternate runs; calls = CPU of the evaluates):
+
+| | 1080p 2x / 6x | 1440p 2x / 6x | 4K 2x / 6x | 1280x701 2x / 6x |
+|---|---|---|---|---|
+| D3D12 before | 0.93 / 2.67 | 1.11 / 3.03 | 1.49 / 4.37 | 0.71 / 2.24 |
+| D3D12 after | **0.77 / 2.40** | **0.92 / 2.72** | **1.16 / 3.86** | **0.62 / 2.03** |
+| Vulkan before | 1.03 / 2.98 | 1.25 / 3.45 | 1.72 / 4.94 | 0.77 / 2.56 |
+| Vulkan after | **0.92 / 2.72** | **1.09 / 3.07** | **1.47 / 4.47** | **0.73 / 2.34** |
+
+CPU of the evaluates, 1080p 2x / 6x: D3D12 0.18 / 0.46 -> 0.16 / 0.45 ms, Vulkan 0.18 / 0.47 -> 0.18 / 0.44. Vulkan's 1080p 2x varies between
+runs of the harness (0.88 to 0.97 for the same DLL); D3D12's within 0.01.
+
+GPU time by pass, 1080p 2x (NFRUX_TEST_TIMES; D3D12 needed the first commit below to read anything; ms; "before" is e43258b with that fix).
+Passes recorded in one group run side by side, so the parts are read together and `(recording)` is the total:
+
+| | D3D12 before | D3D12 after | Vulkan before | Vulkan after |
+|---|---|---|---|---|
+| optical flow: hints, pyramid, levels 5-2 (and two copies before) | 0.245 | 0.153 | 0.244 | 0.155 |
+| (of which the match at level 2) | 0.103 | 0.048 | 0.092 | 0.045 |
+| motion vectors: clear, downsample-all, warp | 0.081 | 0.080 | 0.086 | 0.098 |
+| timestep chain: warp TM1, fill, preprocess, inpaint (6) | 0.086 | 0.076 | 0.091 | 0.084 |
+| network (kernels and the copies to the parameter textures) | 0.142 | 0.137 | 0.180 | 0.180 |
+| composite (after: with the history store) | 0.078 | 0.082 | 0.082 | 0.086 |
+| copies at the end (history; the host's output) | 0.046 | 0 | 0.046 | 0.027 |
+| **(recording)** | **0.677** | **0.529** | **0.728** | **0.627** |
+
+The changes, in order (commit messages have each one's numbers):
+
+| Commit | What | Effect (RTX 4070) |
+|---|---|---|
+| b8ac05c | NFRUX_TEST_TIMES on D3D12 (the wrapped device has no queue: frequency from a compute queue made for it); `(recording)` | measurement |
+| 4961861 | Flow match: row sums reuse the search texels across a row of offsets, SADs as exact float sums, Lucas-Kanade from shared memory | D3D12 1080p 2x 0.93 -> 0.85, 4K 2x 1.49 -> 1.41 |
+| 443922f | Dispatches recorded in groups (barriers once before a group of independent dispatches); flow split so the motion vectors' passes go between its parts; the hints read where they are (two copies gone) | 6x: D3D12 2.59 -> 2.48, Vulkan 2.90 -> 2.81 |
+| dc43723 | D3D12: frame 1 written by the composite into the host's output (unordered access, the composite's format, whole) | D3D12 4K 2x 1.40 -> 1.30, 1080p 0.83 -> 0.81 |
+| 79b45fb | The first composite stores the history (no copy at the end) | D3D12 4K 2x 1.30 -> 1.25 |
+| 76c10d0 | The flow's median filter inside the bilateral filter (4 dispatches less) | 1080p 2x 0.81 -> 0.80 |
+| ef1917b | NFRUX_TEST_TIMES=2: passes by place | measurement |
+| dde0487 | Match: sliding row sums | level 2 0.051 -> 0.048 ms |
+| 67fe9c8 | Vulkan BGRA8 history stored by the composite through an RGBA8 view | Vulkan 4K 2x 1.58 -> 1.51 |
+| 7821a3b | CUDA on D3D12: one UAV barrier a layer instead of one a tensor and network | 1080p 2x 0.80 -> 0.79, network 0.141 -> 0.137 ms |
+| 5af8003 | Preprocess 16 x 16 workgroups (from 32 x 16) | the pass 0.059 -> 0.051 ms (both APIs) |
+| 9b4ce5f | Composite: no UI test without a UI source (it compared the colour with itself) | the pass -0.005 ms |
+| 8e4919b | Motion warp: 3x3 depth neighbourhoods by gathers | the pass -0.001 (D3D12) / -0.003 (Vulkan) ms |
+| 8ac6f2d | Downsample-all: 2x2 / 4x4 depth regions by gathers | 4K: the pass 0.139 -> 0.129 (D3D12), 0.177 -> 0.170 (Vulkan) |
+
+Not kept (no measurable gain, or not exact enough to keep): the pyramid's levels two to a dispatch (2-3, 4-5: 18 x 18 recomputed a tile; no change);
+workgroups of 32 x 8, 16 x 8 or 8 x 8 for the 16 x 16 passes (post-process 0.088 -> 0.091 at 32 x 8; the others within a timestamp tick);
+preprocess at 64 x 8 (0.060) or 32 x 32 (0.073); the inpaint passes and warp TM1 in other shapes (no change: they cost their dispatch); the
+network's layers as one CUDA launch chain on D3D12 (CPU 0.050 -> 0.034 ms, exact in conformance, but the ordering of a chain's launches is not
+specified, so not relied on); on Vulkan, narrower barriers between the CUDA layers, the parameter textures kept in the GENERAL layout, or their
+copies from an undefined layout (no change). The CPU of a dispatch was measured (QueryPerformanceCounter around NRI's calls, 1080p 2x):
+D3D12 about 0.6 us of its own and 1.7 a group (barriers 0.8, binding and the dispatch); Vulkan 0.7 and 3.2 (vkCmdBindDescriptorSets 1.4
+alone); the CUDA network's recording on D3D12 0.050 ms at 2x and 0.087 at 6x, most of it NVAPI's launch calls (one a layer).
+
+Where Vulkan's extra time is, 1080p 2x (0.92 against D3D12's 0.77): GPU 0.10 ms, of which the CUDA kernels 0.025 and their copies into the
+parameter textures 0.015 (the same kernels and copies; launched by VK_NVX_binary_import and vkCmdCopyBufferToImage), the copy into the host's
+output 0.027 (Vulkan outputs: their usage is not known, so the composite cannot write them; their BGRA8 is also written blue first into RGBA8),
+the downsample passes (at 4K: downsample of the colour 0.077 against 0.030); and about 0.03 a recording in submitting and waiting (a recording
+of one copy: 0.19 against 0.16 ms on D3D12), which `--time` counts for each of a batch's evaluates.

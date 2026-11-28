@@ -24,8 +24,8 @@ Cost on the RTX 4070, ms per rendered frame (headless harness, idle GPU; details
 
 | | 1080p 2x / 6x | 4K 2x / 6x |
 |---|---|---|
-| NFRUX, D3D12 | 0.93 / 2.67 | 1.47 / 4.38 |
-| NFRUX, Vulkan | 1.11 / 2.99 | 1.73 / 5.00 |
+| NFRUX, D3D12 | 0.77 / 2.40 | 1.16 / 3.86 |
+| NFRUX, Vulkan | 0.92 / 2.72 | 1.47 / 4.47 |
 | NVIDIA DLSS-G 310.9, D3D12 (2x only on RTX 40) | 1.76 / - | 3.63 / - |
 
 ## Install
