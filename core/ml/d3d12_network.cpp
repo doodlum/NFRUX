@@ -180,54 +180,80 @@ std::unique_ptr<D3D12Graph> D3D12Graph::Create(ID3D12Device* device, const ffx_m
 
 void D3D12Graph::Record(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRTUAL_ADDRESS input, ID3D12Resource* const* outputs, uint32_t outputPitch) const
 {
+    const D3D12Graph* self = this;
+    RecordBatch(list, &self, &input, &outputs, 1, outputPitch);
+}
+
+void D3D12Graph::RecordBatch(ID3D12GraphicsCommandList* list, const D3D12Graph* const* graphs, const D3D12_GPU_VIRTUAL_ADDRESS* inputs,
+                             ID3D12Resource* const* const* outputs, uint32_t count, uint32_t outputPitch)
+{
     auto transition = [](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
         D3D12_RESOURCE_BARRIER x = {};
         x.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, a, b};
         return x;
     };
-    if (!m_uploaded)
-    {
-        list->CopyResource(m_constants.Get(), m_upload.Get());  // COMMON promotes to COPY_DEST
-        const auto b = transition(m_constants.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        list->ResourceBarrier(1, &b);
-        m_uploaded = true;
-    }
+    std::vector<D3D12_RESOURCE_BARRIER> b;
+    for (uint32_t g = 0; g < count; ++g)
+        if (!graphs[g]->m_uploaded)
+        {
+            list->CopyResource(graphs[g]->m_constants.Get(), graphs[g]->m_upload.Get());  // COMMON promotes to COPY_DEST
+            b.push_back(transition(graphs[g]->m_constants.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+            graphs[g]->m_uploaded = true;
+        }
+    if (!b.empty())
+        list->ResourceBarrier(UINT(b.size()), b.data()), b.clear();
     // The tensors decay to COMMON between lists and go back to it here: explicit states within the recording.
-    std::vector<D3D12_RESOURCE_STATES> state(m_tensors.size(), D3D12_RESOURCE_STATE_COMMON);
-    list->SetComputeRootSignature(m_root.Get());
-    const uint64_t base = m_constants->GetGPUVirtualAddress();
-    for (const Layer& l : m_layers)
+    std::vector<std::vector<D3D12_RESOURCE_STATES>> state(count);
+    size_t layers = 0;
+    for (uint32_t g = 0; g < count; ++g)
+        state[g].assign(graphs[g]->m_tensors.size(), D3D12_RESOURCE_STATE_COMMON), layers = std::max(layers, graphs[g]->m_layers.size());
+    ID3D12RootSignature* root = nullptr;
+    for (size_t li = 0; li < layers; ++li)
     {
-        D3D12_RESOURCE_BARRIER b[3];
-        uint32_t               n = 0;
-        auto want = [&](int32_t t, D3D12_RESOURCE_STATES s) {
-            if (t < 0 || state[t] == s)
-                return;
-            b[n++]   = transition(m_tensors[t].Get(), state[t], s);
-            state[t] = s;
-        };
-        want(l.src[0], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        want(l.src[1], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        want(l.dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        if (n)
-            list->ResourceBarrier(n, b);
-        auto va = [&](int32_t t) { return t >= 0 ? m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? input : outputs[-2 - t]->GetGPUVirtualAddress(); };
-        list->SetPipelineState(l.pso.Get());
-        list->SetComputeRoot32BitConstants(0, 20, l.constants, 0);
-        if (l.dst < -1 && outputPitch)
-            list->SetComputeRoot32BitConstant(0, outputPitch / 4, 17);
-        list->SetComputeRootShaderResourceView(1, va(l.src[0]));
-        list->SetComputeRootShaderResourceView(2, va(l.src[1]));
-        list->SetComputeRootShaderResourceView(3, base + l.weights);
-        list->SetComputeRootShaderResourceView(4, base + l.params);
-        list->SetComputeRootUnorderedAccessView(5, va(l.dst));
-        list->Dispatch(l.groups[0], l.groups[1], l.groups[2]);
+        for (uint32_t g = 0; g < count; ++g)
+        {
+            if (li >= graphs[g]->m_layers.size())
+                continue;
+            const Layer& l = graphs[g]->m_layers[li];
+            auto want = [&](int32_t t, D3D12_RESOURCE_STATES s) {
+                if (t < 0 || state[g][t] == s)
+                    return;
+                b.push_back(transition(graphs[g]->m_tensors[t].Get(), state[g][t], s));
+                state[g][t] = s;
+            };
+            want(l.src[0], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            want(l.src[1], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            want(l.dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        if (!b.empty())
+            list->ResourceBarrier(UINT(b.size()), b.data()), b.clear();
+        for (uint32_t g = 0; g < count; ++g)
+        {
+            const D3D12Graph& x = *graphs[g];
+            if (li >= x.m_layers.size())
+                continue;
+            const Layer& l = x.m_layers[li];
+            if (root != x.m_root.Get())
+                list->SetComputeRootSignature(root = x.m_root.Get());
+            const uint64_t base = x.m_constants->GetGPUVirtualAddress();
+            auto va = [&](int32_t t) { return t >= 0 ? x.m_tensors[t]->GetGPUVirtualAddress() : t == -1 ? inputs[g] : outputs[g][-2 - t]->GetGPUVirtualAddress(); };
+            list->SetPipelineState(l.pso.Get());
+            list->SetComputeRoot32BitConstants(0, 20, l.constants, 0);
+            if (l.dst < -1 && outputPitch)
+                list->SetComputeRoot32BitConstant(0, outputPitch / 4, 17);
+            list->SetComputeRootShaderResourceView(1, va(l.src[0]));
+            list->SetComputeRootShaderResourceView(2, va(l.src[1]));
+            list->SetComputeRootShaderResourceView(3, base + l.weights);
+            list->SetComputeRootShaderResourceView(4, base + l.params);
+            list->SetComputeRootUnorderedAccessView(5, va(l.dst));
+            list->Dispatch(l.groups[0], l.groups[1], l.groups[2]);
+        }
     }
-    std::vector<D3D12_RESOURCE_BARRIER> back;
-    for (size_t i = 0; i < m_tensors.size(); ++i)
-        if (state[i] != D3D12_RESOURCE_STATE_COMMON)
-            back.push_back(transition(m_tensors[i].Get(), state[i], D3D12_RESOURCE_STATE_COMMON));
-    if (!back.empty())
-        list->ResourceBarrier(UINT(back.size()), back.data());
+    for (uint32_t g = 0; g < count; ++g)
+        for (size_t i = 0; i < graphs[g]->m_tensors.size(); ++i)
+            if (state[g][i] != D3D12_RESOURCE_STATE_COMMON)
+                b.push_back(transition(graphs[g]->m_tensors[i].Get(), state[g][i], D3D12_RESOURCE_STATE_COMMON));
+    if (!b.empty())
+        list->ResourceBarrier(UINT(b.size()), b.data());
 }
 }  // namespace nfrux

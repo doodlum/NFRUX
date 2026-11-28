@@ -1147,14 +1147,20 @@ public:
             std::vector<ID3D12Resource* const*> op;
             for (auto& o : co) op.push_back(o.data());
             if (!cg.empty()) CudaGraph::Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), cg.data(), ci.data(), op.data(), uint32_t(cg.size()), pitch);
+            // The dot4 / integer kernels: the batch's networks layer by layer (one barrier batch a layer, their dispatches side by side).
+            std::vector<const D3D12Graph*> dg;
+            std::vector<D3D12_GPU_VIRTUAL_ADDRESS> di;
+            std::vector<std::array<ID3D12Resource*, 2>> dout;
             for (uint32_t i = 0; i < count; ++i)
             {
                 auto& x = static_cast<NetN&>(*nets[i]);
                 if (x.cuda) continue;
                 auto  r = [&](const BufN& f) { return reinterpret_cast<ID3D12Resource*>(n.GetBufferNativeObject(f.buf)); };
-                ID3D12Resource* o[2] = {r(*x.out[x.order[0]]), r(*x.out[x.order[1]])};
-                x.d3d->Record(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), r(*x.in)->GetGPUVirtualAddress(), o, x.pitch);
+                dg.push_back(x.d3d.get()), di.push_back(r(*x.in)->GetGPUVirtualAddress()), dout.push_back({r(*x.out[x.order[0]]), r(*x.out[x.order[1]])}), pitch = x.pitch;
             }
+            std::vector<ID3D12Resource* const*> dp;
+            for (auto& o : dout) dp.push_back(o.data());
+            if (!dg.empty()) D3D12Graph::RecordBatch(static_cast<ID3D12GraphicsCommandList*>(nativeCmd), dg.data(), di.data(), dp.data(), uint32_t(dg.size()), pitch);
         }
         boundPass = nullptr;  // the networks set their own pipelines on the native list
         for (uint32_t i = 0; i < count; ++i)
